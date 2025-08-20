@@ -1,7 +1,0 @@
-aiogram==3.*
-fastapi
-uvicorn
-aiohttp
-cachetools
-python-dotenv
-requests
