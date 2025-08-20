@@ -5,3 +5,4 @@ aiohttp==3.9.1
 cachetools==5.3.2
 python-dotenv==1.0.0
 requests==2.31.0
+pytelegrambotapi==4.14.0  # альтернатива aiogram без Rust залежностей
