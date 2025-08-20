@@ -1,5 +1,6 @@
 # bott.py
 import sqlite3
+import os
 import requests
 import time
 import json
@@ -8,7 +9,7 @@ import random
 import re
 
 # ===== НАЛАШТУВАННЯ =====
-TOKEN = "8255365352:AAHqFjtxNo02_b6bQwj2ieoFyDAkXmOW4oQ"
+TOKEN = os.getenv("TELEGRAM_TOKEN", "8063113740:AAGC-9PHzZD65jPad2lxP5mTmlWuQwvKwrU")
 DB_NAME = "crypto_bot.db"
 COINGECKO_API_URL = "https://api.coingecko.com/api/v3"
 REQUEST_LIMIT = 30
@@ -303,3 +304,4 @@ def main():
 
 if __name__=="__main__":
     main()
+
