@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: anom-bot
+    env: python
+    region: oregon  # або closest до тебе
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_TOKEN
+        value: "8063113740:AAGC-9PHzZD65jPad2lxP5mTmlWuQwvKwrU"
+      - key: WEBHOOK_URL
+        value: ""  # порожньо, бо ми не використовуємо webhook
