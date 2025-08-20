@@ -4,3 +4,4 @@ uvicorn
 aiohttp
 cachetools
 python-dotenv
+requests
