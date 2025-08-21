@@ -1,6 +1,6 @@
-aiogram==3.*
-fastapi
-uvicorn
-aiohttp
-cachetools
-python-dotenv
+aiogram==3.13.1
+fastapi==0.115.2
+uvicorn==0.32.0
+aiohttp==3.10.10
+cachetools==5.5.0
+python-dotenv==1.0.1
