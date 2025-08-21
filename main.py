@@ -31,7 +31,7 @@ APP_BASE_URL = os.getenv("APP_BASE_URL", "https://anom-1.onrender.com").rstrip("
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", f"{APP_BASE_URL}/webhook").strip()
 
-# КРИТЕРІЇ
+# КРИТЕРІЇ (глобальні змінні)
 MIN_VOLUME = int(os.getenv("MIN_VOLUME", "1000"))           # $1K
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.000001"))      # Мінімальна ціна
 MIN_PRICE_CHANGE = float(os.getenv("MIN_PRICE_CHANGE", "5"))  # 5%
@@ -353,6 +353,7 @@ async def analyze_coins(chat_id: int | None = None) -> List[Dict[str, Any]]:
                 "trending": True
             }
             
+            # Використовуємо глобальні змінні без оголошення global
             volume_ok = volume_24h > MIN_VOLUME
             price_ok = price > MIN_PRICE
             change_ok = abs(change_24h) > MIN_PRICE_CHANGE
@@ -688,6 +689,7 @@ async def set_criteria_cmd(message: types.Message):
             )
             return
         
+        # Оголошуємо глобальні змінні
         global MIN_VOLUME, MIN_PRICE, MIN_PRICE_CHANGE
         MIN_VOLUME = int(args[0])
         MIN_PRICE = float(args[1])
