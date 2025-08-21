@@ -235,6 +235,9 @@ async def lifespan(app: FastAPI):
     try:
         await bot.set_webhook(WEBHOOK_URL, secret_token=WEBHOOK_SECRET)
         logger.info(f"Webhook set to {WEBHOOK_URL}")
+        # Перевірка статусу вебхука
+        webhook_info = await bot.get_webhook_info()
+        logger.info(f"Webhook info: {webhook_info}")
     except Exception as e:
         logger.error(f"Failed to set webhook: {e}")
     
@@ -256,6 +259,7 @@ async def root():
 async def telegram_webhook(request: Request):
     try:
         update = await request.json()
+        logger.info(f"Received webhook update: {update}")
         telegram_update = types.Update(**update)
         await dp.feed_update(bot, telegram_update)
         return {"ok": True}
