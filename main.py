@@ -44,12 +44,17 @@ active_monitoring = {}
 latest_anomalies = []
 last_fetch_time = 0
 last_coins_data = []
+rate_limit_exceeded = False
+last_rate_limit_time = 0
 
 # CoinGecko API з пагінацією
 async def fetch_coingecko_data():
-    global last_fetch_time, last_coins_data
+    global last_fetch_time, last_coins_data, rate_limit_exceeded, last_rate_limit_time
     now = datetime.now().timestamp()
-    if now - last_fetch_time < 600 and last_coins_data:
+    if rate_limit_exceeded and (now - last_rate_limit_time) < 300:
+        logger.info("Rate limit exceeded recently, skipping fetch")
+        return last_coins_data
+    if now - last_fetch_time < 900 and last_coins_data:  # Збільшено кеш до 15 хвилин
         logger.info("Returning cached CoinGecko data")
         return last_coins_data
 
@@ -62,7 +67,7 @@ async def fetch_coingecko_data():
             "order": "market_cap_desc",
             "per_page": 250,
             "page": page,
-            "sparkline": "false"  # Виправлено: строкове значення
+            "sparkline": "false"
         }
         try:
             async with aiohttp.ClientSession() as session:
@@ -81,19 +86,30 @@ async def fetch_coingecko_data():
                                 "current_price": coin.get("current_price", 0) or 0,
                                 "price_change_percentage_24h": coin.get("price_change_percentage_24h", 0) or 0
                             })
+                    elif resp.status == 429:
+                        logger.error(f"CoinGecko status 429. Response: {await resp.text()}")
+                        rate_limit_exceeded = True
+                        last_rate_limit_time = now
+                        return last_coins_data
                     else:
                         logger.error(f"CoinGecko status {resp.status}. Response: {await resp.text()}")
+                await asyncio.sleep(2)  # Затримка 2 секунди між сторінками
         except Exception as e:
             logger.error(f"CoinGecko request error (page {page}): {e}")
     last_coins_data = all_coins
     last_fetch_time = now
+    rate_limit_exceeded = False
     logger.info(f"Processed {len(all_coins)} coins")
     return all_coins
 
-async def analyze_coins():
+async def analyze_coins(chat_id: int = None):
     coins = await fetch_coingecko_data()
     logger.info(f"Analyzing {len(coins)} coins")
     anomalies = []
+    if not coins and rate_limit_exceeded:
+        if chat_id:
+            await bot.send_message(chat_id, "⚠️ Перевищено ліміт запитів до CoinGecko API. Зачекайте 5 хвилин або оновіть до платного плану: https://www.coingecko.com/en/api/pricing")
+        return anomalies
     for coin in coins:
         market_cap = coin.get('market_cap', 0) or 0
         volume = coin.get('total_volume', 0) or 0
@@ -140,10 +156,11 @@ async def monitoring_task(chat_id: int):
     logger.info(f"Starting monitoring task for chat_id: {chat_id}")
     while active_monitoring.get(chat_id):
         try:
-            anomalies = await analyze_coins()
+            anomalies = await analyze_coins(chat_id)
             if not anomalies:
                 logger.info("No anomalies found or API error occurred")
-                await bot.send_message(chat_id, "ℹ️ Немає аномальних токенів або помилка API. Спробую ще раз через 2 хвилини.")
+                if not rate_limit_exceeded:
+                    await bot.send_message(chat_id, "ℹ️ Немає аномальних токенів або помилка API. Спробую ще раз через 2 хвилини.")
             else:
                 sent = 0
                 for coin in anomalies:
@@ -214,6 +231,9 @@ async def latest_cmd(message: types.Message):
 async def topvol_cmd(message: types.Message):
     logger.info(f"Received /topvol command from chat_id: {message.chat.id}")
     coins = await fetch_coingecko_data()
+    if not coins and rate_limit_exceeded:
+        await message.answer("⚠️ Перевищено ліміт запитів до CoinGecko API. Зачекайте 5 хвилин або оновіть до платного плану: https://www.coingecko.com/en/api/pricing")
+        return
     filtered = [c for c in coins if c.get("market_cap", 0) > 0 and c.get("market_cap", 0) < MIN_CAP]
     top_coins = sorted(filtered, key=lambda x: x.get("total_volume", 0), reverse=True)[:20]
     if top_coins:
@@ -228,6 +248,9 @@ async def topvol_cmd(message: types.Message):
 async def topgainers_cmd(message: types.Message):
     logger.info(f"Received /topgainers command from chat_id: {message.chat.id}")
     coins = await fetch_coingecko_data()
+    if not coins and rate_limit_exceeded:
+        await message.answer("⚠️ Перевищено ліміт запитів до CoinGecko API. Зачекайте 5 хвилин або оновіть до платного плану: https://www.coingecko.com/en/api/pricing")
+        return
     filtered = [c for c in coins if c.get("market_cap", 0) > 0 and c.get("market_cap", 0) < MIN_CAP]
     top_coins = sorted(filtered, key=lambda x: x.get("price_change_percentage_24h", 0), reverse=True)[:20]
     if top_coins:
