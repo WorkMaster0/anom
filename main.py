@@ -31,13 +31,15 @@ APP_BASE_URL = os.getenv("APP_BASE_URL", "https://anom-1.onrender.com").rstrip("
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", f"{APP_BASE_URL}/webhook").strip()
 
-# КРИТЕРІЇ (глобальні змінні)
-MIN_VOLUME = int(os.getenv("MIN_VOLUME", "1000"))           # $1K
-MIN_PRICE = float(os.getenv("MIN_PRICE", "0.000001"))      # Мінімальна ціна
-MIN_PRICE_CHANGE = float(os.getenv("MIN_PRICE_CHANGE", "5"))  # 5%
-MAX_VOLUME = int(os.getenv("MAX_VOLUME", "100000000"))     # $100M
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "600"))   # 10 хвилин
-MAX_ALERTS_PER_CYCLE = int(os.getenv("MAX_ALERTS_PER_CYCLE", "20"))
+# КРИТЕРІЇ (створюємо як словник)
+CRITERIA = {
+    "MIN_VOLUME": int(os.getenv("MIN_VOLUME", "1000")),           # $1K
+    "MIN_PRICE": float(os.getenv("MIN_PRICE", "0.000001")),      # Мінімальна ціна
+    "MIN_PRICE_CHANGE": float(os.getenv("MIN_PRICE_CHANGE", "5")),  # 5%
+    "MAX_VOLUME": int(os.getenv("MAX_VOLUME", "100000000")),     # $100M
+    "CHECK_INTERVAL": int(os.getenv("CHECK_INTERVAL", "600")),   # 10 хвилин
+    "MAX_ALERTS_PER_CYCLE": int(os.getenv("MAX_ALERTS_PER_CYCLE", "20"))
+}
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN не задано")
@@ -353,10 +355,10 @@ async def analyze_coins(chat_id: int | None = None) -> List[Dict[str, Any]]:
                 "trending": True
             }
             
-            # Використовуємо глобальні змінні без оголошення global
-            volume_ok = volume_24h > MIN_VOLUME
-            price_ok = price > MIN_PRICE
-            change_ok = abs(change_24h) > MIN_PRICE_CHANGE
+            # Використовуємо критерії з словника
+            volume_ok = volume_24h > CRITERIA["MIN_VOLUME"]
+            price_ok = price > CRITERIA["MIN_PRICE"]
+            change_ok = abs(change_24h) > CRITERIA["MIN_PRICE_CHANGE"]
             
             if volume_ok and price_ok and change_ok:
                 logger.info(f"ANOMALY FOUND: {normalized['name']} "
@@ -427,14 +429,14 @@ async def monitoring_task(chat_id: int):
                         "ℹ️ Аномальних токенів не знайдено. "
                         "Моніторинг продовжується...\n\n"
                         "Перевіряються токени з:\n"
-                        f"• Зміна ціни > ±{MIN_PRICE_CHANGE}%\n"
-                        f"• Обсяг торгів > ${MIN_VOLUME:,}\n"
-                        f"• Ціна > ${MIN_PRICE:.6f}"
+                        f"• Зміна ціни > ±{CRITERIA['MIN_PRICE_CHANGE']}%\n"
+                        f"• Обсяг торгів > ${CRITERIA['MIN_VOLUME']:,}\n"
+                        f"• Ціна > ${CRITERIA['MIN_PRICE']:.6f}"
                     )
             else:
                 sent = 0
                 for coin in anomalies:
-                    if coin["id"] not in alert_cache and sent < MAX_ALERTS_PER_CYCLE:
+                    if coin["id"] not in alert_cache and sent < CRITERIA["MAX_ALERTS_PER_CYCLE"]:
                         await send_alert(chat_id, coin)
                         sent += 1
                         await asyncio.sleep(1)
@@ -445,7 +447,7 @@ async def monitoring_task(chat_id: int):
                         f"✅ Знайдено {sent} аномальних токенів!"
                     )
             
-            await asyncio.sleep(CHECK_INTERVAL)
+            await asyncio.sleep(CRITERIA["CHECK_INTERVAL"])
             
         except Exception as e:
             logger.error(f"monitoring_task error: {e}")
@@ -454,7 +456,7 @@ async def monitoring_task(chat_id: int):
                 f"⚠️ Помилка моніторингу: {str(e)[:200]}...\n"
                 "Спробую знову через 10 хвилин."
             )
-            await asyncio.sleep(CHECK_INTERVAL)
+            await asyncio.sleep(CRITERIA["CHECK_INTERVAL"])
 
 async def clear_cache_task():
     while True:
@@ -506,9 +508,9 @@ async def status_cmd(message: types.Message):
         f"🔍 У кеші сповіщень: {len(alert_cache)}\n"
         f"📈 Останні аномалії: {len(latest_anomalies)}\n\n"
         f"Поточні критерії:\n"
-        f"• Мін. обсяг: ${MIN_VOLUME:,}\n"
-        f"• Мін. ціна: ${MIN_PRICE:.6f}\n"
-        f"• Мін. зміна: {MIN_PRICE_CHANGE}%"
+        f"• Мін. обсяг: ${CRITERIA['MIN_VOLUME']:,}\n"
+        f"• Мін. ціна: ${CRITERIA['MIN_PRICE']:.6f}\n"
+        f"• Мін. зміна: {CRITERIA['MIN_PRICE_CHANGE']}%"
     )
 
 @dp.message(Command("latest"))
@@ -683,23 +685,22 @@ async def set_criteria_cmd(message: types.Message):
                 "ℹ️ Використовуйте: /setcriteria MIN_VOLUME MIN_PRICE MIN_CHANGE\n"
                 "Приклад: /setcriteria 1000 0.0001 5\n\n"
                 "Поточні значення:\n"
-                f"• Мін. обсяг: ${MIN_VOLUME:,}\n"
-                f"• Мін. ціна: ${MIN_PRICE:.6f}\n"
-                f"• Мін. зміна: {MIN_PRICE_CHANGE}%"
+                f"• Мін. обсяг: ${CRITERIA['MIN_VOLUME']:,}\n"
+                f"• Мін. ціна: ${CRITERIA['MIN_PRICE']:.6f}\n"
+                f"• Мін. зміна: {CRITERIA['MIN_PRICE_CHANGE']}%"
             )
             return
         
-        # Оголошуємо глобальні змінні
-        global MIN_VOLUME, MIN_PRICE, MIN_PRICE_CHANGE
-        MIN_VOLUME = int(args[0])
-        MIN_PRICE = float(args[1])
-        MIN_PRICE_CHANGE = float(args[2])
+        # Оновлюємо критерії в словнику
+        CRITERIA["MIN_VOLUME"] = int(args[0])
+        CRITERIA["MIN_PRICE"] = float(args[1])
+        CRITERIA["MIN_PRICE_CHANGE"] = float(args[2])
         
         await message.answer(
             f"✅ Критерії оновлено:\n"
-            f"• Мін. обсяг: ${MIN_VOLUME:,}\n"
-            f"• Мін. ціна: ${MIN_PRICE:.6f}\n"
-            f"• Мін. зміна: {MIN_PRICE_CHANGE}%"
+            f"• Мін. обсяг: ${CRITERIA['MIN_VOLUME']:,}\n"
+            f"• Мін. ціна: ${CRITERIA['MIN_PRICE']:.6f}\n"
+            f"• Мін. зміна: {CRITERIA['MIN_PRICE_CHANGE']}%"
         )
         
     except Exception as e:
