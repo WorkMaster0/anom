@@ -47,55 +47,50 @@ last_coins_data = []
 rate_limit_exceeded = False
 last_rate_limit_time = 0
 
-# CoinGecko API з пагінацією
-async def fetch_coingecko_data():
+# DexScreener API
+async def fetch_dexscreener_data():
     global last_fetch_time, last_coins_data, rate_limit_exceeded, last_rate_limit_time
     now = datetime.now().timestamp()
     if rate_limit_exceeded and (now - last_rate_limit_time) < 300:
         logger.info("Rate limit exceeded recently, skipping fetch")
         return last_coins_data
-    if now - last_fetch_time < 900 and last_coins_data:  # Збільшено кеш до 15 хвилин
-        logger.info("Returning cached CoinGecko data")
+    if now - last_fetch_time < 900 and last_coins_data:  # Кеш на 15 хвилин
+        logger.info("Returning cached DexScreener data")
         return last_coins_data
 
-    logger.info("Fetching new data from CoinGecko API")
-    url = "https://api.coingecko.com/api/v3/coins/markets"
+    logger.info("Fetching new data from DexScreener API")
+    url = "https://api.dexscreener.com/latest/dex/tokens"
     all_coins = []
-    for page in range(1, 3):  # Отримуємо 2 сторінки (до 500 токенів)
-        params = {
-            "vs_currency": "usd",
-            "order": "market_cap_desc",
-            "per_page": 250,
-            "page": page,
-            "sparkline": "false"
-        }
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params, timeout=15) as resp:
-                    logger.info(f"CoinGecko API response status (page {page}): {resp.status}")
-                    if resp.status == 200:
-                        data = await resp.json()
-                        logger.info(f"Received {len(data)} coins from CoinGecko (page {page})")
-                        for coin in data:
-                            all_coins.append({
-                                "id": coin.get("id", ""),
-                                "name": coin.get("name", ""),
-                                "symbol": coin.get("symbol", "").upper(),
-                                "market_cap": coin.get("market_cap", 0) or 0,
-                                "total_volume": coin.get("total_volume", 0) or 0,
-                                "current_price": coin.get("current_price", 0) or 0,
-                                "price_change_percentage_24h": coin.get("price_change_percentage_24h", 0) or 0
-                            })
-                    elif resp.status == 429:
-                        logger.error(f"CoinGecko status 429. Response: {await resp.text()}")
-                        rate_limit_exceeded = True
-                        last_rate_limit_time = now
-                        return last_coins_data
-                    else:
-                        logger.error(f"CoinGecko status {resp.status}. Response: {await resp.text()}")
-                await asyncio.sleep(2)  # Затримка 2 секунди між сторінками
-        except Exception as e:
-            logger.error(f"CoinGecko request error (page {page}): {e}")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=15) as resp:
+                logger.info(f"DexScreener API response status: {resp.status}")
+                if resp.status == 200:
+                    data = await resp.json()
+                    pairs = data.get("pairs", [])
+                    logger.info(f"Received {len(pairs)} pairs from DexScreener")
+                    for pair in pairs:
+                        all_coins.append({
+                            "id": pair.get("baseToken", {}).get("address", ""),
+                            "name": pair.get("baseToken", {}).get("name", ""),
+                            "symbol": pair.get("baseToken", {}).get("symbol", "").upper(),
+                            "market_cap": pair.get("marketCap", 0) or 0,
+                            "total_volume": pair.get("volume", {}).get("h24", 0) or 0,
+                            "current_price": float(pair.get("priceUsd", "0")) or 0,
+                            "price_change_percentage_24h": pair.get("priceChange", {}).get("h24", 0) or 0,
+                            "chainId": pair.get("chainId", ""),
+                            "pairAddress": pair.get("pairAddress", "")
+                        })
+                elif resp.status == 429:
+                    logger.error(f"DexScreener status 429. Response: {await resp.text()}")
+                    rate_limit_exceeded = True
+                    last_rate_limit_time = now
+                    return last_coins_data
+                else:
+                    logger.error(f"DexScreener status {resp.status}. Response: {await resp.text()}")
+        await asyncio.sleep(1)  # Затримка 1 секунда
+    except Exception as e:
+        logger.error(f"DexScreener request error: {e}")
     last_coins_data = all_coins
     last_fetch_time = now
     rate_limit_exceeded = False
@@ -103,12 +98,12 @@ async def fetch_coingecko_data():
     return all_coins
 
 async def analyze_coins(chat_id: int = None):
-    coins = await fetch_coingecko_data()
+    coins = await fetch_dexscreener_data()
     logger.info(f"Analyzing {len(coins)} coins")
     anomalies = []
     if not coins and rate_limit_exceeded:
         if chat_id:
-            await bot.send_message(chat_id, "⚠️ Перевищено ліміт запитів до CoinGecko API. Зачекайте 5 хвилин або оновіть до платного плану: https://www.coingecko.com/en/api/pricing")
+            await bot.send_message(chat_id, "⚠️ Перевищено ліміт запитів до DexScreener API. Зачекайте 5 хвилин.")
         return anomalies
     for coin in coins:
         market_cap = coin.get('market_cap', 0) or 0
@@ -136,6 +131,8 @@ async def send_alert(chat_id: int, coin: dict):
     mcap = coin.get("market_cap", 0) or 0
     change = coin.get("price_change_percentage_24h", 0) or 0
     vol = coin.get("total_volume", 0) or 0
+    chain = escape(coin.get("chainId", ""))
+    pair = coin.get("pairAddress", "")
 
     msg = (
         f"🚨 <b>{name} ({sym})</b>\n"
@@ -143,7 +140,8 @@ async def send_alert(chat_id: int, coin: dict):
         f"📊 Капіталізація: <code>${mcap:,}</code>\n"
         f"📈 Зміна 24h: <b>{change:.1f}%</b>\n"
         f"💹 Обсяг: <code>${vol:,}</code>\n"
-        f"🔗 <a href='https://www.coingecko.com/en/coins/{coin_id}'>CoinGecko</a>"
+        f"🔗 Ланцюг: {chain}\n"
+        f"🔗 <a href='https://dexscreener.com/{chain}/{pair}'>DexScreener</a>"
     )
 
     await bot.send_message(chat_id, msg, parse_mode="HTML", disable_web_page_preview=True)
@@ -230,9 +228,9 @@ async def latest_cmd(message: types.Message):
 @dp.message(Command("topvol"))
 async def topvol_cmd(message: types.Message):
     logger.info(f"Received /topvol command from chat_id: {message.chat.id}")
-    coins = await fetch_coingecko_data()
+    coins = await fetch_dexscreener_data()
     if not coins and rate_limit_exceeded:
-        await message.answer("⚠️ Перевищено ліміт запитів до CoinGecko API. Зачекайте 5 хвилин або оновіть до платного плану: https://www.coingecko.com/en/api/pricing")
+        await message.answer("⚠️ Перевищено ліміт запитів до DexScreener API. Зачекайте 5 хвилин.")
         return
     filtered = [c for c in coins if c.get("market_cap", 0) > 0 and c.get("market_cap", 0) < MIN_CAP]
     top_coins = sorted(filtered, key=lambda x: x.get("total_volume", 0), reverse=True)[:20]
@@ -247,9 +245,9 @@ async def topvol_cmd(message: types.Message):
 @dp.message(Command("topgainers"))
 async def topgainers_cmd(message: types.Message):
     logger.info(f"Received /topgainers command from chat_id: {message.chat.id}")
-    coins = await fetch_coingecko_data()
+    coins = await fetch_dexscreener_data()
     if not coins and rate_limit_exceeded:
-        await message.answer("⚠️ Перевищено ліміт запитів до CoinGecko API. Зачекайте 5 хвилин або оновіть до платного плану: https://www.coingecko.com/en/api/pricing")
+        await message.answer("⚠️ Перевищено ліміт запитів до DexScreener API. Зачекайте 5 хвилин.")
         return
     filtered = [c for c in coins if c.get("market_cap", 0) > 0 and c.get("market_cap", 0) < MIN_CAP]
     top_coins = sorted(filtered, key=lambda x: x.get("price_change_percentage_24h", 0), reverse=True)[:20]
