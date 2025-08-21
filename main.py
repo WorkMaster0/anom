@@ -62,7 +62,7 @@ async def fetch_coingecko_data():
             "order": "market_cap_desc",
             "per_page": 250,
             "page": page,
-            "sparkline": False
+            "sparkline": "false"  # Виправлено: строкове значення
         }
         try:
             async with aiohttp.ClientSession() as session:
