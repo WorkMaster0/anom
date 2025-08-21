@@ -228,34 +228,41 @@ async def jup_get_real_time_data() -> List[Dict[str, Any]]:
         logger.error(f"Error getting real-time data: {e}")
         return []
 
+# Замініть функцію jup_get_detailed_prices на цю:
+
 async def jup_get_detailed_prices(mints: List[str]) -> Dict[str, Dict[str, Any]]:
     """Отримує детальну інформацію про ціни для списку токенів"""
     if not mints:
         return {}
     
     try:
-        async with aiohttp.ClientSession() as session:
-            batch_size = 15  # Зменшено розмір батчу
-            results = {}
-            
-            for i in range(0, len(mints), batch_size):
-                batch = mints[i:i + batch_size]
-                params = {"ids": ",".join(batch)}
-                
-                data = await _http_get_json(session, PRICE_V3_BASE, params)
-                if isinstance(data, dict) and "data" in data:
-                    for mint, price_data in data["data"].items():
+        results = {}
+        
+        # Обробляємо токени по одному, щоб уникнути проблем
+        for mint in mints:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    params = {"ids": mint}
+                    data = await _http_get_json(session, PRICE_V3_BASE, params)
+                    
+                    if isinstance(data, dict) and "data" in data:
+                        price_data = data["data"].get(mint, {})
                         if isinstance(price_data, dict):
                             results[mint] = {
                                 "price": float(price_data.get("price", 0) or 0),
                                 "price_change_24h": float(price_data.get("priceChange24hPct", 0) or 0),
                                 "volume_24h": float(price_data.get("volume24h", 0) or 0)
                             }
+                            logger.info(f"Price for {mint}: {results[mint]['price']}")
+                    
+                await asyncio.sleep(0.3)  # Затримка між запитами
                 
-                await asyncio.sleep(0.5)  # Додаткова затримка
-            
-            return results
-            
+            except Exception as e:
+                logger.error(f"Error getting price for {mint}: {e}")
+                continue
+        
+        return results
+        
     except Exception as e:
         logger.error(f"Error getting detailed prices: {e}")
         return {}
@@ -313,15 +320,17 @@ async def analyze_coins(chat_id: int | None = None) -> List[Dict[str, Any]]:
     anomalies: List[Dict[str, Any]] = []
     
     try:
-        logger.info("Getting tokens data...")
+        logger.info("Step 1: Getting real-time tokens...")
         tokens = await jup_get_real_time_data()
         
         if not tokens:
             logger.warning("No tokens received from API")
             return anomalies
         
-        # Беремо тільки перші 15 токенів для тесту
-        test_tokens = tokens[:15]
+        logger.info(f"Got {len(tokens)} tokens from API")
+        
+        # Беремо тільки перші 10 токенів для тесту
+        test_tokens = tokens[:10]
         
         mints = []
         for token in test_tokens:
@@ -329,38 +338,57 @@ async def analyze_coins(chat_id: int | None = None) -> List[Dict[str, Any]]:
                 mint = token.get("mint") or token.get("address") or token.get("id")
                 if mint:
                     mints.append(mint)
+                    logger.info(f"Token: {token.get('name', 'Unknown')} - {mint}")
         
         if not mints:
+            logger.warning("No mints found in tokens")
             return anomalies
         
-        logger.info(f"Getting prices for {len(mints)} tokens...")
+        logger.info(f"Step 2: Getting prices for {len(mints)} tokens...")
         price_data = await jup_get_detailed_prices(mints)
         
-        # Проста логіка: будь-який токен з ціною > 0 вважаємо аномалією для тесту
+        logger.info(f"Got price data for {len(price_data)} tokens")
+        
+        # Детальна логіка з критеріями
         for token in test_tokens:
             if isinstance(token, dict):
                 mint = token.get("mint") or token.get("address") or token.get("id")
                 if mint and mint in price_data:
                     p_data = price_data[mint]
                     price = p_data.get("price", 0)
+                    change = p_data.get("price_change_24h", 0)
+                    volume = p_data.get("volume_24h", 0)
                     
-                    if price > 0:  # Просто будь-яка ціна > 0
+                    logger.info(f"Token {token.get('name')}: price=${price}, change={change}%, volume=${volume}")
+                    
+                    # Перевіряємо критерії
+                    volume_ok = volume > CRITERIA["MIN_VOLUME"]
+                    price_ok = price > CRITERIA["MIN_PRICE"]
+                    change_ok = abs(change) > CRITERIA["MIN_PRICE_CHANGE"]
+                    
+                    if price_ok:  # Хочемо бачити всі токени з ціною > 0
                         normalized = {
                             "id": mint,
                             "name": token.get("name", "Unknown"),
                             "symbol": token.get("symbol", "UNK"),
                             "logo": token.get("logoURI", ""),
                             "current_price": price,
-                            "price_change_percentage_24h": p_data.get("price_change_24h", 0),
-                            "total_volume": p_data.get("volume_24h", 0),
+                            "price_change_percentage_24h": change,
+                            "total_volume": volume,
                             "market_cap": 0,
                             "chainId": "solana",
                             "trending": True
                         }
-                        anomalies.append(normalized)
-                        logger.info(f"Found token: {normalized['name']} - ${price}")
+                        
+                        # Додаємо до аномалій якщо відповідає критеріям
+                        if volume_ok and price_ok and change_ok:
+                            anomalies.append(normalized)
+                            logger.info(f"ANOMALY: {normalized['name']} - ${price}")
+                        else:
+                            # Все одно логуємо для дебагу
+                            logger.info(f"Token found but not anomaly: {normalized['name']}")
         
-        logger.info(f"Found {len(anomalies)} tokens with price > 0")
+        logger.info(f"Found {len(anomalies)} anomalies")
         return anomalies
         
     except Exception as e:
@@ -685,6 +713,43 @@ async def debug_cmd(message: types.Message):
     status += f"• Latest anomalies: {len(latest_anomalies)}"
     
     await message.answer(status)
+
+@dp.message(Command("debugtokens"))
+async def debug_tokens_cmd(message: types.Message):
+    """Детальна інформація про токени"""
+    debug_msg = await message.answer("🔍 Детальний аналіз токенів...")
+    
+    try:
+        tokens = await jup_get_real_time_data()
+        
+        if not tokens:
+            await debug_msg.edit_text("❌ Не вдалося отримати токени")
+            return
+        
+        result = f"📊 Знайдено {len(tokens)} токенів:\n\n"
+        
+        for i, token in enumerate(tokens[:5], 1):
+            if isinstance(token, dict):
+                name = token.get('name', 'Unknown')
+                symbol = token.get('symbol', 'UNK')
+                mint = token.get('mint') or token.get('address') or token.get('id', 'N/A')
+                
+                result += f"{i}. {name} ({symbol})\n"
+                result += f"   Mint: {mint[:10]}...\n"
+                
+                # Отримуємо ціну для цього токена
+                if mint:
+                    price_data = await jup_get_detailed_prices([mint])
+                    if mint in price_data:
+                        price = price_data[mint].get('price', 0)
+                        result += f"   Ціна: ${price:.8f}\n"
+                
+                result += "\n"
+        
+        await debug_msg.edit_text(result)
+        
+    except Exception as e:
+        await debug_msg.edit_text(f"❌ Помилка: {str(e)}")
 
 @dp.message(Command("reset"))
 async def reset_cmd(message: types.Message):
