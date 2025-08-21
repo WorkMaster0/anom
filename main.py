@@ -27,7 +27,7 @@ MIN_CAP = int(os.getenv("MIN_CAP", "100000000"))  # $100M
 MIN_VOLUME = int(os.getenv("MIN_VOLUME", "10000"))  # $10K
 MAX_VOLUME = int(os.getenv("MAX_VOLUME", "100000000"))  # $100M
 MIN_PRICE_CHANGE = float(os.getenv("MIN_PRICE_CHANGE", "20"))  # 20%
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "120"))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))  # Збільшено до 5 хвилин
 MAX_ALERTS_PER_CYCLE = int(os.getenv("MAX_ALERTS_PER_CYCLE", "20"))
 
 if not TELEGRAM_BOT_TOKEN:
@@ -51,12 +51,14 @@ last_rate_limit_time = 0
 async def fetch_dexscreener_data():
     global last_fetch_time, last_coins_data, rate_limit_exceeded, last_rate_limit_time
     now = datetime.now().timestamp()
-    if rate_limit_exceeded and (now - last_rate_limit_time) < 300:
-        logger.info("Rate limit exceeded recently, skipping fetch")
-        return last_coins_data
+    wait_time = 300  # 5 хвилин очікування після 429
+    if rate_limit_exceeded and (now - last_rate_limit_time) < wait_time:
+        remaining = int(wait_time - (now - last_rate_limit_time))
+        logger.info(f"Rate limit exceeded, {remaining} seconds remaining")
+        return last_coins_data, remaining
     if now - last_fetch_time < 900 and last_coins_data:  # Кеш на 15 хвилин
         logger.info("Returning cached DexScreener data")
-        return last_coins_data
+        return last_coins_data, 0
 
     logger.info("Fetching new data from DexScreener API")
     url = "https://api.dexscreener.com/latest/dex/tokens"
@@ -70,6 +72,9 @@ async def fetch_dexscreener_data():
                     pairs = data.get("pairs", [])
                     logger.info(f"Received {len(pairs)} pairs from DexScreener")
                     for pair in pairs:
+                        liquidity = pair.get("liquidity", {}).get("usd", 0) or 0
+                        if liquidity < 10000:  # Фільтруємо токени з низькою ліквідністю
+                            continue
                         all_coins.append({
                             "id": pair.get("baseToken", {}).get("address", ""),
                             "name": pair.get("baseToken", {}).get("name", ""),
@@ -85,25 +90,25 @@ async def fetch_dexscreener_data():
                     logger.error(f"DexScreener status 429. Response: {await resp.text()}")
                     rate_limit_exceeded = True
                     last_rate_limit_time = now
-                    return last_coins_data
+                    return last_coins_data, wait_time
                 else:
                     logger.error(f"DexScreener status {resp.status}. Response: {await resp.text()}")
-        await asyncio.sleep(1)  # Затримка 1 секунда
+                await asyncio.sleep(1)  # Затримка 1 секунда
     except Exception as e:
         logger.error(f"DexScreener request error: {e}")
     last_coins_data = all_coins
     last_fetch_time = now
     rate_limit_exceeded = False
     logger.info(f"Processed {len(all_coins)} coins")
-    return all_coins
+    return all_coins, 0
 
 async def analyze_coins(chat_id: int = None):
-    coins = await fetch_dexscreener_data()
+    coins, wait_time = await fetch_dexscreener_data()
     logger.info(f"Analyzing {len(coins)} coins")
     anomalies = []
     if not coins and rate_limit_exceeded:
         if chat_id:
-            await bot.send_message(chat_id, "⚠️ Перевищено ліміт запитів до DexScreener API. Зачекайте 5 хвилин.")
+            await bot.send_message(chat_id, f"⚠️ Перевищено ліміт запитів до DexScreener API. Зачекайте {wait_time} секунд.")
         return anomalies
     for coin in coins:
         market_cap = coin.get('market_cap', 0) or 0
@@ -158,7 +163,7 @@ async def monitoring_task(chat_id: int):
             if not anomalies:
                 logger.info("No anomalies found or API error occurred")
                 if not rate_limit_exceeded:
-                    await bot.send_message(chat_id, "ℹ️ Немає аномальних токенів або помилка API. Спробую ще раз через 2 хвилини.")
+                    await bot.send_message(chat_id, "ℹ️ Немає аномальних токенів або помилка API. Спробую ще раз через 5 хвилин.")
             else:
                 sent = 0
                 for coin in anomalies:
@@ -228,9 +233,9 @@ async def latest_cmd(message: types.Message):
 @dp.message(Command("topvol"))
 async def topvol_cmd(message: types.Message):
     logger.info(f"Received /topvol command from chat_id: {message.chat.id}")
-    coins = await fetch_dexscreener_data()
+    coins, wait_time = await fetch_dexscreener_data()
     if not coins and rate_limit_exceeded:
-        await message.answer("⚠️ Перевищено ліміт запитів до DexScreener API. Зачекайте 5 хвилин.")
+        await message.answer(f"⚠️ Перевищено ліміт запитів до DexScreener API. Зачекайте {wait_time} секунд.")
         return
     filtered = [c for c in coins if c.get("market_cap", 0) > 0 and c.get("market_cap", 0) < MIN_CAP]
     top_coins = sorted(filtered, key=lambda x: x.get("total_volume", 0), reverse=True)[:20]
@@ -245,9 +250,9 @@ async def topvol_cmd(message: types.Message):
 @dp.message(Command("topgainers"))
 async def topgainers_cmd(message: types.Message):
     logger.info(f"Received /topgainers command from chat_id: {message.chat.id}")
-    coins = await fetch_dexscreener_data()
+    coins, wait_time = await fetch_dexscreener_data()
     if not coins and rate_limit_exceeded:
-        await message.answer("⚠️ Перевищено ліміт запитів до DexScreener API. Зачекайте 5 хвилин.")
+        await message.answer(f"⚠️ Перевищено ліміт запитів до DexScreener API. Зачекайте {wait_time} секунд.")
         return
     filtered = [c for c in coins if c.get("market_cap", 0) > 0 and c.get("market_cap", 0) < MIN_CAP]
     top_coins = sorted(filtered, key=lambda x: x.get("price_change_percentage_24h", 0), reverse=True)[:20]
