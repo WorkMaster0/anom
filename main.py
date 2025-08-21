@@ -45,7 +45,7 @@ latest_anomalies = []
 last_fetch_time = 0
 last_coins_data = []
 
-# CoinGecko API
+# CoinGecko API з пагінацією
 async def fetch_coingecko_data():
     global last_fetch_time, last_coins_data
     now = datetime.now().timestamp()
@@ -55,43 +55,40 @@ async def fetch_coingecko_data():
 
     logger.info("Fetching new data from CoinGecko API")
     url = "https://api.coingecko.com/api/v3/coins/markets"
-    params = {
-        "vs_currency": "usd",
-        "order": "market_cap_desc",
-        "per_page": 250,  # Максимум 250 на сторінку
-        "page": 1,
-        "sparkline": False
-    }
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, timeout=15) as resp:
-                logger.info(f"CoinGecko API response status: {resp.status}")
-                if resp.status == 200:
-                    data = await resp.json()
-                    logger.info(f"Received {len(data)} coins from CoinGecko")
-                    formatted_data = []
-                    for coin in data:
-                        formatted_data.append({
-                            "id": coin.get("id", ""),
-                            "name": coin.get("name", ""),
-                            "symbol": coin.get("symbol", "").upper(),
-                            "market_cap": coin.get("market_cap", 0) or 0,
-                            "total_volume": coin.get("total_volume", 0) or 0,
-                            "current_price": coin.get("current_price", 0) or 0,
-                            "price_change_percentage_24h": coin.get("price_change_percentage_24h", 0) or 0
-                        })
-                    last_coins_data = formatted_data
-                    last_fetch_time = now
-                    return formatted_data
-                else:
-                    logger.error(f"CoinGecko status {resp.status}. Response: {await resp.text()}")
-                    return []
-    except Exception as e:
-        logger.error(f"CoinGecko request error: {e}")
-        return []
-
-    return last_coins_data
+    all_coins = []
+    for page in range(1, 3):  # Отримуємо 2 сторінки (до 500 токенів)
+        params = {
+            "vs_currency": "usd",
+            "order": "market_cap_desc",
+            "per_page": 250,
+            "page": page,
+            "sparkline": False
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params, timeout=15) as resp:
+                    logger.info(f"CoinGecko API response status (page {page}): {resp.status}")
+                    if resp.status == 200:
+                        data = await resp.json()
+                        logger.info(f"Received {len(data)} coins from CoinGecko (page {page})")
+                        for coin in data:
+                            all_coins.append({
+                                "id": coin.get("id", ""),
+                                "name": coin.get("name", ""),
+                                "symbol": coin.get("symbol", "").upper(),
+                                "market_cap": coin.get("market_cap", 0) or 0,
+                                "total_volume": coin.get("total_volume", 0) or 0,
+                                "current_price": coin.get("current_price", 0) or 0,
+                                "price_change_percentage_24h": coin.get("price_change_percentage_24h", 0) or 0
+                            })
+                    else:
+                        logger.error(f"CoinGecko status {resp.status}. Response: {await resp.text()}")
+        except Exception as e:
+            logger.error(f"CoinGecko request error (page {page}): {e}")
+    last_coins_data = all_coins
+    last_fetch_time = now
+    logger.info(f"Processed {len(all_coins)} coins")
+    return all_coins
 
 async def analyze_coins():
     coins = await fetch_coingecko_data()
@@ -101,12 +98,14 @@ async def analyze_coins():
         market_cap = coin.get('market_cap', 0) or 0
         volume = coin.get('total_volume', 0) or 0
         price_change = coin.get('price_change_percentage_24h', 0) or 0
+        volume_to_cap_ratio = volume / market_cap if market_cap > 0 else 0
 
         if (market_cap > 0 and market_cap < MIN_CAP and
             volume > MIN_VOLUME and volume < MAX_VOLUME and
-            price_change > MIN_PRICE_CHANGE):
+            price_change > MIN_PRICE_CHANGE and
+            volume_to_cap_ratio > 0.1):  # Співвідношення обсягу до капіталізації
             anomalies.append(coin)
-            logger.info(f"Found anomaly: {coin['name']} (Market Cap: {market_cap:,}, Volume: {volume:,}, Price Change: {price_change:.1f}%)")
+            logger.info(f"Found anomaly: {coin['name']} (Market Cap: {market_cap:,}, Volume: {volume:,}, Price Change: {price_change:.1f}%, Volume/Cap: {volume_to_cap_ratio:.2f})")
     logger.info(f"Found {len(anomalies)} anomalies")
     return anomalies
 
@@ -128,6 +127,7 @@ async def send_alert(chat_id: int, coin: dict):
         f"📊 Капіталізація: <code>${mcap:,}</code>\n"
         f"📈 Зміна 24h: <b>{change:.1f}%</b>\n"
         f"💹 Обсяг: <code>${vol:,}</code>\n"
+        f"🔗 <a href='https://www.coingecko.com/en/coins/{coin_id}'>CoinGecko</a>"
     )
 
     await bot.send_message(chat_id, msg, parse_mode="HTML", disable_web_page_preview=True)
@@ -154,6 +154,12 @@ async def monitoring_task(chat_id: int):
             logger.error(f"monitoring_task error: {e}")
             await bot.send_message(chat_id, f"⚠️ Помилка моніторингу: {str(e)}. Спробую ще раз.")
         await asyncio.sleep(CHECK_INTERVAL)
+
+async def clear_cache_task():
+    while True:
+        logger.info("Clearing alert cache")
+        alert_cache.clear()
+        await asyncio.sleep(86400)  # Раз на 24 години
 
 # Команди
 @dp.message(Command("start"))
@@ -255,13 +261,14 @@ async def help_cmd(message: types.Message):
 
 # Webhook і Lifespan
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan Occupation:0⁊lifespan(app: FastAPI):
     try:
         logger.info(f"Attempting to set webhook to {WEBHOOK_URL}")
         await bot.set_webhook(WEBHOOK_URL, secret_token=WEBHOOK_SECRET)
         logger.info(f"Webhook successfully set to {WEBHOOK_URL}")
         webhook_info = await bot.get_webhook_info()
         logger.info(f"Webhook info: {webhook_info}")
+        asyncio.create_task(clear_cache_task())  # Запускаємо очищення кешу
     except Exception as e:
         logger.error(f"Failed to set webhook: {e}")
         logger.info("Falling back to polling mode")
