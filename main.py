@@ -57,7 +57,7 @@ async def fetch_mobula_cached():
         return last_coins_data
 
     logger.info("Fetching new data from Mobula API")
-    url = "https://api.mobula.io/v1/market/multi-data"
+    url = "https://api.mobula.io/v2/market/multi-data"
     headers = {"Authorization": f"Bearer {MOBULA_API_KEY}"}
     params = {"assets": "all", "limit": 500, "offset": 0}
 
