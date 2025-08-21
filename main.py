@@ -465,7 +465,7 @@ async def latest_cmd(message: types.Message):
     else:
         await message.answer("ℹ Аномалій ще немає")
 
-@dp.message(Command("topvol")))
+@dp.message(Command("topvol"))
 async def topvol_cmd(message: types.Message):
     logger.info(f"Received /topvol from chat_id: {message.chat.id}")
     raw = await jup_get_category("toptraded", interval="24h", limit=100)
