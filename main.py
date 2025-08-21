@@ -103,7 +103,7 @@ async def analyze_coins():
         if (market_cap > 0 and market_cap < MIN_CAP and
             volume > MIN_VOLUME and volume < MAX_VOLUME and
             price_change > MIN_PRICE_CHANGE and
-            volume_to_cap_ratio > 0.1):  # Співвідношення обсягу до капіталізації
+            volume_to_cap_ratio > 0.1):
             anomalies.append(coin)
             logger.info(f"Found anomaly: {coin['name']} (Market Cap: {market_cap:,}, Volume: {volume:,}, Price Change: {price_change:.1f}%, Volume/Cap: {volume_to_cap_ratio:.2f})")
     logger.info(f"Found {len(anomalies)} anomalies")
@@ -261,7 +261,7 @@ async def help_cmd(message: types.Message):
 
 # Webhook і Lifespan
 @asynccontextmanager
-async def lifespan Occupation:0⁊lifespan(app: FastAPI):
+async def lifespan(app: FastAPI):
     try:
         logger.info(f"Attempting to set webhook to {WEBHOOK_URL}")
         await bot.set_webhook(WEBHOOK_URL, secret_token=WEBHOOK_SECRET)
