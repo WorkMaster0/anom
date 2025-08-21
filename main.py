@@ -7,6 +7,7 @@ from aiogram.filters import Command
 from html import escape
 import asyncio
 from datetime import datetime
+import json
 from cachetools import TTLCache
 import aiohttp
 
@@ -23,18 +24,15 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 APP_BASE_URL = os.getenv("APP_BASE_URL", "https://anom-1.onrender.com").rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", f"{APP_BASE_URL}/webhook").strip()
-BITQUERY_API_KEY = os.getenv("BITQUERY_API_KEY", "").strip()
-MIN_CAP = int(os.getenv("MIN_CAP", "100000000"))  # $100M
-MIN_VOLUME = int(os.getenv("MIN_VOLUME", "10000"))  # $10K
+MIN_CAP = int(os.getenv("MIN_CAP", "0"))  # $0
+MIN_VOLUME = int(os.getenv("MIN_VOLUME", "1000"))  # $1K
 MAX_VOLUME = int(os.getenv("MAX_VOLUME", "100000000"))  # $100M
-MIN_PRICE_CHANGE = float(os.getenv("MIN_PRICE_CHANGE", "20"))  # 20%
+MIN_PRICE_CHANGE = float(os.getenv("MIN_PRICE_CHANGE", "0"))  # 0%
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "600"))  # 10 хвилин
 MAX_ALERTS_PER_CYCLE = int(os.getenv("MAX_ALERTS_PER_CYCLE", "20"))
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN не задано")
-if not BITQUERY_API_KEY:
-    raise RuntimeError("BITQUERY_API_KEY не задано")
 
 # Ініціалізація
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -49,93 +47,93 @@ last_fetch_time = 0
 last_coins_data = []
 rate_limit_exceeded = False
 last_rate_limit_time = 0
-request_lock = asyncio.Lock()  # Асинхронна блокировка для запитів
+request_lock = asyncio.Lock()
 request_count = 0
 request_count_reset_time = 0
-MAX_REQUESTS_PER_MINUTE = 8  # Обмеження до 8 запитів/хв (Bitquery: 10 запитів/хв)
+MAX_REQUESTS_PER_MINUTE = 50  # DexScreener: 60 запитів/хв
 
-# Bitquery API
-async def fetch_bitquery_data():
+# Локальний кеш у файл
+async def save_coins_to_file(coins):
+    try:
+        with open("coins_cache.json", "w") as f:
+            json.dump(coins, f)
+        logger.info("Saved coins to file")
+    except Exception as e:
+        logger.error(f"Failed to save coins to file: {e}")
+
+async def load_coins_from_file():
+    try:
+        with open("coins_cache.json", "r") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"Failed to load coins from file: {e}")
+        return []
+
+# DexScreener API
+async def fetch_dexscreener_data():
     global last_fetch_time, last_coins_data, rate_limit_exceeded, last_rate_limit_time, request_count, request_count_reset_time
     now = datetime.now().timestamp()
-    wait_time = 300  # 5 хвилин очікування після 429
+    wait_time = 300
 
-    # Скидаємо лічильник запитів кожну хвилину
     if now - request_count_reset_time > 60:
         request_count = 0
         request_count_reset_time = now
         logger.info("Reset request count")
 
-    # Перевірка ліміту запитів
     if request_count >= MAX_REQUESTS_PER_MINUTE:
-        logger.info(f"Reached max requests ({MAX_REQUESTS_PER_MINUTE}), skipping fetch")
-        return last_coins_data, 60  # Чекаємо до наступної хвилини
+        logger.info(f"Reached max requests ({MAX_REQUESTS_PER_MINUTE}), using file cache")
+        return await load_coins_from_file(), 60
 
-    # Перевірка часу очікування після 429
     if rate_limit_exceeded and (now - last_rate_limit_time) < wait_time:
         remaining = int(wait_time - (now - last_rate_limit_time))
         logger.info(f"Rate limit exceeded, {remaining} seconds remaining")
-        return last_coins_data, remaining
+        return await load_coins_from_file(), remaining
 
-    # Перевірка кешу
-    if now - last_fetch_time < 1800 and last_coins_data:  # Кеш на 30 хвилин
-        logger.info("Returning cached Bitquery data")
+    if now - last_fetch_time < 1800 and last_coins_data:
+        logger.info("Returning cached DexScreener data")
         return last_coins_data, 0
 
-    async with request_lock:  # Блокуємо одночасні запити
+    async with request_lock:
         request_count += 1
         logger.info(f"Request count: {request_count}/{MAX_REQUESTS_PER_MINUTE}")
-        url = "https://graphql.bitquery.io"
-        query = """
-        query MyQuery {
-          Solana {
-            DEXTradeByTokens(
-              where: {Transaction: {Result: {Success: true}}, Block: {Time: {since: "2025-08-21T00:00:00Z"}}}
-              limit: {count: 100}
-            ) {
-              Trade {
-                Currency { Name Symbol MintAddress }
-                PriceInUSD
-                Side { AmountInUSD Type }
-              }
-              total_volume: sum(of: Trade_Side_AmountInUSD)
-            }
-          }
-        }
-        """
-        headers = {"X-API-KEY": BITQUERY_API_KEY}
+        url = "https://api.dexscreener.com/latest/dex/pairs/solana"
         all_coins = []
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, json={"query": query}, headers=headers, timeout=15) as resp:
-                    logger.info(f"Bitquery API response status: {resp.status}")
+                async with session.get(url, timeout=15) as resp:
+                    logger.info(f"DexScreener API response status: {resp.status}")
                     if resp.status == 200:
                         data = await resp.json()
-                        trades = data.get("data", {}).get("Solana", {}).get("DEXTradeByTokens", [])
-                        logger.info(f"Received {len(trades)} trades from Bitquery")
-                        for trade in trades:
-                            currency = trade.get("Trade", {}).get("Currency", {})
+                        pairs = data.get("pairs", [])
+                        logger.info(f"Received {len(pairs)} pairs from DexScreener")
+                        for pair in pairs:
+                            volume = pair.get("volume", {}).get("h24", 0) or 0
+                            if volume < 1000:  # Фільтруємо низький обсяг
+                                continue
                             all_coins.append({
-                                "id": currency.get("MintAddress", ""),
-                                "name": currency.get("Name", "") or "Unknown",
-                                "symbol": currency.get("Symbol", "").upper() or "UNK",
-                                "market_cap": 0,  # Bitquery не надає market_cap
-                                "total_volume": trade.get("total_volume", 0) or 0,
-                                "current_price": trade.get("Trade", {}).get("PriceInUSD", 0) or 0,
-                                "price_change_percentage_24h": 0,  # Bitquery не надає, використовуємо 0
+                                "id": pair.get("pairAddress", ""),
+                                "name": pair.get("baseToken", {}).get("name", "") or "Unknown",
+                                "symbol": pair.get("baseToken", {}).get("symbol", "").upper() or "UNK",
+                                "market_cap": pair.get("marketCap", 0) or 0,
+                                "total_volume": volume,
+                                "current_price": pair.get("priceUsd", 0) or 0,
+                                "price_change_percentage_24h": pair.get("priceChange", {}).get("h24", 0) or 0,
                                 "chainId": "solana",
-                                "pairAddress": ""
+                                "pairAddress": pair.get("pairAddress", "")
                             })
+                        await save_coins_to_file(all_coins)
                     elif resp.status == 429:
-                        logger.error(f"Bitquery status 429. Response: {await resp.text()}")
+                        logger.error(f"DexScreener status 429. Response: {await resp.text()}")
                         rate_limit_exceeded = True
                         last_rate_limit_time = now
-                        return last_coins_data, wait_time
+                        return await load_coins_from_file(), wait_time
                     else:
-                        logger.error(f"Bitquery status {resp.status}. Response: {await resp.text()}")
-                    await asyncio.sleep(1)  # Затримка 1 секунда
+                        logger.error(f"DexScreener status {resp.status}. Response: {await resp.text()}")
+                        return await load_coins_from_file(), 0
+                    await asyncio.sleep(1)
         except Exception as e:
-            logger.error(f"Bitquery request error: {e}")
+            logger.error(f"DexScreener request error: {e}")
+            return await load_coins_from_file(), 0
         last_coins_data = all_coins
         last_fetch_time = now
         rate_limit_exceeded = False
@@ -143,21 +141,22 @@ async def fetch_bitquery_data():
         return all_coins, 0
 
 async def analyze_coins(chat_id: int = None):
-    coins, wait_time = await fetch_bitquery_data()
+    coins, wait_time = await fetch_dexscreener_data()
     logger.info(f"Analyzing {len(coins)} coins")
     anomalies = []
     if not coins and rate_limit_exceeded:
         if chat_id:
-            await bot.send_message(chat_id, f"⚠️ Перевищено ліміт запитів до Bitquery API. Зачекайте {wait_time} секунд.")
+            await bot.send_message(chat_id, f"⚠️ Перевищено ліміт запитів до DexScreener API. Зачекайте {wait_time} секунд.")
+        return anomalies
+    if not coins:
+        if chat_id:
+            await bot.send_message(chat_id, "ℹ️ Не знайдено торгів на Solana DEX. Спробуйте змінити критерії через /setcriteria.")
         return anomalies
     for coin in coins:
         market_cap = coin.get('market_cap', 0) or 0
         volume = coin.get('total_volume', 0) or 0
         price_change = coin.get('price_change_percentage_24h', 0) or 0
-        volume_to_cap_ratio = volume / market_cap if market_cap > 0 else 0
-
-        # Ігноруємо market_cap, якщо він 0, і використовуємо лише обсяг і зміну ціни
-        if (volume > MIN_VOLUME and volume < MAX_VOLUME and
+        if (market_cap >= MIN_CAP and volume > MIN_VOLUME and volume < MAX_VOLUME and
             price_change >= MIN_PRICE_CHANGE):
             anomalies.append(coin)
             logger.info(f"Found anomaly: {coin['name']} (Volume: {volume:,}, Price Change: {price_change:.1f}%)")
@@ -168,7 +167,6 @@ async def send_alert(chat_id: int, coin: dict):
     coin_id = coin.get("id", "")
     if coin_id in alert_cache:
         return
-
     name = escape(coin.get("name", "Unknown"))
     sym = escape(coin.get("symbol", "UNK").upper())
     price = coin.get("current_price", 0) or 0
@@ -176,7 +174,6 @@ async def send_alert(chat_id: int, coin: dict):
     change = coin.get("price_change_percentage_24h", 0) or 0
     vol = coin.get("total_volume", 0) or 0
     chain = escape(coin.get("chainId", ""))
-
     msg = (
         f"🚨 <b>{name} ({sym})</b>\n"
         f"💰 Ціна: <code>${price:.8f}</code>\n"
@@ -184,9 +181,8 @@ async def send_alert(chat_id: int, coin: dict):
         f"📈 Зміна 24h: <b>{change:.1f}%</b>\n"
         f"💹 Обсяг: <code>${vol:,}</code>\n"
         f"🔗 Ланцюг: {chain}\n"
-        f"🔗 Дані з Bitquery API"
+        f"🔗 Дані з DexScreener API"
     )
-
     await bot.send_message(chat_id, msg, parse_mode="HTML", disable_web_page_preview=True)
     alert_cache[coin_id] = 1
     latest_anomalies.insert(0, coin)
@@ -201,7 +197,7 @@ async def monitoring_task(chat_id: int):
             if not anomalies:
                 logger.info("No anomalies found or API error occurred")
                 if not rate_limit_exceeded:
-                    await bot.send_message(chat_id, "ℹ️ Немає аномальних токенів або помилка API. Спробую ще раз через 10 хвилин.")
+                    await bot.send_message(chat_id, "ℹ️ Немає аномальних токенів. Спробую ще раз через 10 хвилин.")
             else:
                 sent = 0
                 for coin in anomalies:
@@ -217,7 +213,7 @@ async def clear_cache_task():
     while True:
         logger.info("Clearing alert cache")
         alert_cache.clear()
-        await asyncio.sleep(86400)  # Раз на 24 години
+        await asyncio.sleep(86400)
 
 # Команди
 @dp.message(Command("start"))
@@ -235,8 +231,8 @@ async def start_cmd(message: types.Message):
         "• /stop — зупинити\n"
         "• /status — статус\n"
         "• /latest — останні аномалії\n"
-        "• /topvol — топ дрібних капів за обсягом\n"
-        "• /topgainers — топ дрібних капів за ростом\n"
+        "• /topvol — топ за обсягом\n"
+        "• /topgainers — топ за ростом\n"
         "• /setcriteria — налаштувати критерії\n"
         "• /help — ця підказка"
     )
@@ -271,14 +267,17 @@ async def latest_cmd(message: types.Message):
 @dp.message(Command("topvol"))
 async def topvol_cmd(message: types.Message):
     logger.info(f"Received /topvol command from chat_id: {message.chat.id}")
-    coins, wait_time = await fetch_bitquery_data()
+    coins, wait_time = await fetch_dexscreener_data()
     if not coins and rate_limit_exceeded:
-        await message.answer(f"⚠️ Перевищено ліміт запитів до Bitquery API. Зачекайте {wait_time} секунд.")
+        await message.answer(f"⚠️ Перевищено ліміт запитів до DexScreener API. Зачекайте {wait_time} секунд.")
+        return
+    if not coins:
+        await message.answer("ℹ️ Не знайдено торгів на Solana DEX. Спробуйте змінити критерії через /setcriteria.")
         return
     filtered = [c for c in coins if c.get("total_volume", 0) > MIN_VOLUME and c.get("total_volume", 0) < MAX_VOLUME]
     top_coins = sorted(filtered, key=lambda x: x.get("total_volume", 0), reverse=True)[:20]
     if top_coins:
-        lines = ["💹 Топ дрібних капів за обсягом:"]
+        lines = ["💹 Топ за обсягом:"]
         for coin in top_coins:
             lines.append(f"• {escape(coin['name'])} ({escape(coin['symbol'])}) — ${coin.get('total_volume', 0):,.0f}")
         await message.answer("\n".join(lines))
@@ -288,14 +287,17 @@ async def topvol_cmd(message: types.Message):
 @dp.message(Command("topgainers"))
 async def topgainers_cmd(message: types.Message):
     logger.info(f"Received /topgainers command from chat_id: {message.chat.id}")
-    coins, wait_time = await fetch_bitquery_data()
+    coins, wait_time = await fetch_dexscreener_data()
     if not coins and rate_limit_exceeded:
-        await message.answer(f"⚠️ Перевищено ліміт запитів до Bitquery API. Зачекайте {wait_time} секунд.")
+        await message.answer(f"⚠️ Перевищено ліміт запитів до DexScreener API. Зачекайте {wait_time} секунд.")
+        return
+    if not coins:
+        await message.answer("ℹ️ Не знайдено торгів на Solana DEX. Спробуйте змінити критерії через /setcriteria.")
         return
     filtered = [c for c in coins if c.get("total_volume", 0) > MIN_VOLUME and c.get("total_volume", 0) < MAX_VOLUME]
     top_coins = sorted(filtered, key=lambda x: x.get("price_change_percentage_24h", 0), reverse=True)[:20]
     if top_coins:
-        lines = ["🚀 Топ дрібних капів за ростом:"]
+        lines = ["🚀 Топ за ростом:"]
         for coin in top_coins:
             lines.append(f"• {escape(coin['name'])} ({escape(coin['symbol'])}) — +{coin.get('price_change_percentage_24h', 0):.1f}%")
         await message.answer("\n".join(lines))
@@ -308,7 +310,7 @@ async def set_criteria_cmd(message: types.Message):
     try:
         args = message.text.split()[1:]
         if len(args) != 3:
-            await message.answer("ℹ️ Використовуйте: /setcriteria MIN_CAP MIN_VOLUME MIN_PRICE_CHANGE\nПриклад: /setcriteria 50000000 5000 10")
+            await message.answer("ℹ️ Використовуйте: /setcriteria MIN_CAP MIN_VOLUME MIN_PRICE_CHANGE\nПриклад: /setcriteria 100000 1000 5")
             return
         global MIN_CAP, MIN_VOLUME, MIN_PRICE_CHANGE
         MIN_CAP = int(args[0])
@@ -316,7 +318,7 @@ async def set_criteria_cmd(message: types.Message):
         MIN_PRICE_CHANGE = float(args[2])
         await message.answer(f"✅ Критерії оновлено:\nMIN_CAP: ${MIN_CAP:,}\nMIN_VOLUME: ${MIN_VOLUME:,}\nMIN_PRICE_CHANGE: {MIN_PRICE_CHANGE}%")
     except Exception as e:
-        await message.answer(f"⚠️ Помилка: {str(e)}")
+        await message.answer(f"⚠️ Помилка: {str(e)}. Використовуйте: /setcriteria 100000 1000 5")
 
 @dp.message(Command("help"))
 async def help_cmd(message: types.Message):
@@ -332,7 +334,7 @@ async def lifespan(app: FastAPI):
         logger.info(f"Webhook successfully set to {WEBHOOK_URL}")
         webhook_info = await bot.get_webhook_info()
         logger.info(f"Webhook info: {webhook_info}")
-        asyncio.create_task(clear_cache_task())  # Запускаємо очищення кешу
+        asyncio.create_task(clear_cache_task())
     except Exception as e:
         logger.error(f"Failed to set webhook: {e}")
         logger.info("Falling back to polling mode")
