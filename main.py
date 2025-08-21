@@ -20,21 +20,18 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-MOBULA_API_KEY = os.getenv("MOBULA_API_KEY", "").strip()
 APP_BASE_URL = os.getenv("APP_BASE_URL", "https://anom-1.onrender.com").rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", f"{APP_BASE_URL}/webhook").strip()
-MIN_CAP = int(os.getenv("MIN_CAP", "100000000"))
-MIN_VOLUME = int(os.getenv("MIN_VOLUME", "10000"))
-MAX_VOLUME = int(os.getenv("MAX_VOLUME", "100000000"))
-MIN_PRICE_CHANGE = float(os.getenv("MIN_PRICE_CHANGE", "20"))
+MIN_CAP = int(os.getenv("MIN_CAP", "100000000"))  # $100M
+MIN_VOLUME = int(os.getenv("MIN_VOLUME", "10000"))  # $10K
+MAX_VOLUME = int(os.getenv("MAX_VOLUME", "100000000"))  # $100M
+MIN_PRICE_CHANGE = float(os.getenv("MIN_PRICE_CHANGE", "20"))  # 20%
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "120"))
 MAX_ALERTS_PER_CYCLE = int(os.getenv("MAX_ALERTS_PER_CYCLE", "20"))
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN не задано")
-if not MOBULA_API_KEY:
-    raise RuntimeError("MOBULA_API_KEY не задано")
 
 # Ініціалізація
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -48,90 +45,68 @@ latest_anomalies = []
 last_fetch_time = 0
 last_coins_data = []
 
-# Mobula API
-async def fetch_mobula_cached():
+# CoinGecko API
+async def fetch_coingecko_data():
     global last_fetch_time, last_coins_data
     now = datetime.now().timestamp()
     if now - last_fetch_time < 600 and last_coins_data:
-        logger.info("Returning cached Mobula data")
+        logger.info("Returning cached CoinGecko data")
         return last_coins_data
 
-    logger.info("Fetching new data from Mobula API")
-    url = "https://api.mobula.io/api/1/market/data"  # Оновлений ендпоінт
-    headers = {"Authorization": f"Bearer {MOBULA_API_KEY}"}
-    params = {"asset": "Bitcoin,BNB,Pepe"}  # Тестуємо з кількома активами
+    logger.info("Fetching new data from CoinGecko API")
+    url = "https://api.coingecko.com/api/v3/coins/markets"
+    params = {
+        "vs_currency": "usd",
+        "order": "market_cap_desc",
+        "per_page": 250,  # Максимум 250 на сторінку
+        "page": 1,
+        "sparkline": False
+    }
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, params=params, timeout=10) as resp:
-                logger.info(f"Mobula API response status: {resp.status}")
+            async with session.get(url, params=params, timeout=15) as resp:
+                logger.info(f"CoinGecko API response status: {resp.status}")
                 if resp.status == 200:
                     data = await resp.json()
-                    logger.info(f"Received data from Mobula: {data}")
-                    raw_assets = data.get("data", []) if isinstance(data.get("data"), list) else [data.get("data")]
+                    logger.info(f"Received {len(data)} coins from CoinGecko")
                     formatted_data = []
-                    for asset in raw_assets:
-                        coin = {
-                            "id": asset.get("id", ""),
-                            "name": asset.get("name", ""),
-                            "symbol": asset.get("symbol", ""),
-                            "market_cap": asset.get("market_cap", 0),
-                            "total_volume": asset.get("volume", 0),
-                            "current_price": asset.get("price", 0),
-                            "price_change_percentage_24h": asset.get("price_change_24h", 0) * 100
-                        }
-                        formatted_data.append(coin)
+                    for coin in data:
+                        formatted_data.append({
+                            "id": coin.get("id", ""),
+                            "name": coin.get("name", ""),
+                            "symbol": coin.get("symbol", "").upper(),
+                            "market_cap": coin.get("market_cap", 0) or 0,
+                            "total_volume": coin.get("total_volume", 0) or 0,
+                            "current_price": coin.get("current_price", 0) or 0,
+                            "price_change_percentage_24h": coin.get("price_change_percentage_24h", 0) or 0
+                        })
                     last_coins_data = formatted_data
                     last_fetch_time = now
                     return formatted_data
-                elif resp.status == 404:
-                    logger.error(f"Mobula API returned 404. URL: {url}, Params: {params}, Headers: {headers}")
-                    # Спробуємо альтернативний ендпоінт
-                    alt_url = "https://api.mobula.io/api/1/market/multi-data"
-                    logger.info(f"Retrying with alternative URL: {alt_url}")
-                    async with session.get(alt_url, headers=headers, params=params, timeout=10) as alt_resp:
-                        if alt_resp.status == 200:
-                            data = await alt_resp.json()
-                            logger.info(f"Received {len(data.get('data', []))} coins from Mobula (multi-data)")
-                            raw_assets = data.get("data", [])
-                            formatted_data = []
-                            for asset in raw_assets:
-                                coin = {
-                                    "id": asset.get("id", ""),
-                                    "name": asset.get("name", ""),
-                                    "symbol": asset.get("symbol", ""),
-                                    "market_cap": asset.get("market_cap", 0),
-                                    "total_volume": asset.get("volume", 0),
-                                    "current_price": asset.get("price", 0),
-                                    "price_change_percentage_24h": asset.get("price_change_24h", 0) * 100
-                                }
-                                formatted_data.append(coin)
-                            last_coins_data = formatted_data
-                            last_fetch_time = now
-                            return formatted_data
-                        else:
-                            logger.error(f"Alternative Mobula API returned {alt_resp.status}. URL: {alt_url}, Response: {await alt_resp.text()}")
-                elif resp.status == 429:
-                    logger.warning("Mobula rate limit 429, retry in 60s")
-                    await asyncio.sleep(60)
-                    return await fetch_mobula_cached()
                 else:
-                    logger.error(f"Mobula status {resp.status}. Response: {await resp.text()}")
+                    logger.error(f"CoinGecko status {resp.status}. Response: {await resp.text()}")
+                    return []
     except Exception as e:
-        logger.error(f"Помилка запиту Mobula: {e}")
+        logger.error(f"CoinGecko request error: {e}")
+        return []
 
     return last_coins_data
 
 async def analyze_coins():
-    coins = await fetch_mobula_cached()
+    coins = await fetch_coingecko_data()
+    logger.info(f"Analyzing {len(coins)} coins")
     anomalies = []
     for coin in coins:
-        market_cap = coin.get('market_cap', 0)
-        volume = coin.get('total_volume', 0)
-        price_change = coin.get('price_change_percentage_24h', 0)
+        market_cap = coin.get('market_cap', 0) or 0
+        volume = coin.get('total_volume', 0) or 0
+        price_change = coin.get('price_change_percentage_24h', 0) or 0
 
-        if market_cap < MIN_CAP and volume > MIN_VOLUME and price_change > MIN_PRICE_CHANGE:
+        if (market_cap > 0 and market_cap < MIN_CAP and
+            volume > MIN_VOLUME and volume < MAX_VOLUME and
+            price_change > MIN_PRICE_CHANGE):
             anomalies.append(coin)
+            logger.info(f"Found anomaly: {coin['name']} (Market Cap: {market_cap:,}, Volume: {volume:,}, Price Change: {price_change:.1f}%)")
     logger.info(f"Found {len(anomalies)} anomalies")
     return anomalies
 
@@ -141,11 +116,11 @@ async def send_alert(chat_id: int, coin: dict):
         return
 
     name = escape(coin.get("name", ""))
-    sym = escape((coin.get("symbol") or "").upper())
-    price = coin.get("current_price") or 0
-    mcap = coin.get("market_cap") or 0
-    change = coin.get("price_change_percentage_24h") or 0
-    vol = coin.get("total_volume") or 0
+    sym = escape(coin.get("symbol", "").upper())
+    price = coin.get("current_price", 0) or 0
+    mcap = coin.get("market_cap", 0) or 0
+    change = coin.get("price_change_percentage_24h", 0) or 0
+    vol = coin.get("total_volume", 0) or 0
 
     msg = (
         f"🚨 <b>{name} ({sym})</b>\n"
@@ -166,13 +141,18 @@ async def monitoring_task(chat_id: int):
     while active_monitoring.get(chat_id):
         try:
             anomalies = await analyze_coins()
-            sent = 0
-            for coin in anomalies:
-                if coin["id"] not in alert_cache and sent < MAX_ALERTS_PER_CYCLE:
-                    await send_alert(chat_id, coin)
-                    sent += 1
+            if not anomalies:
+                logger.info("No anomalies found or API error occurred")
+                await bot.send_message(chat_id, "ℹ️ Немає аномальних токенів або помилка API. Спробую ще раз через 2 хвилини.")
+            else:
+                sent = 0
+                for coin in anomalies:
+                    if coin["id"] not in alert_cache and sent < MAX_ALERTS_PER_CYCLE:
+                        await send_alert(chat_id, coin)
+                        sent += 1
         except Exception as e:
             logger.error(f"monitoring_task error: {e}")
+            await bot.send_message(chat_id, f"⚠️ Помилка моніторингу: {str(e)}. Спробую ще раз.")
         await asyncio.sleep(CHECK_INTERVAL)
 
 # Команди
@@ -193,6 +173,7 @@ async def start_cmd(message: types.Message):
         "• /latest — останні аномалії\n"
         "• /topvol — топ дрібних капів за обсягом\n"
         "• /topgainers — топ дрібних капів за ростом\n"
+        "• /setcriteria — налаштувати критерії\n"
         "• /help — ця підказка"
     )
 
@@ -218,7 +199,7 @@ async def latest_cmd(message: types.Message):
     if latest_anomalies:
         lines = ["🔍 Останні аномальні токени:"]
         for coin in latest_anomalies[:20]:
-            lines.append(f"• {escape(coin['name'])} ({escape(coin['symbol'].upper())})")
+            lines.append(f"• {escape(coin['name'])} ({escape(coin['symbol'])})")
         await message.answer("\n".join(lines))
     else:
         await message.answer("ℹ Аномалій ще немає")
@@ -226,13 +207,13 @@ async def latest_cmd(message: types.Message):
 @dp.message(Command("topvol"))
 async def topvol_cmd(message: types.Message):
     logger.info(f"Received /topvol command from chat_id: {message.chat.id}")
-    coins = await fetch_mobula_cached()
-    filtered = [c for c in coins if c.get("market_cap", 0) < MIN_CAP]
+    coins = await fetch_coingecko_data()
+    filtered = [c for c in coins if c.get("market_cap", 0) > 0 and c.get("market_cap", 0) < MIN_CAP]
     top_coins = sorted(filtered, key=lambda x: x.get("total_volume", 0), reverse=True)[:20]
     if top_coins:
         lines = ["💹 Топ дрібних капів за обсягом:"]
         for coin in top_coins:
-            lines.append(f"• {escape(coin['name'])} ({escape(coin['symbol'].upper())}) — ${coin.get('total_volume', 0):,.0f}")
+            lines.append(f"• {escape(coin['name'])} ({escape(coin['symbol'])}) — ${coin.get('total_volume', 0):,.0f}")
         await message.answer("\n".join(lines))
     else:
         await message.answer("ℹ️ Немає токенів, що відповідають критеріям.")
@@ -240,16 +221,32 @@ async def topvol_cmd(message: types.Message):
 @dp.message(Command("topgainers"))
 async def topgainers_cmd(message: types.Message):
     logger.info(f"Received /topgainers command from chat_id: {message.chat.id}")
-    coins = await fetch_mobula_cached()
-    filtered = [c for c in coins if c.get("market_cap", 0) < MIN_CAP]
+    coins = await fetch_coingecko_data()
+    filtered = [c for c in coins if c.get("market_cap", 0) > 0 and c.get("market_cap", 0) < MIN_CAP]
     top_coins = sorted(filtered, key=lambda x: x.get("price_change_percentage_24h", 0), reverse=True)[:20]
     if top_coins:
         lines = ["🚀 Топ дрібних капів за ростом:"]
         for coin in top_coins:
-            lines.append(f"• {escape(coin['name'])} ({escape(coin['symbol'].upper())}) — +{coin.get('price_change_percentage_24h', 0):.1f}%")
+            lines.append(f"• {escape(coin['name'])} ({escape(coin['symbol'])}) — +{coin.get('price_change_percentage_24h', 0):.1f}%")
         await message.answer("\n".join(lines))
     else:
         await message.answer("ℹ️ Немає токенів, що відповідають критеріям.")
+
+@dp.message(Command("setcriteria"))
+async def set_criteria_cmd(message: types.Message):
+    logger.info(f"Received /setcriteria command from chat_id: {message.chat.id}")
+    try:
+        args = message.text.split()[1:]
+        if len(args) != 3:
+            await message.answer("ℹ️ Використовуйте: /setcriteria MIN_CAP MIN_VOLUME MIN_PRICE_CHANGE\nПриклад: /setcriteria 50000000 5000 10")
+            return
+        global MIN_CAP, MIN_VOLUME, MIN_PRICE_CHANGE
+        MIN_CAP = int(args[0])
+        MIN_VOLUME = int(args[1])
+        MIN_PRICE_CHANGE = float(args[2])
+        await message.answer(f"✅ Критерії оновлено:\nMIN_CAP: ${MIN_CAP:,}\nMIN_VOLUME: ${MIN_VOLUME:,}\nMIN_PRICE_CHANGE: {MIN_PRICE_CHANGE}%")
+    except Exception as e:
+        await message.answer(f"⚠️ Помилка: {str(e)}")
 
 @dp.message(Command("help"))
 async def help_cmd(message: types.Message):
@@ -260,13 +257,15 @@ async def help_cmd(message: types.Message):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
+        logger.info(f"Attempting to set webhook to {WEBHOOK_URL}")
         await bot.set_webhook(WEBHOOK_URL, secret_token=WEBHOOK_SECRET)
-        logger.info(f"Webhook set to {WEBHOOK_URL}")
-        # Перевірка статусу вебхука
+        logger.info(f"Webhook successfully set to {WEBHOOK_URL}")
         webhook_info = await bot.get_webhook_info()
         logger.info(f"Webhook info: {webhook_info}")
     except Exception as e:
         logger.error(f"Failed to set webhook: {e}")
+        logger.info("Falling back to polling mode")
+        asyncio.create_task(dp.start_polling(bot))
     
     yield
     
@@ -280,6 +279,10 @@ app.lifespan = lifespan
 
 @app.get("/")
 async def root():
+    return {"message": "Ultimaster Bot is running!"}
+
+@app.head("/")
+async def root_head():
     return {"message": "Ultimaster Bot is running!"}
 
 @app.post("/webhook")
