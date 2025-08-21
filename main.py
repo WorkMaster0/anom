@@ -57,9 +57,9 @@ async def fetch_mobula_cached():
         return last_coins_data
 
     logger.info("Fetching new data from Mobula API")
-    url = "https://api.mobula.io/v/market/data"
+    url = "https://api.mobula.io/api/1/market/data"  # Оновлений ендпоінт
     headers = {"Authorization": f"Bearer {MOBULA_API_KEY}"}
-    params = {"assets": "all", "limit": 500, "offset": 0}
+    params = {"asset": "Bitcoin,BNB,Pepe"}  # Тестуємо з кількома активами
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -67,8 +67,8 @@ async def fetch_mobula_cached():
                 logger.info(f"Mobula API response status: {resp.status}")
                 if resp.status == 200:
                     data = await resp.json()
-                    logger.info(f"Received {len(data.get('data', []))} coins from Mobula")
-                    raw_assets = data.get("data", [])
+                    logger.info(f"Received data from Mobula: {data}")
+                    raw_assets = data.get("data", []) if isinstance(data.get("data"), list) else [data.get("data")]
                     formatted_data = []
                     for asset in raw_assets:
                         coin = {
@@ -76,7 +76,7 @@ async def fetch_mobula_cached():
                             "name": asset.get("name", ""),
                             "symbol": asset.get("symbol", ""),
                             "market_cap": asset.get("market_cap", 0),
-                            "total_volume": asset.get("volume_24h", 0),
+                            "total_volume": asset.get("volume", 0),
                             "current_price": asset.get("price", 0),
                             "price_change_percentage_24h": asset.get("price_change_24h", 0) * 100
                         }
@@ -84,12 +84,39 @@ async def fetch_mobula_cached():
                     last_coins_data = formatted_data
                     last_fetch_time = now
                     return formatted_data
+                elif resp.status == 404:
+                    logger.error(f"Mobula API returned 404. URL: {url}, Params: {params}, Headers: {headers}")
+                    # Спробуємо альтернативний ендпоінт
+                    alt_url = "https://api.mobula.io/api/1/market/multi-data"
+                    logger.info(f"Retrying with alternative URL: {alt_url}")
+                    async with session.get(alt_url, headers=headers, params=params, timeout=10) as alt_resp:
+                        if alt_resp.status == 200:
+                            data = await alt_resp.json()
+                            logger.info(f"Received {len(data.get('data', []))} coins from Mobula (multi-data)")
+                            raw_assets = data.get("data", [])
+                            formatted_data = []
+                            for asset in raw_assets:
+                                coin = {
+                                    "id": asset.get("id", ""),
+                                    "name": asset.get("name", ""),
+                                    "symbol": asset.get("symbol", ""),
+                                    "market_cap": asset.get("market_cap", 0),
+                                    "total_volume": asset.get("volume", 0),
+                                    "current_price": asset.get("price", 0),
+                                    "price_change_percentage_24h": asset.get("price_change_24h", 0) * 100
+                                }
+                                formatted_data.append(coin)
+                            last_coins_data = formatted_data
+                            last_fetch_time = now
+                            return formatted_data
+                        else:
+                            logger.error(f"Alternative Mobula API returned {alt_resp.status}. URL: {alt_url}, Response: {await alt_resp.text()}")
                 elif resp.status == 429:
                     logger.warning("Mobula rate limit 429, retry in 60s")
                     await asyncio.sleep(60)
                     return await fetch_mobula_cached()
                 else:
-                    logger.error(f"Mobula status {resp.status}")
+                    logger.error(f"Mobula status {resp.status}. Response: {await resp.text()}")
     except Exception as e:
         logger.error(f"Помилка запиту Mobula: {e}")
 
