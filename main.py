@@ -1,6 +1,7 @@
 import os
 import logging
 from fastapi import FastAPI, Request
+from contextlib import asynccontextmanager
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from html import escape
@@ -20,9 +21,9 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 MOBULA_API_KEY = os.getenv("MOBULA_API_KEY", "").strip()
-APP_BASE_URL = os.getenv("APP_BASE_URL", "").rstrip("/")
+APP_BASE_URL = os.getenv("APP_BASE_URL", "https://anom-1.onrender.com").rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", f"{APP_BASE_URL}/webhook")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", f"{APP_BASE_URL}/webhook").strip()
 MIN_CAP = int(os.getenv("MIN_CAP", "100000000"))
 MIN_VOLUME = int(os.getenv("MIN_VOLUME", "10000"))
 MAX_VOLUME = int(os.getenv("MAX_VOLUME", "100000000"))
@@ -52,8 +53,10 @@ async def fetch_mobula_cached():
     global last_fetch_time, last_coins_data
     now = datetime.now().timestamp()
     if now - last_fetch_time < 600 and last_coins_data:
+        logger.info("Returning cached Mobula data")
         return last_coins_data
 
+    logger.info("Fetching new data from Mobula API")
     url = "https://api.mobula.io/v1/market/multi-data"
     headers = {"Authorization": f"Bearer {MOBULA_API_KEY}"}
     params = {"assets": "all", "limit": 500, "offset": 0}
@@ -61,8 +64,10 @@ async def fetch_mobula_cached():
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers, params=params, timeout=10) as resp:
+                logger.info(f"Mobula API response status: {resp.status}")
                 if resp.status == 200:
                     data = await resp.json()
+                    logger.info(f"Received {len(data.get('data', []))} coins from Mobula")
                     raw_assets = data.get("data", [])
                     formatted_data = []
                     for asset in raw_assets:
@@ -100,6 +105,7 @@ async def analyze_coins():
 
         if market_cap < MIN_CAP and volume > MIN_VOLUME and price_change > MIN_PRICE_CHANGE:
             anomalies.append(coin)
+    logger.info(f"Found {len(anomalies)} anomalies")
     return anomalies
 
 async def send_alert(chat_id: int, coin: dict):
@@ -126,8 +132,10 @@ async def send_alert(chat_id: int, coin: dict):
     alert_cache[coin_id] = 1
     latest_anomalies.insert(0, coin)
     del latest_anomalies[200:]
+    logger.info(f"Sent alert for {name} to chat_id: {chat_id}")
 
 async def monitoring_task(chat_id: int):
+    logger.info(f"Starting monitoring task for chat_id: {chat_id}")
     while active_monitoring.get(chat_id):
         try:
             anomalies = await analyze_coins()
@@ -143,6 +151,7 @@ async def monitoring_task(chat_id: int):
 # Команди
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
+    logger.info(f"Received /start command from chat_id: {message.chat.id}")
     chat_id = message.chat.id
     if active_monitoring.get(chat_id):
         await message.answer("🔍 Моніторинг вже запущений!")
@@ -162,6 +171,7 @@ async def start_cmd(message: types.Message):
 
 @dp.message(Command("stop"))
 async def stop_cmd(message: types.Message):
+    logger.info(f"Received /stop command from chat_id: {message.chat.id}")
     chat_id = message.chat.id
     if active_monitoring.pop(chat_id, None):
         await message.answer("⏹️ Моніторинг зупинено!")
@@ -170,12 +180,14 @@ async def stop_cmd(message: types.Message):
 
 @dp.message(Command("status"))
 async def status_cmd(message: types.Message):
+    logger.info(f"Received /status command from chat_id: {message.chat.id}")
     chat_id = message.chat.id
     stat = "активний" if active_monitoring.get(chat_id) else "неактивний"
     await message.answer(f"📊 Статус: {stat}\n🔍 У кеші сповіщень: {len(alert_cache)}")
 
 @dp.message(Command("latest"))
 async def latest_cmd(message: types.Message):
+    logger.info(f"Received /latest command from chat_id: {message.chat.id}")
     if latest_anomalies:
         lines = ["🔍 Останні аномальні токени:"]
         for coin in latest_anomalies[:20]:
@@ -186,6 +198,7 @@ async def latest_cmd(message: types.Message):
 
 @dp.message(Command("topvol"))
 async def topvol_cmd(message: types.Message):
+    logger.info(f"Received /topvol command from chat_id: {message.chat.id}")
     coins = await fetch_mobula_cached()
     filtered = [c for c in coins if c.get("market_cap", 0) < MIN_CAP]
     top_coins = sorted(filtered, key=lambda x: x.get("total_volume", 0), reverse=True)[:20]
@@ -199,6 +212,7 @@ async def topvol_cmd(message: types.Message):
 
 @dp.message(Command("topgainers"))
 async def topgainers_cmd(message: types.Message):
+    logger.info(f"Received /topgainers command from chat_id: {message.chat.id}")
     coins = await fetch_mobula_cached()
     filtered = [c for c in coins if c.get("market_cap", 0) < MIN_CAP]
     top_coins = sorted(filtered, key=lambda x: x.get("price_change_percentage_24h", 0), reverse=True)[:20]
@@ -212,24 +226,31 @@ async def topgainers_cmd(message: types.Message):
 
 @dp.message(Command("help"))
 async def help_cmd(message: types.Message):
+    logger.info(f"Received /help command from chat_id: {message.chat.id}")
     return await start_cmd(message)
 
-# Webhook
-@app.on_event("startup")
-async def on_startup():
+# Webhook і Lifespan
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     try:
         await bot.set_webhook(WEBHOOK_URL, secret_token=WEBHOOK_SECRET)
         logger.info(f"Webhook set to {WEBHOOK_URL}")
     except Exception as e:
         logger.error(f"Failed to set webhook: {e}")
-
-@app.on_event("shutdown")
-async def on_shutdown():
+    
+    yield
+    
     try:
         await bot.delete_webhook()
         logger.info("Webhook deleted")
     except Exception as e:
         logger.error(f"Failed to delete webhook: {e}")
+
+app.lifespan = lifespan
+
+@app.get("/")
+async def root():
+    return {"message": "Ultimaster Bot is running!"}
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
