@@ -33,12 +33,12 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", f"{APP_BASE_URL}/webhook").strip()
 
 # КРИТЕРІЇ (створюємо як словник)
 CRITERIA = {
-    "MIN_VOLUME": int(os.getenv("MIN_VOLUME", "1000")),           # $1K
-    "MIN_PRICE": float(os.getenv("MIN_PRICE", "0.000001")),      # Мінімальна ціна
-    "MIN_PRICE_CHANGE": float(os.getenv("MIN_PRICE_CHANGE", "5")),  # 5%
+    "MIN_VOLUME": int(os.getenv("MIN_VOLUME", "100")),           # $100
+    "MIN_PRICE": float(os.getenv("MIN_PRICE", "0.00000001")),    # Мінімальна ціна
+    "MIN_PRICE_CHANGE": float(os.getenv("MIN_PRICE_CHANGE", "1")),  # 1%
     "MAX_VOLUME": int(os.getenv("MAX_VOLUME", "100000000")),     # $100M
-    "CHECK_INTERVAL": int(os.getenv("CHECK_INTERVAL", "600")),   # 10 хвилин
-    "MAX_ALERTS_PER_CYCLE": int(os.getenv("MAX_ALERTS_PER_CYCLE", "20"))
+    "CHECK_INTERVAL": int(os.getenv("CHECK_INTERVAL", "1800")),  # 30 хвилин
+    "MAX_ALERTS_PER_CYCLE": int(os.getenv("MAX_ALERTS_PER_CYCLE", "5"))
 }
 
 if not TELEGRAM_BOT_TOKEN:
@@ -52,8 +52,8 @@ TOKEN_V2_BASE = f"{JUP_BASE}/tokens/v2"
 PRICE_V3_BASE = f"{JUP_BASE}/price/v3"
 
 # Внутрішній ліміт
-MAX_REQUESTS_PER_MINUTE = 18
-PER_REQUEST_DELAY = 0.35
+MAX_REQUESTS_PER_MINUTE = 10  # Зменшено
+PER_REQUEST_DELAY = 1.0       # Збільшено
 
 # ------------------------------------------------------------------------------
 # Ініціалізація
@@ -116,6 +116,10 @@ async def _http_get_json(session: aiohttp.ClientSession, url: str, params: Dict[
     if not ok:
         logger.info(f"Rate guard: waiting {wait_s}s before {url}")
         await asyncio.sleep(wait_s)
+        # Після очікування скидаємо стан rate limit
+        rate_limit_exceeded = False
+        request_count = 0
+        request_count_reset_time = _now_ts()
 
     await _sleep_delay()
     try:
@@ -135,6 +139,7 @@ async def _http_get_json(session: aiohttp.ClientSession, url: str, params: Dict[
                 logger.warning(f"429 from {url}: {text[:200]}")
                 rate_limit_exceeded = True
                 last_rate_limit_time = _now_ts()
+                # Повертаємо пустий результат замість очікування
                 return {}
             else:
                 logger.error(f"HTTP {status} from {url}: {text[:200]}")
@@ -146,7 +151,7 @@ async def _http_get_json(session: aiohttp.ClientSession, url: str, params: Dict[
 # ------------------------------------------------------------------------------
 # Jupiter: ЗАПИТИ
 # ------------------------------------------------------------------------------
-async def jup_get_recent(limit: int = 80) -> List[Dict[str, Any]]:
+async def jup_get_recent(limit: int = 30) -> List[Dict[str, Any]]:
     cache_key = f"recent:{limit}"
     if cache_key in recent_cache:
         return recent_cache[cache_key]
@@ -161,7 +166,7 @@ async def jup_get_recent(limit: int = 80) -> List[Dict[str, Any]]:
     logger.info(f"Jupiter recent: {len(data)} tokens")
     return data
 
-async def jup_get_category(category: str, interval: str = "24h", limit: int = 100) -> List[Dict[str, Any]]:
+async def jup_get_category(category: str, interval: str = "1h", limit: int = 30) -> List[Dict[str, Any]]:
     cache_key = f"cat:{category}:{interval}:{limit}"
     if cache_key in category_cache:
         return category_cache[cache_key]
@@ -188,7 +193,7 @@ async def jup_get_prices(mints: List[str]) -> Dict[str, float]:
     if not to_fetch:
         return result
 
-    batch_size = 90
+    batch_size = 20  # Зменшено розмір батчу
     async with aiohttp.ClientSession() as session:
         for i in range(0, len(to_fetch), batch_size):
             batch = to_fetch[i:i + batch_size]
@@ -203,25 +208,21 @@ async def jup_get_prices(mints: List[str]) -> Dict[str, float]:
                     price = float(val.get("price") or val.get("priceUsd") or 0.0)
                 result[mint] = price
                 price_cache[mint] = price
+            await asyncio.sleep(0.5)  # Додаткова затримка
 
     return result
 
 async def jup_get_real_time_data() -> List[Dict[str, Any]]:
     """Отримує актуальні дані з різних джерел Jupiter"""
     try:
-        recent_tokens = await jup_get_recent(limit=100)
-        trending_tokens = await jup_get_category("toptrending", "1h", limit=50)
+        # Спочатку пробуємо тільки trending, бо це найважливіше
+        trending_tokens = await jup_get_category("toptrending", "1h", limit=20)
         
-        all_tokens = recent_tokens + trending_tokens
-        unique_tokens = {}
+        # Якщо trending не працює, пробуємо recent
+        if not trending_tokens:
+            trending_tokens = await jup_get_recent(limit=20)
         
-        for token in all_tokens:
-            if isinstance(token, dict):
-                mint = token.get("mint") or token.get("address") or token.get("id")
-                if mint:
-                    unique_tokens[mint] = token
-        
-        return list(unique_tokens.values())
+        return trending_tokens
         
     except Exception as e:
         logger.error(f"Error getting real-time data: {e}")
@@ -234,7 +235,7 @@ async def jup_get_detailed_prices(mints: List[str]) -> Dict[str, Dict[str, Any]]
     
     try:
         async with aiohttp.ClientSession() as session:
-            batch_size = 50
+            batch_size = 15  # Зменшено розмір батчу
             results = {}
             
             for i in range(0, len(mints), batch_size):
@@ -251,7 +252,7 @@ async def jup_get_detailed_prices(mints: List[str]) -> Dict[str, Dict[str, Any]]
                                 "volume_24h": float(price_data.get("volume24h", 0) or 0)
                             }
                 
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.5)  # Додаткова затримка
             
             return results
             
@@ -308,64 +309,58 @@ def merge_price(tokens: List[Dict[str, Any]], price_map: Dict[str, float]) -> No
 # АНАЛІТИКА
 # ------------------------------------------------------------------------------
 async def analyze_coins(chat_id: int | None = None) -> List[Dict[str, Any]]:
-    """Нова логіка пошуку аномальних токенів"""
+    """Спрощена логіка пошуку аномальних токенів"""
     anomalies: List[Dict[str, Any]] = []
     
     try:
-        logger.info("Step 1: Getting real-time tokens...")
+        logger.info("Getting tokens data...")
         tokens = await jup_get_real_time_data()
         
         if not tokens:
             logger.warning("No tokens received from API")
             return anomalies
         
-        mints = []
-        for token in tokens:
-            mint = token.get("mint") or token.get("address") or token.get("id")
-            if mint:
-                mints.append(mint)
+        # Беремо тільки перші 15 токенів для тесту
+        test_tokens = tokens[:15]
         
-        logger.info(f"Step 2: Getting prices for {len(mints)} tokens...")
+        mints = []
+        for token in test_tokens:
+            if isinstance(token, dict):
+                mint = token.get("mint") or token.get("address") or token.get("id")
+                if mint:
+                    mints.append(mint)
+        
+        if not mints:
+            return anomalies
+        
+        logger.info(f"Getting prices for {len(mints)} tokens...")
         price_data = await jup_get_detailed_prices(mints)
         
-        logger.info("Step 3: Processing tokens...")
-        for token in tokens:
-            mint = token.get("mint") or token.get("address") or token.get("id")
-            if not mint or mint not in price_data:
-                continue
-            
-            p_data = price_data[mint]
-            price = p_data.get("price", 0)
-            change_24h = p_data.get("price_change_24h", 0)
-            volume_24h = p_data.get("volume_24h", 0)
-            
-            if price <= 0:
-                continue
-            
-            normalized = {
-                "id": mint,
-                "name": token.get("name", "Unknown"),
-                "symbol": token.get("symbol", "UNK"),
-                "logo": token.get("logoURI", ""),
-                "current_price": price,
-                "price_change_percentage_24h": change_24h,
-                "total_volume": volume_24h,
-                "market_cap": 0,
-                "chainId": "solana",
-                "trending": True
-            }
-            
-            # Використовуємо критерії з словника
-            volume_ok = volume_24h > CRITERIA["MIN_VOLUME"]
-            price_ok = price > CRITERIA["MIN_PRICE"]
-            change_ok = abs(change_24h) > CRITERIA["MIN_PRICE_CHANGE"]
-            
-            if volume_ok and price_ok and change_ok:
-                logger.info(f"ANOMALY FOUND: {normalized['name']} "
-                           f"(Price: ${price:.6f}, Change: {change_24h:.1f}%, Volume: ${volume_24h:,.0f})")
-                anomalies.append(normalized)
+        # Проста логіка: будь-який токен з ціною > 0 вважаємо аномалією для тесту
+        for token in test_tokens:
+            if isinstance(token, dict):
+                mint = token.get("mint") or token.get("address") or token.get("id")
+                if mint and mint in price_data:
+                    p_data = price_data[mint]
+                    price = p_data.get("price", 0)
+                    
+                    if price > 0:  # Просто будь-яка ціна > 0
+                        normalized = {
+                            "id": mint,
+                            "name": token.get("name", "Unknown"),
+                            "symbol": token.get("symbol", "UNK"),
+                            "logo": token.get("logoURI", ""),
+                            "current_price": price,
+                            "price_change_percentage_24h": p_data.get("price_change_24h", 0),
+                            "total_volume": p_data.get("volume_24h", 0),
+                            "market_cap": 0,
+                            "chainId": "solana",
+                            "trending": True
+                        }
+                        anomalies.append(normalized)
+                        logger.info(f"Found token: {normalized['name']} - ${price}")
         
-        logger.info(f"Found {len(anomalies)} anomalies")
+        logger.info(f"Found {len(anomalies)} tokens with price > 0")
         return anomalies
         
     except Exception as e:
@@ -423,7 +418,7 @@ async def monitoring_task(chat_id: int):
             
             if not anomalies:
                 logger.info("No anomalies found in this cycle")
-                if cycle_count % 3 == 0:
+                if cycle_count % 6 == 0:  # Рідше повідомляємо
                     await bot.send_message(
                         chat_id, 
                         "ℹ️ Аномальних токенів не знайдено. "
@@ -431,7 +426,7 @@ async def monitoring_task(chat_id: int):
                         "Перевіряються токени з:\n"
                         f"• Зміна ціни > ±{CRITERIA['MIN_PRICE_CHANGE']}%\n"
                         f"• Обсяг торгів > ${CRITERIA['MIN_VOLUME']:,}\n"
-                        f"• Ціна > ${CRITERIA['MIN_PRICE']:.6f}"
+                        f"• Ціна > ${CRITERIA['MIN_PRICE']:.8f}"
                     )
             else:
                 sent = 0
@@ -456,7 +451,7 @@ async def monitoring_task(chat_id: int):
                 f"⚠️ Помилка моніторингу: {str(e)[:200]}...\n"
                 "Спробую знову через 10 хвилин."
             )
-            await asyncio.sleep(CRITERIA["CHECK_INTERVAL"])
+            await asyncio.sleep(600)
 
 async def clear_cache_task():
     while True:
@@ -486,6 +481,9 @@ async def start_cmd(message: types.Message):
         "• /topgainers — топ ростучі\n"
         "• /setcriteria — налаштувати критерії\n"
         "• /testscan — тестове сканування\n"
+        "• /testapi — тест API\n"
+        "• /debug — інформація про стан\n"
+        "• /reset — скинути rate limit\n"
         "• /help — ця підказка"
     )
 
@@ -509,7 +507,7 @@ async def status_cmd(message: types.Message):
         f"📈 Останні аномалії: {len(latest_anomalies)}\n\n"
         f"Поточні критерії:\n"
         f"• Мін. обсяг: ${CRITERIA['MIN_VOLUME']:,}\n"
-        f"• Мін. ціна: ${CRITERIA['MIN_PRICE']:.6f}\n"
+        f"• Мін. ціна: ${CRITERIA['MIN_PRICE']:.8f}\n"
         f"• Мін. зміна: {CRITERIA['MIN_PRICE_CHANGE']}%"
     )
 
@@ -546,134 +544,56 @@ async def latest_cmd(message: types.Message):
 async def topvol_cmd(message: types.Message):
     logger.info(f"Received /topvol from chat_id: {message.chat.id}")
     
-    loading_msg = await message.answer("🔄 Завантажую топ токенів за обсягом...")
+    loading_msg = await message.answer("⏳ Отримую дані...")
     
     try:
-        top_tokens = await jup_get_real_time_data()
+        # Проста версія - просто показуємо що отримуємо
+        tokens = await jup_get_real_time_data()
         
-        if not top_tokens:
-            await loading_msg.edit_text("❌ Не вдалося отримати дані")
+        if not tokens:
+            await loading_msg.edit_text("❌ Не вдалося отримати дані з API")
             return
         
-        detailed_tokens = []
-        for token in top_tokens:
-            mint = token.get("mint") or token.get("address") or token.get("id")
-            if mint:
-                price_data = await jup_get_detailed_prices([mint])
-                if mint in price_data:
-                    detailed_data = {
-                        "name": token.get("name", "Unknown"),
-                        "symbol": token.get("symbol", "UNK"),
-                        "price": price_data[mint].get("price", 0),
-                        "volume": price_data[mint].get("volume_24h", 0),
-                        "change": price_data[mint].get("price_change_24h", 0)
-                    }
-                    detailed_tokens.append(detailed_data)
+        lines = ["📊 Останні токени:\n"]
         
-        if not detailed_tokens:
-            await loading_msg.edit_text("❌ Не знайдено токенів з даними")
-            return
+        for i, token in enumerate(tokens[:10], 1):
+            if isinstance(token, dict):
+                name = escape(token.get('name', 'Unknown')[:15])
+                symbol = escape(token.get('symbol', 'UNK')[:8])
+                lines.append(f"{i}. {name} ({symbol})")
         
-        valid_tokens = [t for t in detailed_tokens if t["price"] > 0]
-        valid_tokens.sort(key=lambda x: x.get("volume", 0), reverse=True)
-        
-        lines = ["💹 <b>Топ токенів за обсягом:</b>\n"]
-        
-        for i, token in enumerate(valid_tokens[:15], 1):
-            name = escape(token.get('name', 'Unknown')[:15])
-            symbol = escape(token.get('symbol', 'UNK')[:8])
-            price = float(token.get('price', 0) or 0)
-            volume = float(token.get('volume', 0) or 0)
-            change = float(token.get('change', 0) or 0)
-            
-            change_icon = "📈" if change >= 0 else "📉"
-            change_text = f"{change_icon} {abs(change):.1f}%"
-            
-            price_text = f"${price:,.8f}".rstrip('0').rstrip('.') if price < 1 else f"${price:,.4f}"
-            volume_text = f"${volume:,.0f}" if volume >= 1000 else f"${volume:,.2f}"
-            
-            lines.append(
-                f"{i}. <b>{name} ({symbol})</b>\n"
-                f"   💰 <i>Ціна:</i> <code>{price_text}</code>\n"
-                f"   💹 <i>Обсяг:</i> <code>{volume_text}</code>\n"
-                f"   📊 <i>Зміна:</i> {change_text}\n"
-            )
-        
-        await loading_msg.edit_text("\n".join(lines), parse_mode="HTML")
+        await loading_msg.edit_text("\n".join(lines))
         
     except Exception as e:
         logger.error(f"Error in topvol_cmd: {e}")
-        await loading_msg.edit_text("⚠️ Помилка при отриманні даних")
+        await loading_msg.edit_text("⚠️ Помилка. Спробуйте пізніше.")
 
 @dp.message(Command("topgainers"))
 async def topgainers_cmd(message: types.Message):
     logger.info(f"Received /topgainers from chat_id: {message.chat.id}")
     
-    loading_msg = await message.answer("🔄 Завантажую топ ростучі токени...")
+    loading_msg = await message.answer("⏳ Отримую дані...")
     
     try:
-        top_tokens = await jup_get_real_time_data()
+        tokens = await jup_get_real_time_data()
         
-        if not top_tokens:
-            await loading_msg.edit_text("❌ Не вдалося отримати дані")
+        if not tokens:
+            await loading_msg.edit_text("❌ Не вдалося отримати дані з API")
             return
         
-        detailed_tokens = []
-        for token in top_tokens:
-            mint = token.get("mint") or token.get("address") or token.get("id")
-            if mint:
-                price_data = await jup_get_detailed_prices([mint])
-                if mint in price_data:
-                    detailed_data = {
-                        "name": token.get("name", "Unknown"),
-                        "symbol": token.get("symbol", "UNK"),
-                        "price": price_data[mint].get("price", 0),
-                        "volume": price_data[mint].get("volume_24h", 0),
-                        "change": price_data[mint].get("price_change_24h", 0)
-                    }
-                    detailed_tokens.append(detailed_data)
+        lines = ["📈 Трендові токени:\n"]
         
-        if not detailed_tokens:
-            await loading_msg.edit_text("❌ Не знайдено токенів з даними")
-            return
+        for i, token in enumerate(tokens[:10], 1):
+            if isinstance(token, dict):
+                name = escape(token.get('name', 'Unknown')[:15])
+                symbol = escape(token.get('symbol', 'UNK')[:8])
+                lines.append(f"{i}. {name} ({symbol})")
         
-        gainers = [t for t in detailed_tokens if t["price"] > 0 and t.get("change", 0) > 0]
-        if not gainers:
-            gainers = [t for t in detailed_tokens if t["price"] > 0]
-        
-        if not gainers:
-            await loading_msg.edit_text("❌ Не знайдено токенів з ціною")
-            return
-        
-        gainers.sort(key=lambda x: x.get("change", 0), reverse=True)
-        
-        lines = ["🚀 <b>Топ ростучі токени:</b>\n"]
-        
-        for i, token in enumerate(gainers[:15], 1):
-            name = escape(token.get('name', 'Unknown')[:15])
-            symbol = escape(token.get('symbol', 'UNK')[:8])
-            price = float(token.get('price', 0) or 0)
-            volume = float(token.get('volume', 0) or 0)
-            change = float(token.get('change', 0) or 0)
-            
-            change_icon = "📈"
-            change_text = f"{change_icon} {change:.1f}%"
-            
-            price_text = f"${price:,.8f}".rstrip('0').rstrip('.') if price < 1 else f"${price:,.4f}"
-            volume_text = f"${volume:,.0f}" if volume >= 1000 else f"${volume:,.2f}"
-            
-            lines.append(
-                f"{i}. <b>{name} ({symbol})</b>\n"
-                f"   💰 <i>Ціна:</i> <code>{price_text}</code>\n"
-                f"   💹 <i>Обсяг:</i> <code>{volume_text}</code>\n"
-                f"   📊 <i>Зміна:</i> {change_text}\n"
-            )
-        
-        await loading_msg.edit_text("\n".join(lines), parse_mode="HTML")
+        await loading_msg.edit_text("\n".join(lines))
         
     except Exception as e:
         logger.error(f"Error in topgainers_cmd: {e}")
-        await loading_msg.edit_text("⚠️ Помилка при отриманні даних")
+        await loading_msg.edit_text("⚠️ Помилка. Спробуйте пізніше.")
 
 @dp.message(Command("setcriteria"))
 async def set_criteria_cmd(message: types.Message):
@@ -683,10 +603,10 @@ async def set_criteria_cmd(message: types.Message):
         if len(args) != 3:
             await message.answer(
                 "ℹ️ Використовуйте: /setcriteria MIN_VOLUME MIN_PRICE MIN_CHANGE\n"
-                "Приклад: /setcriteria 1000 0.0001 5\n\n"
+                "Приклад: /setcriteria 100 0.00000001 1\n\n"
                 "Поточні значення:\n"
                 f"• Мін. обсяг: ${CRITERIA['MIN_VOLUME']:,}\n"
-                f"• Мін. ціна: ${CRITERIA['MIN_PRICE']:.6f}\n"
+                f"• Мін. ціна: ${CRITERIA['MIN_PRICE']:.8f}\n"
                 f"• Мін. зміна: {CRITERIA['MIN_PRICE_CHANGE']}%"
             )
             return
@@ -699,7 +619,7 @@ async def set_criteria_cmd(message: types.Message):
         await message.answer(
             f"✅ Критерії оновлено:\n"
             f"• Мін. обсяг: ${CRITERIA['MIN_VOLUME']:,}\n"
-            f"• Мін. ціна: ${CRITERIA['MIN_PRICE']:.6f}\n"
+            f"• Мін. ціна: ${CRITERIA['MIN_PRICE']:.8f}\n"
             f"• Мін. зміна: {CRITERIA['MIN_PRICE_CHANGE']}%"
         )
         
@@ -711,32 +631,69 @@ async def test_scan_cmd(message: types.Message):
     """Команда для тестового сканування"""
     logger.info(f"Received /testscan from chat_id: {message.chat.id}")
     
-    test_msg = await message.answer("🧪 Запускаю тестове сканування...")
+    test_msg = await message.answer("🧪 Тестове сканування...")
     
     try:
         anomalies = await analyze_coins(message.chat.id)
         
         if anomalies:
-            result = f"✅ Знайдено {len(anomalies)} аномалій!\n\n"
-            for i, coin in enumerate(anomalies[:5], 1):
+            result = f"✅ Знайдено {len(anomalies)} токенів!\n\n"
+            for i, coin in enumerate(anomalies[:3], 1):
                 result += (f"{i}. {coin['name']} ({coin['symbol']})\n"
-                          f"   Ціна: ${coin['current_price']:.6f}\n"
-                          f"   Зміна: {coin['price_change_percentage_24h']:.1f}%\n"
-                          f"   Обсяг: ${coin['total_volume']:,.0f}\n\n")
+                          f"   Ціна: ${coin['current_price']:.8f}\n\n")
             
             await test_msg.edit_text(result)
         else:
             await test_msg.edit_text(
-                "❌ Тестове сканування не знайшло аномалій.\n\n"
-                "Перевірте:\n"
-                "1. Доступність Jupiter API\n"
-                "2. Параметри пошуку (зміна >5%, обсяг >$1000)\n"
-                "3. Спробуйте змінити критерії /setcriteria"
+                "❌ Не знайдено токенів.\n"
+                "Спробуйте команду /reset та /testapi"
             )
             
     except Exception as e:
         logger.error(f"Test scan error: {e}")
-        await test_msg.edit_text(f"⚠️ Помилка тестового сканування: {str(e)}")
+        await test_msg.edit_text(f"⚠️ Помилка: {str(e)}")
+
+@dp.message(Command("testapi"))
+async def test_api_cmd(message: types.Message):
+    """Тест API"""
+    test_msg = await message.answer("🧪 Тестую API...")
+    
+    try:
+        # Тестуємо різні ендпоінти
+        recent = await jup_get_recent(limit=5)
+        trending = await jup_get_category("toptrending", "1h", limit=5)
+        
+        result = f"✅ API працює:\n"
+        result += f"• Recent: {len(recent) if recent else 0} токенів\n"
+        result += f"• Trending: {len(trending) if trending else 0} токенів\n"
+        
+        await test_msg.edit_text(result)
+        
+    except Exception as e:
+        await test_msg.edit_text(f"❌ Помилка API: {str(e)}")
+
+@dp.message(Command("debug"))
+async def debug_cmd(message: types.Message):
+    """Інформація про стан"""
+    global rate_limit_exceeded, request_count
+    
+    status = f"🐛 Debug info:\n"
+    status += f"• Rate limit exceeded: {rate_limit_exceeded}\n"
+    status += f"• Request count: {request_count}\n"
+    status += f"• Active monitoring: {len(active_monitoring)}\n"
+    status += f"• Alert cache: {len(alert_cache)}\n"
+    status += f"• Latest anomalies: {len(latest_anomalies)}"
+    
+    await message.answer(status)
+
+@dp.message(Command("reset"))
+async def reset_cmd(message: types.Message):
+    """Скинути rate limit"""
+    global rate_limit_exceeded, request_count, request_count_reset_time
+    rate_limit_exceeded = False
+    request_count = 0
+    request_count_reset_time = _now_ts()
+    await message.answer("🔄 Rate limit скинуто!")
 
 @dp.message(Command("help"))
 async def help_cmd(message: types.Message):
