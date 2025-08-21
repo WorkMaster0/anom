@@ -457,46 +457,109 @@ async def status_cmd(message: types.Message):
 @dp.message(Command("latest"))
 async def latest_cmd(message: types.Message):
     logger.info(f"Received /latest from chat_id: {message.chat.id}")
-    if latest_anomalies:
-        lines = ["🔍 Останні аномальні токени:"]
-        for coin in latest_anomalies[:20]:
-            lines.append(f"• {escape(coin['name'])} ({escape(coin['symbol'])})")
-        await message.answer("\n".join(lines))
-    else:
+    
+    if not latest_anomalies:
         await message.answer("ℹ Аномалій ще немає")
+        return
+    
+    lines = ["🔍 <b>Останні аномальні токени:</b>"]
+    
+    for i, coin in enumerate(latest_anomalies[:15], 1):
+        name = escape(coin.get('name', 'Unknown'))
+        symbol = escape(coin.get('symbol', 'UNK'))
+        price = float(coin.get('current_price', 0) or 0)
+        change = float(coin.get('price_change_percentage_24h', 0) or 0)
+        
+        change_icon = "📈" if change >= 0 else "📉"
+        change_text = f"{change_icon} {abs(change):.1f}%"
+        
+        lines.append(
+            f"{i}. <b>{name} ({symbol})</b>\n"
+            f"   💰 Ціна: <code>${price:.8f}</code>\n"
+            f"   {change_text}"
+        )
+    
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
 @dp.message(Command("topvol"))
 async def topvol_cmd(message: types.Message):
     logger.info(f"Received /topvol from chat_id: {message.chat.id}")
     raw = await jup_get_category("toptraded", interval="24h", limit=100)
     tokens = [normalize_token(x) for x in raw if isinstance(x, dict)]
-    if tokens:
-        # сортуємо за total_volume (normalize_token вже постарався витягти)
-        tokens.sort(key=lambda t: float(t.get("total_volume", 0) or 0), reverse=True)
-        lines = ["💹 Топ за обсягом (категорія 24h):"]
-        for t in tokens[:20]:
-            lines.append(f"• {escape(t['name'])} ({escape(t['symbol'])}) — ${float(t.get('total_volume',0)):,.0f}")
-        await message.answer("\n".join(lines))
-    else:
+    
+    if not tokens:
         await message.answer("ℹ️ Порожньо — немає даних категорії.")
+        return
+    
+    # Отримуємо ціни для всіх токенів
+    mints = [t["id"] for t in tokens if t["id"]]
+    price_map = await jup_get_prices(mints)
+    merge_price(tokens, price_map)
+    
+    # Сортуємо за обсягом
+    tokens.sort(key=lambda t: float(t.get("total_volume", 0) or 0), reverse=True)
+    
+    # Формуємо детальне повідомлення
+    lines = ["💹 <b>Топ за обсягом (категорія 24h):</b>"]
+    
+    for i, t in enumerate(tokens[:20], 1):
+        name = escape(t['name'])
+        symbol = escape(t['symbol'])
+        price = float(t.get('current_price', 0) or 0)
+        volume = float(t.get('total_volume', 0) or 0)
+        change = float(t.get('price_change_percentage_24h', 0) or 0)
+        
+        change_icon = "📈" if change >= 0 else "📉"
+        change_text = f"{change_icon} {abs(change):.1f}%"
+        
+        lines.append(
+            f"{i}. <b>{name} ({symbol})</b>\n"
+            f"   💰 Ціна: <code>${price:.8f}</code>\n"
+            f"   💹 Обсяг: <code>${volume:,.0f}</code>\n"
+            f"   {change_text}\n"
+        )
+    
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
 @dp.message(Command("topgainers"))
 async def topgainers_cmd(message: types.Message):
     logger.info(f"Received /topgainers from chat_id: {message.chat.id}")
-    # У V2 є toptrending — вважаємо як ростучі; якщо ціна% є — покажемо
     raw = await jup_get_category("toptrending", interval="24h", limit=100)
     tokens = [normalize_token(x) for x in raw if isinstance(x, dict)]
-    if tokens:
-        # якщо є відсотки — сортуємо за ними, інакше як є
-        tokens.sort(key=lambda t: float(t.get("price_change_percentage_24h", 0) or 0), reverse=True)
-        lines = ["🚀 Топ «ростучих» (категорія 24h):"]
-        for t in tokens[:20]:
-            pct = float(t.get("price_change_percentage_24h", 0) or 0)
-            suffix = f" — +{pct:.1f}%" if pct != 0 else ""
-            lines.append(f"• {escape(t['name'])} ({escape(t['symbol'])}){suffix}")
-        await message.answer("\n".join(lines))
-    else:
+    
+    if not tokens:
         await message.answer("ℹ️ Порожньо — немає даних категорії.")
+        return
+    
+    # Отримуємо ціни для всіх токенів
+    mints = [t["id"] for t in tokens if t["id"]]
+    price_map = await jup_get_prices(mints)
+    merge_price(tokens, price_map)
+    
+    # Сортуємо за зміною ціни
+    tokens.sort(key=lambda t: float(t.get("price_change_percentage_24h", 0) or 0), reverse=True)
+    
+    # Формуємо детальне повідомлення
+    lines = ["🚀 <b>Топ «ростучих» (категорія 24h):</b>"]
+    
+    for i, t in enumerate(tokens[:20], 1):
+        name = escape(t['name'])
+        symbol = escape(t['symbol'])
+        price = float(t.get('current_price', 0) or 0)
+        volume = float(t.get('total_volume', 0) or 0)
+        change = float(t.get('price_change_percentage_24h', 0) or 0)
+        
+        change_icon = "📈" if change >= 0 else "📉"
+        change_text = f"{change_icon} {abs(change):.1f}%"
+        
+        lines.append(
+            f"{i}. <b>{name} ({symbol})</b>\n"
+            f"   💰 Ціна: <code>${price:.8f}</code>\n"
+            f"   💹 Обсяг: <code>${volume:,.0f}</code>\n"
+            f"   {change_text}\n"
+        )
+    
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
 @dp.message(Command("setcriteria"))
 async def set_criteria_cmd(message: types.Message):
