@@ -6,7 +6,7 @@ from datetime import datetime
 import aiohttp
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.utils.markdown import escape
+from html import escape
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
