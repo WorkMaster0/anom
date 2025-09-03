@@ -1,6 +1,8 @@
-aiogram==3.13.1
-fastapi==0.115.2
-uvicorn==0.32.0
-aiohttp==3.10.10
-cachetools==5.5.0
-python-dotenv==1.0.1
+ccxt==4.0.0
+pytelegrambotapi==4.12.0
+cryptography==41.0.0
+aiohttp==3.8.0
+asyncio==3.4.3
+python-dotenv==1.0.0
+numpy==1.24.0
+pandas==2.0.0
