@@ -19,9 +19,10 @@ EXCHANGES = {
             'withdraw': False      # Тільки читання!
         }
     },
-    'bybit': {
-        'apiKey': os.getenv('BYBIT_API_KEY'),
-        'secret': os.getenv('BYBIT_SECRET'),
+    'kucoin': {
+        'apiKey': os.getenv('KUCOIN_API_KEY'),
+        'secret': os.getenv('KUCOIN_SECRET'),
+        'password': os.getenv('KUCOIN_PASSWORD'),  # KuCoin вимагає пароль
         'enableRateLimit': True,
         'options': {
             'defaultType': 'spot',
