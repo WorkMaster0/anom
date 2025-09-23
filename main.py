@@ -123,9 +123,23 @@ def analyze_and_alert_futures(symbol: str):
     )
     send_telegram(msg)
 
+# ---------------- GET ALL USDT FUTURES ----------------
+def get_all_usdt_futures_symbols():
+    try:
+        exchange_info = client.futures_exchange_info()
+        symbols = [
+            s["symbol"] for s in exchange_info["symbols"]
+            if s["quoteAsset"] == "USDT" and s["contractType"] == "PERPETUAL"
+        ]
+        logger.info(f"Found {len(symbols)} USDT perpetual symbols")
+        return symbols
+    except Exception as e:
+        logger.error(f"Error fetching symbols: {e}")
+        return []
+
 # ---------------- LOOP ----------------
 def run_futures_bot(symbols):
-    logger.info("Bot started in loop...")
+    logger.info(f"Bot started in loop for {len(symbols)} symbols")
     while True:
         for sym in symbols:
             try:
@@ -141,12 +155,15 @@ def home():
     return "Futures bot is running!"
 
 def start_bot():
-    symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+    symbols = get_all_usdt_futures_symbols()
+    if not symbols:
+        logger.error("No symbols found. Exiting.")
+        return
     run_futures_bot(symbols)
 
 threading.Thread(target=start_bot, daemon=True).start()
 
 # ---------------- START ----------------
 if __name__ == "__main__":
-    send_telegram("✅ Futures bot started (public API mode)")
+    send_telegram("✅ Futures bot started (public API mode, auto symbols)")
     app.run(host="0.0.0.0", port=5000)
