@@ -6,6 +6,8 @@ from datetime import datetime
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 import requests
+from flask import Flask
+import threading
 
 # ---------------- CONFIG ----------------
 BINANCE_API_KEY = "WvWJOeWRKoARJ8ugljdIIWqThP6mfrDIQTmkdYCtduFv4oDV7kTMhouDtMFxlPY3"
@@ -15,7 +17,7 @@ TELEGRAM_CHAT_ID = "6053907025"
 
 client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 # ---------------- TELEGRAM ----------------
@@ -24,6 +26,7 @@ def send_telegram(msg: str):
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}
     try:
         requests.post(url, json=payload, timeout=10)
+        logger.info("Telegram message sent")
     except Exception as e:
         logger.error(f"Telegram error: {e}")
 
@@ -36,11 +39,8 @@ def fetch_futures_data(symbol: str, interval="1m", limit=200):
             "close_time", "quote_asset_volume", "number_of_trades",
             "taker_buy_base", "taker_buy_quote", "ignore"
         ])
-        df["open"] = df["open"].astype(float)
-        df["high"] = df["high"].astype(float)
-        df["low"] = df["low"].astype(float)
-        df["close"] = df["close"].astype(float)
-        df["volume"] = df["volume"].astype(float)
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = df[col].astype(float)
         df["time"] = pd.to_datetime(df["timestamp"], unit="ms")
         return df
     except BinanceAPIException as e:
@@ -51,17 +51,20 @@ def get_funding_rate(symbol: str):
     try:
         funding = client.futures_funding_rate(symbol=symbol, limit=1)
         return float(funding[0]["fundingRate"])
-    except Exception:
+    except Exception as e:
+        logger.error(f"Funding rate error for {symbol}: {e}")
         return 0.0
 
-def get_open_interest_change(symbol: str):
+def get_open_interest_change(symbol: str, interval=5) -> float:
     try:
         oi_now = float(client.futures_open_interest(symbol=symbol)["openInterest"])
-        oi_prev = float(client.futures_open_interest_hist(symbol=symbol, period="5m", limit=1)[0]["sumOpenInterest"])
+        klines = client.futures_klines(symbol=symbol, interval=f"{interval}m", limit=2)
+        oi_prev = float(klines[0][5])  # об’єм як груба оцінка
         if oi_prev == 0:
             return 0.0
         return (oi_now - oi_prev) / oi_prev
-    except Exception:
+    except Exception as e:
+        logger.error(f"Open interest error for {symbol}: {e}")
         return 0.0
 
 def get_liquidations(symbol: str):
@@ -70,13 +73,13 @@ def get_liquidations(symbol: str):
         long_liq = sum(float(l["price"]) * float(l["origQty"]) for l in liqs if l["side"] == "SELL")
         short_liq = sum(float(l["price"]) * float(l["origQty"]) for l in liqs if l["side"] == "BUY")
         return {"long": long_liq, "short": short_liq}
-    except Exception:
+    except Exception as e:
+        logger.error(f"Liquidations error for {symbol}: {e}")
         return {"long": 0, "short": 0}
 
 def get_quarterly_price(symbol: str):
     try:
-        # квартальні фʼючерси мають суфікс, наприклад BTCUSDT_240927
-        quarterly_symbol = symbol.replace("USDT", "USDT_240927")  
+        quarterly_symbol = symbol.replace("USDT", "USDT_240927")
         price = float(client.futures_mark_price(symbol=quarterly_symbol)["markPrice"])
         return price
     except Exception:
@@ -86,31 +89,18 @@ def get_quarterly_price(symbol: str):
 def apply_futures_features(df: pd.DataFrame, funding: float, oi_change: float,
                            liquidations: dict, perp_price: float, quarterly_price: float) -> pd.DataFrame:
     df = df.copy()
-
-    # Volume spike
     df["vol_ma20"] = df["volume"].rolling(20).mean()
     df["volume_spike"] = df["volume"] > 3 * df["vol_ma20"]
-
-    # Whale candle
     df["body"] = abs(df["close"] - df["open"])
     df["whale_candle"] = (df["body"] > df["close"] * 0.01) & (df["volume"] > 3 * df["vol_ma20"])
-
-    # Funding extreme
     df["funding_extreme_long"] = funding > 0.0005
     df["funding_extreme_short"] = funding < -0.0005
-
-    # Open interest surge
     df["oi_surge"] = oi_change > 0.15
-
-    # Liquidations
     df["liq_long"] = liquidations.get("long", 0) > 5e6
     df["liq_short"] = liquidations.get("short", 0) > 5e6
-
-    # Spread perp vs quarterly
     spread = (perp_price - quarterly_price) / quarterly_price if quarterly_price and quarterly_price == quarterly_price else 0
     df["spread_overheat"] = spread > 0.01
     df["spread_oversold"] = spread < -0.01
-
     return df
 
 # ---------------- SIGNAL DETECTION ----------------
@@ -118,7 +108,6 @@ def detect_futures_signal(df: pd.DataFrame):
     last = df.iloc[-1]
     votes = []
     confidence = 0.5
-
     if last["volume_spike"]: votes.append("volume_spike"); confidence += 0.1
     if last["whale_candle"]: votes.append("whale_candle"); confidence += 0.1
     if last["funding_extreme_long"]: votes.append("funding_extreme_long"); confidence += 0.1
@@ -129,7 +118,6 @@ def detect_futures_signal(df: pd.DataFrame):
     if last["spread_overheat"]: votes.append("spread_overheat"); confidence += 0.1
     if last["spread_oversold"]: votes.append("spread_oversold"); confidence += 0.1
 
-    # Trend bias
     action = "WATCH"
     if "funding_extreme_long" in votes or "spread_overheat" in votes or "liq_long_cluster" in votes:
         action = "SHORT"
@@ -141,8 +129,11 @@ def detect_futures_signal(df: pd.DataFrame):
 
 # ---------------- ALERT ----------------
 def analyze_and_alert_futures(symbol: str):
+    logger.info(f"Analyzing {symbol}...")
     df = fetch_futures_data(symbol)
-    if df is None: return
+    if df is None:
+        logger.warning(f"No data for {symbol}")
+        return
 
     funding = get_funding_rate(symbol)
     oi_change = get_open_interest_change(symbol)
@@ -153,7 +144,9 @@ def analyze_and_alert_futures(symbol: str):
     df = apply_futures_features(df, funding, oi_change, liquidations, perp_price, quarterly_price)
     action, votes, confidence, last = detect_futures_signal(df)
 
+    logger.info(f"{symbol} action: {action}, votes: {votes}, confidence: {confidence:.2f}")
     if action == "WATCH":
+        logger.info(f"No actionable signal for {symbol}")
         return
 
     msg = (
@@ -170,6 +163,7 @@ def analyze_and_alert_futures(symbol: str):
 
 # ---------------- AUTO LOOP ----------------
 def run_futures_bot(symbols):
+    logger.info("Bot started in loop...")
     while True:
         for sym in symbols:
             try:
@@ -179,23 +173,20 @@ def run_futures_bot(symbols):
         time.sleep(60)  # перевірка щохвилини
 
 # --- Flask ---
-from flask import Flask
-import threading
-
 app = Flask(__name__)
-
 @app.route("/")
 def home():
     return "Futures bot is running!"
 
-# Запускаємо бота у окремому потоці
 def start_bot():
     symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
     run_futures_bot(symbols)
 
 threading.Thread(target=start_bot, daemon=True).start()
 
-# ---------------- START (локальний запуск) ----------------
+# ---------------- START ----------------
 if __name__ == "__main__":
-    # Якщо запускаєш локально (python main.py), Flask теж підніметься
+    # Перевірка Telegram
+    send_telegram("✅ Futures bot started")
+    # Запуск Flask
     app.run(host="0.0.0.0", port=5000)
