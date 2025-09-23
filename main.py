@@ -178,7 +178,6 @@ def run_futures_bot(symbols):
                 logger.error(f"Error analyzing futures {sym}: {e}")
         time.sleep(60)  # перевірка щохвилини
 
-
 # --- Flask ---
 from flask import Flask
 import threading
@@ -195,7 +194,6 @@ def start_bot():
     run_futures_bot(symbols)
 
 threading.Thread(target=start_bot, daemon=True).start()
-
 
 # ---------------- START (локальний запуск) ----------------
 if __name__ == "__main__":
