@@ -178,7 +178,26 @@ def run_futures_bot(symbols):
                 logger.error(f"Error analyzing futures {sym}: {e}")
         time.sleep(60)  # перевірка щохвилини
 
-# ---------------- START ----------------
-if __name__ == "__main__":
-    symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]  # додай свої
+
+# --- Flask ---
+from flask import Flask
+import threading
+
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Futures bot is running!"
+
+# Запускаємо бота у окремому потоці
+def start_bot():
+    symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
     run_futures_bot(symbols)
+
+threading.Thread(target=start_bot, daemon=True).start()
+
+
+# ---------------- START (локальний запуск) ----------------
+if __name__ == "__main__":
+    # Якщо запускаєш локально (python main.py), Flask теж підніметься
+    app.run(host="0.0.0.0", port=5000)
