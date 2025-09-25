@@ -15,7 +15,6 @@ from binance.streams import ThreadedWebsocketManager
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
-import asyncio
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -26,13 +25,14 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
-PORT = int(os.getenv("PORT", "5000"))
+PORT = int(os.getenv("PORT", 5000))
 STATE_FILE = "state.json"
 HISTORY_FILE = "history.json"
 ROLLING_WINDOW = 10
 PARALLEL_WORKERS = 4
 TIMEFRAMES = ["15m","1h","4h"]
 ATR_THRESHOLD = 0.002
+SCAN_INTERVAL = 300  # 5 хвилин
 
 # ---------------- GLOBALS ----------------
 binance_client = None
@@ -132,23 +132,16 @@ def handle_socket(msg):
         klines_data[symbol] = df.tail(1000)
 
 def start_ws(symbols=None, interval="1m"):
-    global twm
-    try:
-        asyncio.get_event_loop()
-    except RuntimeError:
-        asyncio.set_event_loop(asyncio.new_event_loop())
-    twm = ThreadedWebsocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
-    twm.start()
-    if symbols is None:
-        symbols = ["BTCUSDT"]
-    for s in symbols:
-        if s not in klines_data:
-            fetch_klines(s, interval, 500)
-        twm.start_kline_socket(callback=handle_socket, symbol=s, interval=interval)
-    logger.info(f"[WS] Started for {symbols}")
-
-def get_latest_df(symbol):
-    return klines_data.get(symbol) or fetch_klines(symbol)
+    def run_ws():
+        global twm
+        twm = ThreadedWebsocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
+        twm.start()
+        for s in symbols:
+            if s not in klines_data:
+                fetch_klines(s, interval, 500)
+            twm.start_kline_socket(callback=handle_socket, symbol=s, interval=interval)
+        logger.info(f"[WS] Started for {symbols}")
+    Thread(target=run_ws, daemon=True).start()
 
 # ---------------- FEATURES ----------------
 def extract_features(df: pd.DataFrame):
@@ -169,54 +162,24 @@ def extract_features(df: pd.DataFrame):
     df["vol_zscore"] = (df["volume"] - df["vol_ma20"]) / df["vol_ma20"].rolling(20).std()
     df["hammer"] = (df["close"] > df["open"]) & ((df["low"] - df[["open","close"]].min(axis=1)) > 2*(df["close"] - df["open"]))
     df["shooting_star"] = (df["open"] > df["close"]) & ((df["high"] - df[["open","close"]].max(axis=1)) > 2*(df["open"] - df["close"]))
-    df["support"] = df["low"].rolling(20).min()
-    df["resistance"] = df["high"].rolling(20).max()
-    df["false_break_high"] = (df["high"] > df["resistance"]) & (df["close"] < df["resistance"])
-    df["false_break_low"] = (df["low"] < df["support"]) & (df["close"] > df["support"])
-    df["retest_support"] = abs(df["close"] - df["support"]) / df["support"] < 0.003
-    df["retest_resistance"] = abs(df["close"] - df["resistance"]) / df["resistance"] < 0.003
-    df["accumulation_zone"] = (df["high"] - df["low"] < df["high"].rolling(20).max()*0.02) & (df["volume"] > df["vol_ma20"])
-    df["squeeze"] = df["atr"] < df["atr"].rolling(50).mean()*0.7
+    df = df.fillna(0)
     return df
-
-def get_rolling_vector(df, window=ROLLING_WINDOW):
-    features = ["ema_diff","adx","rsi","macd_hist","atr","bb_width","vol_zscore",
-                "hammer","shooting_star","false_break_high","false_break_low",
-                "retest_support","retest_resistance","accumulation_zone","squeeze"]
-    vectors = []
-    for i in range(window, len(df)):
-        vec = df[features].iloc[i-window:i].values.flatten()
-        vectors.append(vec)
-    vectors = np.array(vectors)
-    vectors = vectors[~np.isnan(vectors).any(axis=1)]
-    return vectors
 
 # ---------------- ML ----------------
-def generate_labels(df: pd.DataFrame):
-    df = df.copy()
-    df['future_return'] = df['close'].shift(-1)/df['close'] - 1
-    df['label'] = (df['future_return'] > ATR_THRESHOLD).astype(int)
-    return df
-
-def fit_scaler_and_model(symbols):
+def fit_ml(symbols):
     all_X, all_y = [], []
-    valid_symbols = []
     for s in symbols:
-        df = fetch_klines(s, "1m", 1000)
+        df = fetch_klines(s, "1m", 500)
         if df is None or len(df) < ROLLING_WINDOW + 1:
             continue
         df = extract_features(df)
-        df = generate_labels(df)
-        vecs = get_rolling_vector(df)
-        labels = df['label'].iloc[ROLLING_WINDOW:].values
+        df['future_return'] = df['close'].shift(-1)/df['close'] - 1
+        df['label'] = (df['future_return'] > ATR_THRESHOLD).astype(int)
+        vecs = df[["ema_diff","adx","rsi","macd_hist","atr","bb_width","vol_zscore"]].values
+        labels = df['label'].values
         min_len = min(len(vecs), len(labels))
-        if min_len == 0: 
-            continue
-        vecs = vecs[-min_len:]
-        labels = labels[-min_len:]
-        all_X.append(vecs)
-        all_y.append(labels)
-        valid_symbols.append(s)
+        all_X.append(vecs[-min_len:])
+        all_y.append(labels[-min_len:])
     if all_X:
         X = np.vstack(all_X)
         y = np.hstack(all_y)
@@ -224,22 +187,16 @@ def fit_scaler_and_model(symbols):
         scaler.fit(X)
         X_scaled = scaler.transform(X)
         ml_model.fit(X_scaled, y)
-        logger.info(f"[ML] Trained on {X.shape[0]} samples for symbols: {valid_symbols}")
-    else:
-        logger.warning("[ML] Not enough data to train model")
+        logger.info(f"[ML] Trained on {X.shape[0]} samples")
 
 # ---------------- SIGNAL ----------------
 def detect_signal(symbol):
-    df = get_latest_df(symbol)
-    if df is None or len(df) < ROLLING_WINDOW:
-        return None
+    df = fetch_klines(symbol, "1m", 500)
+    if df is None: return None
     df = extract_features(df)
-    vecs = get_rolling_vector(df)
-    if len(vecs) == 0:
-        return None
-    last_vec = vecs[-1].reshape(1,-1)
-    last_vec_scaled = scaler.transform(last_vec)
-    prob = ml_model.predict_proba(last_vec_scaled)[0,1]
+    vec = df[["ema_diff","adx","rsi","macd_hist","atr","bb_width","vol_zscore"]].iloc[-1].values.reshape(1,-1)
+    vec_scaled = scaler.transform(imputer.transform(vec))
+    prob = ml_model.predict_proba(vec_scaled)[0,1]
     last = df.iloc[-1]
     if prob < 0.7:
         return None
@@ -248,59 +205,63 @@ def detect_signal(symbol):
     atr = last["atr"]
     sl = entry - 1.5*atr if action=="LONG" else entry + 1.5*atr
     tp1 = entry + 1.5*atr if action=="LONG" else entry - 1.5*atr
-    tp2 = entry + 3*atr if action=="LONG" else entry - 3*atr
-    tp3 = entry + 5*atr if action=="LONG" else entry - 5*atr
-    return {"symbol":symbol,"action":action,"entry":entry,"sl":sl,"tp1":tp1,"tp2":tp2,"tp3":tp3,"confidence":prob}
+    return {"symbol":symbol,"action":action,"entry":entry,"sl":sl,"tp1":tp1,"confidence":prob}
 
-def plot_signal(df, signal):
-    addplots=[]
-    for tp in ["tp1","tp2","tp3"]:
-        addplots.append(mpf.make_addplot([signal[tp]]*len(df), linestyle="--", color='green'))
-    addplots.append(mpf.make_addplot([signal["sl"]]*len(df), linestyle="--", color='red'))
-    addplots.append(mpf.make_addplot([signal["entry"]]*len(df), linestyle="--", color='blue'))
-    fig, ax = mpf.plot(df.tail(200), type='candle', style='yahoo', addplot=addplots, returnfig=True)
-    buf = io.BytesIO()
-    fig.savefig(buf, format='png', bbox_inches='tight')
-    buf.seek(0)
-    plt.close(fig)
-    return buf
+# ---------------- AUTO SCAN ----------------
+def fetch_top_symbols(limit=50):
+    try:
+        tickers = binance_client.futures_ticker()
+        usdt_pairs = [t for t in tickers if t.get("symbol","").endswith("USDT")]
+        scores = []
+        for t in usdt_pairs:
+            try:
+                change_pct = abs(float(t.get("priceChangePercent",0)))
+                vol = float(t.get("quoteVolume",0))
+                score = change_pct*0.6 + vol*0.4
+                scores.append((t["symbol"], score))
+            except: continue
+        sorted_symbols = [s[0] for s in sorted(scores, key=lambda x:x[1], reverse=True)[:limit]]
+        return sorted_symbols
+    except Exception as e:
+        logger.warning(f"Failed fetch_top_symbols: {e}")
+        return ["BTCUSDT","ETHUSDT","BNBUSDT"]
 
-def analyze_all_symbols():
-    symbols = ["BTCUSDT","ETHUSDT","BNBUSDT"]
-    for s in symbols:
-        signal = detect_signal(s)
-        if signal:
-            df = get_latest_df(s)
-            photo = plot_signal(df, signal)
-            msg = f"⚡ Signal {signal['symbol']}\nAction: {signal['action']}\nEntry: {signal['entry']:.2f}\nSL: {signal['sl']:.2f}\nTP1: {signal['tp1']:.2f}\nConf: {signal['confidence']:.2f}"
-            send_telegram(msg, photo)
-            state["signals"][s] = signal
-            history["signals"].append(signal)
-    save_json_safe(STATE_FILE, state)
-    save_json_safe(HISTORY_FILE, history)
+def analyze_loop():
+    while True:
+        symbols = fetch_top_symbols()
+        for s in symbols:
+            sig = detect_signal(s)
+            if sig:
+                msg = f"⚡ Signal {sig['symbol']}\nAction: {sig['action']}\nEntry: {sig['entry']:.2f}\nSL: {sig['sl']:.2f}\nTP1: {sig['tp1']:.2f}\nConf: {sig['confidence']:.2f}"
+                send_telegram(msg)
+                state["signals"][s] = sig
+                history["signals"].append(sig)
+        save_json_safe(STATE_FILE, state)
+        save_json_safe(HISTORY_FILE, history)
+        state["last_scan"] = str(datetime.now(timezone.utc))
+        time.sleep(SCAN_INTERVAL)
 
 # ---------------- FLASK ----------------
 app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
-def home():
-    return jsonify({"status":"ok", "time":str(datetime.now(timezone.utc)), "signals":len(state["signals"])})
+def home_route():
+    return jsonify({"status":"ok","time":str(datetime.now(timezone.utc)),"signals":len(state["signals"])})
 
 @app.route("/scan", methods=["POST"])
 def scan_endpoint():
-    Thread(target=analyze_all_symbols, daemon=True).start()
-    return jsonify({"ok": True, "message": "Scan started"})
+    Thread(target=analyze_loop, daemon=True).start()
+    return jsonify({"ok": True,"message":"Scan loop started"})
 
 # ---------------- STARTUP ----------------
-def startup_tasks():
+def startup():
     init_binance_client()
     symbols = ["BTCUSDT","ETHUSDT","BNBUSDT"]
-    fit_scaler_and_model(symbols)
-    start_ws(symbols, "1m")
-    send_telegram("⚡ Bot started and ready! Monitoring symbols: " + ", ".join(symbols))
-    Thread(target=analyze_all_symbols, daemon=True).start()
+    fit_ml(symbols)
+    start_ws(symbols)
+    Thread(target=analyze_loop, daemon=True).start()
+    send_telegram("⚡ Bot started and ready!")
 
 if __name__ == "__main__":
-    logger.info("Starting bot...")
-    startup_tasks()
+    startup()
     app.run(host="0.0.0.0", port=PORT)
