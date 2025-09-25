@@ -359,8 +359,8 @@ def startup_tasks():
     scan_all_symbols()
 
 # --- для Gunicorn (Render) ---
-@app.before_first_request
-def activate_job():
+@app.before_serving
+async def activate_job():
     logger.info("🔥 Flask started, launching startup tasks...")
     Thread(target=startup_tasks, daemon=True).start()
 
