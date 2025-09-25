@@ -47,32 +47,29 @@ twm = None
 state = {"signals": {}, "last_scan": None, "top_symbols": []}
 history = {"signals": []}
 
-state = load_json_safe(STATE_FILE, state)
-history = load_json_safe(HISTORY_FILE, history)
-
 # ---------------- UTILS ----------------
 def load_json_safe(path, default):
     try:
         if os.path.exists(path):
-            with open(path,"r") as f: return json.load(f)
-    except: pass
+            with open(path,"r") as f:
+                return json.load(f)
+    except:
+        pass
     return default
 
 def save_json_safe(path, data):
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         tmp = path+".tmp"
-        with open(tmp,"w") as f: json.dump(data,f,indent=2,default=str)
-        os.replace(tmp,path)
-    except: pass
+        with open(tmp,"w") as f:
+            json.dump(data, f, indent=2, default=str)
+        os.replace(tmp, path)
+    except:
+        pass
 
-state = load_json_safe(STATE_FILE,state)
-history = load_json_safe(HISTORY_FILE,history)
-
-def escape_md_v2(text:str)->str:
-    for c in "_*[]()~`>#+-=|{}.!":
-        text = text.replace(c,"\\"+c)
-    return text
+# І тільки тепер викликаємо
+state = load_json_safe(STATE_FILE, state)
+history = load_json_safe(HISTORY_FILE, history)
 
 # ---------------- TELEGRAM ----------------
 def send_telegram(msg, photo=None, max_retries=3):
