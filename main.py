@@ -359,9 +359,9 @@ def startup_tasks():
     scan_all_symbols()
 
 # --- для Gunicorn (Render) ---
-@app.before_serving
-async def activate_job():
-    logger.info("🔥 Flask started, launching startup tasks...")
+# запускаємо фоновий тред одразу після створення app
+if os.getenv("RENDER", "false").lower() == "true":
+    logger.info("🔥 Running on Render, launching startup tasks in background...")
     Thread(target=startup_tasks, daemon=True).start()
 
 # --- для локального запуску ---
