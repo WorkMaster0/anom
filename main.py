@@ -352,16 +352,20 @@ def home():
     return jsonify({"status":"ok","time":str(datetime.now(timezone.utc)),"signals":len(state["signals"])})
 
 # ---------------- MAIN ----------------
-if __name__ == "__main__":
-    logger.info("Starting adaptive ML trading bot with WS+REST")
-
+def startup_tasks():
     init_binance_client()
+    symbols = fetch_top_symbols(limit=10)
+    start_ws(symbols, "1m")
+    scan_all_symbols()
 
-    # Запускаємо WS і сканування вже після запуску Flask
-    def startup_tasks():
-        symbols = fetch_top_symbols(limit=10)
-        start_ws(symbols, "1m")
-        scan_all_symbols()
-
+# --- для Gunicorn (Render) ---
+@app.before_first_request
+def activate_job():
+    logger.info("🔥 Flask started, launching startup tasks...")
     Thread(target=startup_tasks, daemon=True).start()
+
+# --- для локального запуску ---
+if __name__ == "__main__":
+    logger.info("Starting bot locally...")
+    startup_tasks()
     app.run(host="0.0.0.0", port=PORT)
