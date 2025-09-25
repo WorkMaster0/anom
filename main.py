@@ -1,14 +1,15 @@
-import os, json, logging, requests, io, time, psutil
+import os, json, logging, requests, io
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import mplfinance as mpf
 import ta
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from threading import Thread
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify
 from binance.client import Client
+from binance.streams import ThreadedWebsocketManager
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
@@ -35,6 +36,10 @@ TIMEFRAMES = ["15m","1h","4h"]
 binance_client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 state = {"signals": {}, "last_scan": None, "top_symbols": []}
 history = {"signals": []}
+
+# ---------------- GLOBAL WS ----------------
+klines_data = {}
+twm = None
 
 # ---------------- UTIL ----------------
 def load_json_safe(path, default):
@@ -70,23 +75,74 @@ def send_telegram(msg,photo=None):
         else:
             payload={"chat_id":CHAT_ID,"text":escape_md_v2(msg),"parse_mode":"MarkdownV2"}
             requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",json=payload,timeout=10)
-    except: pass
+    except Exception as e:
+        logger.warning(f"Telegram send failed: {e}")
 
-# ---------------- DATA ----------------
-def fetch_klines(symbol,interval="15m",limit=500):
+# ---------------- WS + REST DATA ----------------
+def fetch_klines(symbol="BTCUSDT", interval="1m", limit=500):
+    """
+    Отримати історичні свічки через REST (для старту)
+    """
     try:
-        url="https://fapi.binance.com/fapi/v1/klines"
-        resp=requests.get(url,params={"symbol":symbol,"interval":interval,"limit":limit},timeout=5)
-        data=resp.json()
-        df=pd.DataFrame(data,columns=[
-            "open_time","open","high","low","close","volume",
-            "close_time","quote_asset_volume","trades",
-            "taker_buy_base","taker_buy_quote","ignore"])
-        for col in ["open","high","low","close","volume"]: df[col]=df[col].astype(float)
-        df["open_time"]=pd.to_datetime(df["open_time"],unit="ms")
-        df.set_index("open_time",inplace=True)
+        raw = binance_client.get_klines(symbol=symbol, interval=interval, limit=limit)
+        df = pd.DataFrame(raw, columns=[
+            "time", "open", "high", "low", "close", "volume",
+            "close_time", "qav", "num_trades", "taker_base_vol", "taker_quote_vol", "ignore"
+        ])
+        df["time"] = pd.to_datetime(df["time"], unit="ms")
+        df.set_index("time", inplace=True)
+        df = df[["open", "high", "low", "close", "volume"]].astype(float)
+        klines_data[symbol] = df
         return df
-    except: return None
+    except Exception as e:
+        logger.error(f"[ERROR] fetch_klines {symbol}: {e}")
+        return None
+
+def handle_socket(msg):
+    """
+    Обробка нових свічок з WebSocket
+    """
+    if msg["e"] == "kline":
+        k = msg["k"]
+        symbol = msg["s"]
+        candle_time = pd.to_datetime(k["t"], unit="ms")
+        candle = {
+            "open": float(k["o"]),
+            "high": float(k["h"]),
+            "low": float(k["l"]),
+            "close": float(k["c"]),
+            "volume": float(k["v"]),
+        }
+
+        if symbol not in klines_data:
+            return
+
+        df = klines_data[symbol]
+        df.loc[candle_time] = [candle["open"], candle["high"], candle["low"], candle["close"], candle["volume"]]
+        klines_data[symbol] = df.tail(1000)
+
+def start_ws(symbols=None, interval="1m"):
+    """
+    Запускає WebSocket для списку символів
+    """
+    global twm
+    twm = ThreadedWebsocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
+    twm.start()
+
+    if symbols is None:
+        symbols = ["BTCUSDT", "ETHUSDT"]
+
+    for s in symbols:
+        fetch_klines(s, interval, 500)
+        twm.start_kline_socket(callback=handle_socket, symbol=s, interval=interval)
+
+    logger.info(f"[WS] Started for {symbols}")
+
+def get_latest_df(symbol):
+    """
+    Отримати актуальний DataFrame по символу (оновлений через WebSocket або REST)
+    """
+    return klines_data.get(symbol) or fetch_klines(symbol)
 
 # ---------------- FEATURES ----------------
 def extract_features(df:pd.DataFrame):
@@ -96,11 +152,13 @@ def extract_features(df:pd.DataFrame):
     df["ema_diff"]=df["ema20"]-df["ema50"]
     df["adx"]=ta.trend.ADXIndicator(df['high'],df['low'],df['close'],window=14).adx()
     df["rsi"]=ta.momentum.RSIIndicator(df['close'],window=14).rsi()
-    df["macd"]=ta.trend.MACD(df['close']).macd()
-    df["macd_signal"]=ta.trend.MACD(df['close']).macd_signal()
+    macd=ta.trend.MACD(df['close'])
+    df["macd"]=macd.macd()
+    df["macd_signal"]=macd.macd_signal()
     df["macd_hist"]=df["macd"]-df["macd_signal"]
     df["atr"]=ta.volatility.AverageTrueRange(df['high'],df['low'],df['close'],window=14).average_true_range()
-    df["bb_width"]=ta.volatility.BollingerBands(df['close']).bollinger_hband()-ta.volatility.BollingerBands(df['close']).bollinger_lband()
+    bb=ta.volatility.BollingerBands(df['close'])
+    df["bb_width"]=bb.bollinger_hband()-bb.bollinger_lband()
     df["vol_ma20"]=df["volume"].rolling(20).mean()
     df["vol_zscore"]=(df["volume"]-df["vol_ma20"])/df["vol_ma20"].rolling(20).std()
     df["hammer"]=(df["close"]>df["open"])&((df["low"]-df[["open","close"]].min(axis=1))>2*(df["close"]-df["open"]))
@@ -143,7 +201,7 @@ def train_ml_model():
 def fetch_multi_tf_klines(symbol, limit=500):
     dfs = {}
     for tf in TIMEFRAMES:
-        df = fetch_klines(symbol, interval=tf, limit=limit)
+        df = get_latest_df(symbol)
         if df is not None and len(df) >= ROLLING_WINDOW:
             dfs[tf] = extract_features(df)
     return dfs if dfs else None
@@ -158,30 +216,6 @@ def get_multi_tf_vector(dfs):
     if vectors:
         return np.concatenate(vectors)
     return None
-
-# ---------------- SIGNAL EVALUATION ----------------
-def evaluate_signals(symbol, look_ahead=10):
-    df = fetch_klines(symbol, interval="15m", limit=look_ahead+1)
-    if df is None or len(df)<look_ahead: return
-    for sig in history.get("signals", []):
-        if sig.get("evaluated"): continue
-        if sig.get("symbol") != symbol: continue
-        entry = sig["entry"]
-        sl = sig["sl"]
-        tps = [sig["tp1"], sig["tp2"], sig["tp3"]]
-        action = sig["action"]
-        future = df.iloc[-look_ahead:]
-        success = 0
-        if action == "LONG":
-            if (future["high"]>=max(tps)).any(): success = 1
-            elif (future["low"]<=sl).any(): success = 0
-        else:
-            if (future["low"]<=min(tps)).any(): success = 1
-            elif (future["high"]>=sl).any(): success = 0
-        sig["success"] = success
-        sig["evaluated"] = True
-    save_json_safe(HISTORY_FILE, history)
-    train_ml_model()
 
 # ---------------- SIGNAL GENERATION ----------------
 def detect_signal_ml(dfs,symbol):
@@ -227,25 +261,34 @@ def analyze_symbol(symbol):
     save_json_safe(STATE_FILE,state)
     history["signals"].append(signal)
     save_json_safe(HISTORY_FILE,history)
-    evaluate_signals(symbol)
 
-# ---------------- DYNAMIC TOP SYMBOLS ----------------
-def fetch_top_symbols(limit=TOP_SYMBOL_LIMIT):
+# ---------------- TOP SYMBOLS ----------------
+last_top_update = None
+def fetch_top_symbols(limit=200, cache_minutes=60):
+    global last_top_update
+    if state.get("top_symbols") and last_top_update:
+        if datetime.now(timezone.utc) - last_top_update < timedelta(minutes=cache_minutes):
+            return state["top_symbols"]
+
     try:
         tickers = binance_client.futures_ticker()
-        usdt_pairs = [t for t in tickers if t['symbol'].endswith("USDT")]
+        usdt_pairs = [t for t in tickers if t.get("symbol","").endswith("USDT")]
         scores=[]
         for t in usdt_pairs:
             try:
-                change_pct=abs(float(t.get("priceChangePercent",0)))
-                vol=float(t.get("quoteVolume",0))
-                scores.append((t['symbol'],change_pct*0.6+vol*0.4))
+                change_pct = abs(float(t.get("priceChangePercent",0)))
+                vol = float(t.get("quoteVolume",0))
+                score = change_pct*0.6 + vol*0.4
+                scores.append((t["symbol"], score))
             except: continue
-        sorted_symbols=[s[0] for s in sorted(scores,key=lambda x:x[1],reverse=True)[:limit]]
-        state["top_symbols"]=sorted_symbols
+        if not scores: return ["BTCUSDT","ETHUSDT","BNBUSDT"]
+        sorted_symbols = [s[0] for s in sorted(scores,key=lambda x:x[1],reverse=True)[:limit]]
+        state["top_symbols"] = sorted_symbols
         save_json_safe(STATE_FILE,state)
+        last_top_update = datetime.now(timezone.utc)
         return sorted_symbols
-    except: return ["BTCUSDT","ETHUSDT","BNBUSDT"]
+    except:
+        return state.get("top_symbols") or ["BTCUSDT","ETHUSDT","BNBUSDT"]
 
 # ---------------- MASTER SCAN ----------------
 def scan_all_symbols():
@@ -262,10 +305,13 @@ def scan_endpoint():
     Thread(target=scan_all_symbols,daemon=True).start()
     return jsonify({"ok":True,"message":"Scan started"})
 @app.route("/",methods=["GET"])
-def home(): return jsonify({"status":"ok","time":str(datetime.now(timezone.utc)),"signals":len(state["signals"])})
+def home():
+    return jsonify({"status":"ok","time":str(datetime.now(timezone.utc)),"signals":len(state["signals"])})
 
 # ---------------- MAIN ----------------
 if __name__=="__main__":
-    logger.info("Starting adaptive ML trading bot")
+    logger.info("Starting adaptive ML trading bot with WS+REST")
+    symbols = fetch_top_symbols(limit=10)
+    Thread(target=start_ws, args=(symbols,"1m"), daemon=True).start()
     Thread(target=scan_all_symbols,daemon=True).start()
     app.run(host="0.0.0.0",port=PORT)
