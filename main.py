@@ -30,9 +30,14 @@ PARALLEL_WORKERS = 4
 TIMEFRAMES = ["15m","1h","4h"]
 
 # ---------------- CLIENT ----------------
-binance_client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
-state = {"signals": {}, "last_scan": None, "top_symbols": []}
-history = {"signals": []}
+binance_client = None
+
+def init_binance_client():
+    global binance_client
+    if binance_client is None:
+        binance_client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+        logger.info("Binance client initialized (without ping)")
+    return binance_client
 
 # ---------------- GLOBAL WS ----------------
 klines_data = {}
@@ -343,9 +348,16 @@ def home():
     return jsonify({"status":"ok","time":str(datetime.now(timezone.utc)),"signals":len(state["signals"])})
 
 # ---------------- MAIN ----------------
-if __name__=="__main__":
+if __name__ == "__main__":
     logger.info("Starting adaptive ML trading bot with WS+REST")
-    symbols=fetch_top_symbols(limit=10)
-    Thread(target=start_ws,args=(symbols,"1m"),daemon=True).start()
-    Thread(target=scan_all_symbols,daemon=True).start()
-    app.run(host="0.0.0.0",port=PORT)
+
+    init_binance_client()
+
+    # Запускаємо WS і сканування вже після запуску Flask
+    def startup_tasks():
+        symbols = fetch_top_symbols(limit=10)
+        start_ws(symbols, "1m")
+        scan_all_symbols()
+
+    Thread(target=startup_tasks, daemon=True).start()
+    app.run(host="0.0.0.0", port=PORT)
