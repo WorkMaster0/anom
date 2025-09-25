@@ -1,4 +1,8 @@
-import os, json, logging, requests, io
+import os
+import json
+import logging
+import requests
+import io
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -52,8 +56,8 @@ def load_json_safe(path, default):
         if os.path.exists(path):
             with open(path, "r") as f:
                 return json.load(f)
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"Failed to load {path}: {e}")
     return default
 
 def save_json_safe(path, data):
@@ -63,8 +67,8 @@ def save_json_safe(path, data):
         with open(tmp, "w") as f:
             json.dump(data, f, indent=2, default=str)
         os.replace(tmp, path)
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"Failed to save {path}: {e}")
 
 state = load_json_safe(STATE_FILE, state)
 history = load_json_safe(HISTORY_FILE, history)
@@ -98,14 +102,12 @@ def send_telegram(msg, photo=None, max_retries=3):
     logger.error("Telegram send failed after max retries")
     return False
 
-# ---------------- KLİNES ----------------
+# ---------------- KLINES ----------------
 def fetch_klines(symbol="BTCUSDT", interval="1m", limit=500):
     try:
-        raw = binance_client.get_klines(symbol=symbol, interval=interval, limit=limit)
-        df = pd.DataFrame(raw, columns=[
-            "time","open","high","low","close","volume",
-            "close_time","qav","num_trades","taker_base_vol","taker_quote_vol","ignore"
-        ])
+        df = pd.DataFrame(binance_client.get_klines(symbol=symbol, interval=interval, limit=limit),
+                          columns=["time","open","high","low","close","volume",
+                                   "close_time","qav","num_trades","taker_base_vol","taker_quote_vol","ignore"])
         df["time"] = pd.to_datetime(df["time"], unit="ms")
         df.set_index("time", inplace=True)
         df = df[["open","high","low","close","volume"]].astype(float)
@@ -188,8 +190,19 @@ def get_rolling_vector(df, window=ROLLING_WINDOW):
 scaler = StandardScaler()
 ml_model = LogisticRegression()
 
+def get_multi_tf_vector(dfs):
+    vectors = []
+    for tf in TIMEFRAMES:
+        df = dfs.get(tf)
+        if df is None: continue
+        vec = get_rolling_vector(df)
+        if len(vec) > 0:
+            vectors.append(vec[-1])
+    if vectors:
+        return np.concatenate(vectors)
+    return None
+
 def fit_scaler_and_model(symbols):
-    """Fit scaler and a dummy logistic model on available history"""
     all_data = []
     for s in symbols:
         df = fetch_klines(s, "1m", 500)
@@ -202,8 +215,7 @@ def fit_scaler_and_model(symbols):
     if all_data:
         combined = np.vstack(all_data)
         scaler.fit(combined)
-        # Fit a dummy logistic model
-        ml_model.fit(combined, np.zeros(combined.shape[0]))  # all zeros, just to avoid NotFittedError
+        ml_model.fit(combined, np.zeros(combined.shape[0]))
         logger.info(f"[Scaler+ML] Fitted on {combined.shape[0]} samples with {combined.shape[1]} features")
     else:
         logger.warning("[Scaler+ML] No data to fit scaler/model!")
@@ -216,18 +228,6 @@ def fetch_multi_tf_klines(symbol):
     for tf in TIMEFRAMES:
         dfs[tf] = extract_features(df)
     return dfs
-
-def get_multi_tf_vector(dfs):
-    vectors = []
-    for tf in TIMEFRAMES:
-        df = dfs.get(tf)
-        if df is None: continue
-        vec = get_rolling_vector(df)
-        if len(vec) > 0:
-            vectors.append(vec[-1])
-    if vectors:
-        return np.concatenate(vectors)
-    return None
 
 def detect_signal_ml(dfs, symbol):
     vec = get_multi_tf_vector(dfs)
@@ -263,6 +263,7 @@ def plot_signal(df,symbol,signal):
     plt.close(fig)
     return buf
 
+# ---------------- ANALYSIS ----------------
 def analyze_symbol(symbol):
     logger.info(f"Analyzing symbol: {symbol}")
     dfs = fetch_multi_tf_klines(symbol)
@@ -312,26 +313,35 @@ def fetch_top_symbols(limit=10, cache_minutes=10):
                 vol = float(t.get("quoteVolume",0))
                 score = change_pct*0.6 + vol*0.4
                 scores.append((t["symbol"], score))
-            except: continue
+            except Exception: continue
         if not scores: return ["BTCUSDT","ETHUSDT","BNBUSDT"]
         sorted_symbols = [s[0] for s in sorted(scores, key=lambda x:x[1], reverse=True)[:limit]]
         state["top_symbols"] = sorted_symbols
         save_json_safe(STATE_FILE, state)
         last_top_update = datetime.now(timezone.utc)
         return sorted_symbols
-    except:
+    except Exception as e:
+        logger.warning(f"Failed to fetch top symbols: {e}")
         return state.get("top_symbols") or ["BTCUSDT","ETHUSDT","BNBUSDT"]
 
 # ---------------- MASTER SCAN ----------------
 def scan_all_symbols():
     logger.info("Starting full symbols scan...")
     symbols = fetch_top_symbols()
+    if not symbols:
+        logger.warning("No symbols to scan")
+        return
     total_symbols = len(symbols)
     logger.info(f"Symbols to scan: {total_symbols} -> {symbols}")
     with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as exe:
-        for idx, _ in enumerate(exe.map(analyze_symbol, symbols), start=1):
+        futures = [exe.submit(analyze_symbol, s) for s in symbols]
+        for idx, f in enumerate(futures, start=1):
+            try:
+                f.result()
+            except Exception as e:
+                logger.error(f"Error analyzing symbol: {e}")
             logger.info(f"Processed {idx}/{total_symbols} symbols")
-            time.sleep(0.5)
+            time.sleep(0.2)
     state["last_scan"] = str(datetime.now(timezone.utc))
     save_json_safe(STATE_FILE, state)
     logger.info("Full symbols scan completed")
@@ -351,6 +361,9 @@ def home():
 def startup_tasks():
     init_binance_client()
     symbols = fetch_top_symbols(limit=10)
+    if not symbols:
+        logger.error("No symbols fetched at startup!")
+        return
     fit_scaler_and_model(symbols)
     start_ws(symbols, "1m")
     try:
