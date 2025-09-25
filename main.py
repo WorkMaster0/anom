@@ -1,10 +1,8 @@
-import os
-import json
-import logging
-import requests
-import io
+import os, json, logging, requests, io, time
 import pandas as pd
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import mplfinance as mpf
 import ta
@@ -16,8 +14,8 @@ from binance.client import Client
 from binance.streams import ThreadedWebsocketManager
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
 import asyncio
-import time
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -33,8 +31,8 @@ STATE_FILE = "state.json"
 HISTORY_FILE = "history.json"
 ROLLING_WINDOW = 10
 PARALLEL_WORKERS = 4
-TIMEFRAMES = ["15m", "1h", "4h"]
-ATR_THRESHOLD = 0.002  # для ML label generation
+TIMEFRAMES = ["15m","1h","4h"]
+ATR_THRESHOLD = 0.002
 
 # ---------------- GLOBALS ----------------
 binance_client = None
@@ -43,6 +41,9 @@ twm = None
 state = {"signals": {}, "last_scan": None, "top_symbols": []}
 history = {"signals": []}
 json_lock = Lock()
+imputer = SimpleImputer(strategy='mean')
+scaler = StandardScaler()
+ml_model = LogisticRegression()
 
 # ---------------- UTILS ----------------
 def load_json_safe(path, default):
@@ -116,7 +117,7 @@ def fetch_klines(symbol="BTCUSDT", interval="1m", limit=500):
         klines_data[symbol] = df
         return df
     except Exception as e:
-        logger.error(f"[ERROR] fetch_klines {symbol}: {e}")
+        logger.warning(f"[ERROR] fetch_klines {symbol}: {e}")
         return None
 
 def handle_socket(msg):
@@ -186,21 +187,20 @@ def get_rolling_vector(df, window=ROLLING_WINDOW):
     for i in range(window, len(df)):
         vec = df[features].iloc[i-window:i].values.flatten()
         vectors.append(vec)
-    return np.array(vectors)
+    vectors = np.array(vectors)
+    vectors = vectors[~np.isnan(vectors).any(axis=1)]
+    return vectors
 
-# ---------------- ML MODEL ----------------
-scaler = StandardScaler()
-ml_model = LogisticRegression()
-
+# ---------------- ML ----------------
 def generate_labels(df: pd.DataFrame):
-    """Label = 1 якщо наступна свічка росте більше ATR_THRESHOLD, інакше 0"""
     df = df.copy()
-    df['future_return'] = df['close'].shift(-1) / df['close'] - 1
+    df['future_return'] = df['close'].shift(-1)/df['close'] - 1
     df['label'] = (df['future_return'] > ATR_THRESHOLD).astype(int)
     return df
 
 def fit_scaler_and_model(symbols):
     all_X, all_y = [], []
+    valid_symbols = []
     for s in symbols:
         df = fetch_klines(s, "1m", 1000)
         if df is None or len(df) < ROLLING_WINDOW + 1:
@@ -209,173 +209,98 @@ def fit_scaler_and_model(symbols):
         df = generate_labels(df)
         vecs = get_rolling_vector(df)
         labels = df['label'].iloc[ROLLING_WINDOW:].values
-        if len(vecs) != len(labels):
+        min_len = min(len(vecs), len(labels))
+        if min_len == 0: 
             continue
+        vecs = vecs[-min_len:]
+        labels = labels[-min_len:]
         all_X.append(vecs)
         all_y.append(labels)
+        valid_symbols.append(s)
     if all_X:
         X = np.vstack(all_X)
         y = np.hstack(all_y)
+        X = imputer.fit_transform(X)
         scaler.fit(X)
         X_scaled = scaler.transform(X)
         ml_model.fit(X_scaled, y)
-        logger.info(f"[ML] Trained on {X.shape[0]} samples with {X.shape[1]} features")
+        logger.info(f"[ML] Trained on {X.shape[0]} samples for symbols: {valid_symbols}")
     else:
         logger.warning("[ML] Not enough data to train model")
 
-def fetch_multi_tf_klines(symbol):
-    dfs = {}
-    df = klines_data.get(symbol)
+# ---------------- SIGNAL ----------------
+def detect_signal(symbol):
+    df = get_latest_df(symbol)
     if df is None or len(df) < ROLLING_WINDOW:
         return None
-    for tf in TIMEFRAMES:
-        dfs[tf] = extract_features(df)
-    return dfs
-
-def get_multi_tf_vector(dfs):
-    vectors = []
-    for tf in TIMEFRAMES:
-        df = dfs.get(tf)
-        if df is None: continue
-        vec = get_rolling_vector(df)
-        if len(vec) > 0:
-            vectors.append(vec[-1])
-    if vectors:
-        return np.concatenate(vectors)
-    return None
-
-def detect_signal_ml(dfs, symbol):
-    vec = get_multi_tf_vector(dfs)
-    if vec is None: return None
-    vec_scaled = scaler.transform(vec.reshape(1,-1))
-    prob = ml_model.predict_proba(vec_scaled)[0,1] if hasattr(ml_model,"predict_proba") else 0.5
-    last = dfs["15m"].iloc[-1]
-    if prob < 0.6: return None  # поріг впевненості
+    df = extract_features(df)
+    vecs = get_rolling_vector(df)
+    if len(vecs) == 0:
+        return None
+    last_vec = vecs[-1].reshape(1,-1)
+    last_vec_scaled = scaler.transform(last_vec)
+    prob = ml_model.predict_proba(last_vec_scaled)[0,1]
+    last = df.iloc[-1]
+    if prob < 0.7:
+        return None
     action = "LONG" if last["ema_diff"] > 0 else "SHORT"
-    atr = last["atr"]
     entry = last["close"]
-    if action == "LONG":
-        sl = entry - 1.5*atr; tp1=entry+1.5*atr; tp2=entry+3*atr; tp3=entry+5*atr
-    else:
-        sl = entry + 1.5*atr; tp1=entry-1.5*atr; tp2=entry-3*atr; tp3=entry-5*atr
-    rr1 = (tp1-entry)/(entry-sl) if action=="LONG" else (entry-tp1)/(sl-entry)
-    if rr1<2: return None
-    return {"action":action,"entry":entry,"sl":sl,"tp1":tp1,"tp2":tp2,"tp3":tp3,
-            "confidence":prob,"rr1":rr1,"features":vec.tolist(),"symbol":symbol}
+    atr = last["atr"]
+    sl = entry - 1.5*atr if action=="LONG" else entry + 1.5*atr
+    tp1 = entry + 1.5*atr if action=="LONG" else entry - 1.5*atr
+    tp2 = entry + 3*atr if action=="LONG" else entry - 3*atr
+    tp3 = entry + 5*atr if action=="LONG" else entry - 5*atr
+    return {"symbol":symbol,"action":action,"entry":entry,"sl":sl,"tp1":tp1,"tp2":tp2,"tp3":tp3,"confidence":prob}
 
-# ---------------- SIGNAL PLOTTING ----------------
-def plot_signal(df,symbol,signal):
+def plot_signal(df, signal):
     addplots=[]
     for tp in ["tp1","tp2","tp3"]:
         addplots.append(mpf.make_addplot([signal[tp]]*len(df), linestyle="--", color='green'))
     addplots.append(mpf.make_addplot([signal["sl"]]*len(df), linestyle="--", color='red'))
     addplots.append(mpf.make_addplot([signal["entry"]]*len(df), linestyle="--", color='blue'))
-    fig, ax = mpf.plot(df.tail(200), type='candle', style='yahoo',
-                    title=f"{symbol}-{signal['action']}", addplot=addplots, returnfig=True)
+    fig, ax = mpf.plot(df.tail(200), type='candle', style='yahoo', addplot=addplots, returnfig=True)
     buf = io.BytesIO()
     fig.savefig(buf, format='png', bbox_inches='tight')
     buf.seek(0)
     plt.close(fig)
     return buf
 
-# ---------------- ANALYSIS ----------------
-def analyze_symbol(symbol):
-    dfs = fetch_multi_tf_klines(symbol)
-    if not dfs:
-        return
-    signal = detect_signal_ml(dfs, symbol)
-    if not signal:
-        return
-    last_signal = state["signals"].get(symbol, {}).get("signal")
-    if last_signal and last_signal["action"] == signal["action"]:
-        return  # не дублюємо
-    try:
-        photo = plot_signal(dfs["15m"], symbol, signal)
-    except Exception:
-        photo = None
-    msg = (
-        f"⚡ TRADE SIGNAL\n"
-        f"Symbol: {symbol}\n"
-        f"Action: {signal['action']}\n"
-        f"Entry: {signal['entry']:.6f}\n"
-        f"SL: {signal['sl']:.6f}\n"
-        f"TP1: {signal['tp1']:.6f}\n"
-        f"Confidence: {signal['confidence']:.2f}\n"
-        f"R/R1: {signal['rr1']:.2f}\n"
-        f"(Timeframes: {', '.join(dfs.keys())})"
-    )
-    send_telegram(msg, photo)
-    state["signals"][symbol] = {"signal": signal, "time": str(datetime.now(timezone.utc))}
+def analyze_all_symbols():
+    symbols = ["BTCUSDT","ETHUSDT","BNBUSDT"]
+    for s in symbols:
+        signal = detect_signal(s)
+        if signal:
+            df = get_latest_df(s)
+            photo = plot_signal(df, signal)
+            msg = f"⚡ Signal {signal['symbol']}\nAction: {signal['action']}\nEntry: {signal['entry']:.2f}\nSL: {signal['sl']:.2f}\nTP1: {signal['tp1']:.2f}\nConf: {signal['confidence']:.2f}"
+            send_telegram(msg, photo)
+            state["signals"][s] = signal
+            history["signals"].append(signal)
     save_json_safe(STATE_FILE, state)
-    history["signals"].append(signal)
     save_json_safe(HISTORY_FILE, history)
-
-# ---------------- TOP SYMBOLS ----------------
-last_top_update = None
-def fetch_top_symbols(limit=10, cache_minutes=10):
-    global last_top_update
-    if state.get("top_symbols") and last_top_update:
-        if datetime.now(timezone.utc) - last_top_update < timedelta(minutes=cache_minutes):
-            return state["top_symbols"]
-    try:
-        tickers = binance_client.futures_ticker()
-        usdt_pairs = [t for t in tickers if t.get("symbol","").endswith("USDT")]
-        scores = []
-        for t in usdt_pairs:
-            try:
-                change_pct = abs(float(t.get("priceChangePercent",0)))
-                vol = float(t.get("quoteVolume",0))
-                score = change_pct*0.6 + vol*0.4
-                scores.append((t["symbol"], score))
-            except Exception: continue
-        if not scores: return ["BTCUSDT","ETHUSDT","BNBUSDT"]
-        sorted_symbols = [s[0] for s in sorted(scores, key=lambda x:x[1], reverse=True)[:limit]]
-        state["top_symbols"] = sorted_symbols
-        save_json_safe(STATE_FILE, state)
-        last_top_update = datetime.now(timezone.utc)
-        return sorted_symbols
-    except Exception:
-        return state.get("top_symbols") or ["BTCUSDT","ETHUSDT","BNBUSDT"]
-
-# ---------------- MASTER SCAN ----------------
-def scan_all_symbols():
-    symbols = fetch_top_symbols()
-    if not symbols:
-        return
-    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as exe:
-        futures = [exe.submit(analyze_symbol, s) for s in symbols]
-        for f in futures:
-            try: f.result()
-            except Exception as e: logger.error(f"Symbol scan error: {e}")
-    state["last_scan"] = str(datetime.now(timezone.utc))
-    save_json_safe(STATE_FILE, state)
 
 # ---------------- FLASK ----------------
 app = Flask(__name__)
-@app.route("/scan", methods=["POST"])
-def scan_endpoint():
-    Thread(target=scan_all_symbols, daemon=True).start()
-    return jsonify({"ok": True, "message": "Scan started"})
 
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({"status":"ok", "time":str(datetime.now(timezone.utc)), "signals":len(state["signals"])})
 
+@app.route("/scan", methods=["POST"])
+def scan_endpoint():
+    Thread(target=analyze_all_symbols, daemon=True).start()
+    return jsonify({"ok": True, "message": "Scan started"})
+
 # ---------------- STARTUP ----------------
 def startup_tasks():
     init_binance_client()
-    symbols = fetch_top_symbols(limit=10)
+    symbols = ["BTCUSDT","ETHUSDT","BNBUSDT"]
     fit_scaler_and_model(symbols)
     start_ws(symbols, "1m")
-    try:
-        send_telegram("⚡ Bot started! Monitoring: " + ", ".join(symbols))
-    except Exception as e:
-        logger.warning(f"Cannot send Telegram message: {e}")
-    scan_all_symbols()
-
-if os.getenv("RENDER", "false").lower() == "true":
-    Thread(target=startup_tasks, daemon=True).start()
+    send_telegram("⚡ Bot started and ready! Monitoring symbols: " + ", ".join(symbols))
+    Thread(target=analyze_all_symbols, daemon=True).start()
 
 if __name__ == "__main__":
+    logger.info("Starting bot...")
     startup_tasks()
     app.run(host="0.0.0.0", port=PORT)
