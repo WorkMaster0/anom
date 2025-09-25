@@ -62,18 +62,34 @@ def escape_md_v2(text:str)->str:
         text = text.replace(c,"\\"+c)
     return text
 
-def send_telegram(msg,photo=None):
-    if not TELEGRAM_TOKEN or not CHAT_ID: return
-    try:
-        if photo:
-            files={'photo':('signal.png',photo,'image/png')}
-            data={'chat_id':CHAT_ID,'caption':escape_md_v2(msg),'parse_mode':'MarkdownV2'}
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",data=data,files=files,timeout=10)
-        else:
-            payload={"chat_id":CHAT_ID,"text":escape_md_v2(msg),"parse_mode":"MarkdownV2"}
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",json=payload,timeout=10)
-    except Exception as e:
-        logger.warning(f"Telegram send failed: {e}")
+# ---------------- TELEGRAM ----------------
+def send_telegram(msg, photo=None, max_retries=3):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        logger.warning("Telegram token or chat_id not set, skipping send.")
+        return False
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            if photo:
+                files = {'photo': ('signal.png', photo, 'image/png')}
+                data = {'chat_id': CHAT_ID, 'caption': escape_md_v2(msg), 'parse_mode': 'MarkdownV2'}
+                resp = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+                                     data=data, files=files, timeout=10)
+            else:
+                payload = {"chat_id": CHAT_ID, "text": escape_md_v2(msg), "parse_mode": "MarkdownV2"}
+                resp = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                                     json=payload, timeout=10)
+
+            if resp.status_code == 200:
+                logger.info(f"Telegram message sent successfully (attempt {attempt})")
+                return True
+            else:
+                logger.warning(f"Telegram send failed (attempt {attempt}): {resp.status_code} {resp.text}")
+        except Exception as e:
+            logger.warning(f"Telegram send exception (attempt {attempt}): {e}")
+
+    logger.error("Telegram send failed after max retries")
+    return False
 
 # ---------------- REST + WS ----------------
 def fetch_klines(symbol="BTCUSDT", interval="1m", limit=500):
@@ -231,17 +247,43 @@ def plot_signal(df,symbol,signal):
 
 # ---------------- ANALYSIS ----------------
 def analyze_symbol(symbol):
-    dfs=fetch_multi_tf_klines(symbol)
-    if not dfs: return
-    signal=detect_signal_ml(dfs,symbol)
-    if not signal: return
-    photo=plot_signal(dfs["15m"],symbol,signal)
-    msg=f"⚡ TRADE SIGNAL\nSymbol: {symbol}\nAction: {signal['action']}\nEntry: {signal['entry']:.6f}\nSL: {signal['sl']:.6f}\nTP1: {signal['tp1']:.6f}\nConfidence: {signal['confidence']:.2f}\nR/R1: {signal['rr1']:.2f}\n(Timeframes: {', '.join(dfs.keys())})"
-    send_telegram(msg,photo)
-    state["signals"][symbol]={"signal":signal,"time":str(datetime.now(timezone.utc))}
-    save_json_safe(STATE_FILE,state)
+    logger.info(f"Analyzing symbol: {symbol}")
+    dfs = fetch_multi_tf_klines(symbol)
+    if not dfs:
+        logger.info(f"No data available for {symbol}")
+        return
+
+    signal = detect_signal_ml(dfs, symbol)
+    if not signal:
+        logger.info(f"No signal generated for {symbol}")
+        return
+
+    try:
+        photo = plot_signal(dfs["15m"], symbol, signal)
+    except Exception as e:
+        logger.warning(f"Failed to plot signal for {symbol}: {e}")
+        photo = None
+
+    msg = (
+        f"⚡ TRADE SIGNAL\n"
+        f"Symbol: {symbol}\n"
+        f"Action: {signal['action']}\n"
+        f"Entry: {signal['entry']:.6f}\n"
+        f"SL: {signal['sl']:.6f}\n"
+        f"TP1: {signal['tp1']:.6f}\n"
+        f"Confidence: {signal['confidence']:.2f}\n"
+        f"R/R1: {signal['rr1']:.2f}\n"
+        f"(Timeframes: {', '.join(dfs.keys())})"
+    )
+
+    sent = send_telegram(msg, photo)
+    logger.info(f"Signal for {symbol} sent: {sent}")
+
+    # Зберігаємо стан
+    state["signals"][symbol] = {"signal": signal, "time": str(datetime.now(timezone.utc))}
+    save_json_safe(STATE_FILE, state)
     history["signals"].append(signal)
-    save_json_safe(HISTORY_FILE,history)
+    save_json_safe(HISTORY_FILE, history)
 
 # ---------------- TOP SYMBOLS ----------------
 last_top_update=None
@@ -270,13 +312,25 @@ def fetch_top_symbols(limit=10,cache_minutes=10):
     except:
         return state.get("top_symbols") or ["BTCUSDT","ETHUSDT","BNBUSDT"]
 
+import time
+
 # ---------------- MASTER SCAN ----------------
 def scan_all_symbols():
-    symbols=fetch_top_symbols()
+    logger.info("Starting full symbols scan...")
+    symbols = fetch_top_symbols()
+    total_symbols = len(symbols)
+    logger.info(f"Symbols to scan: {total_symbols} -> {symbols}")
+
     with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as exe:
-        list(exe.map(analyze_symbol,symbols))
-    state["last_scan"]=str(datetime.now(timezone.utc))
-    save_json_safe(STATE_FILE,state)
+        # Використовуємо map, але логування всередині analyze_symbol
+        for idx, _ in enumerate(exe.map(analyze_symbol, symbols), start=1):
+            logger.info(f"Processed {idx}/{total_symbols} symbols")
+            # невелика затримка, щоб уникнути обмежень API
+            time.sleep(0.5)
+
+    state["last_scan"] = str(datetime.now(timezone.utc))
+    save_json_safe(STATE_FILE, state)
+    logger.info("Full symbols scan completed")
 
 # ---------------- FLASK ----------------
 app = Flask(__name__)
