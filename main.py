@@ -191,16 +191,19 @@ ml_model = LogisticRegression()
 def fit_scaler_on_history(symbols):
     all_data = []
     for s in symbols:
-        df = fetch_klines(s, "1m", 200)
-        if df is not None and not df.empty:
-            feats = extract_features(df)
-            vecs = get_rolling_vector(feats)
-            if len(vecs) > 0:
-                all_data.append(vecs)
+        df = fetch_klines(s, "1m", 500)
+        if df is None or len(df) < ROLLING_WINDOW:
+            continue
+        dfs = {}
+        for tf in TIMEFRAMES:
+            dfs[tf] = extract_features(df)
+        vec = get_multi_tf_vector(dfs)
+        if vec is not None:
+            all_data.append(vec)
     if all_data:
         combined = np.vstack(all_data)
         scaler.fit(combined)
-        logger.info(f"[Scaler] Fitted on {combined.shape[0]} samples")
+        logger.info(f"[Scaler] Fitted on {combined.shape[0]} samples with {combined.shape[1]} features")
     else:
         logger.warning("[Scaler] No data to fit scaler!")
 
