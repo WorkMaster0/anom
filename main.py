@@ -43,6 +43,13 @@ def init_binance_client():
 klines_data = {}
 twm = None
 
+# ---------------- STATE ----------------
+state = {"signals": {}, "last_scan": None, "top_symbols": []}
+history = {"signals": []}
+
+state = load_json_safe(STATE_FILE, state)
+history = load_json_safe(HISTORY_FILE, history)
+
 # ---------------- UTILS ----------------
 def load_json_safe(path, default):
     try:
