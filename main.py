@@ -309,9 +309,35 @@ def home():
     return jsonify({"status":"ok","time":str(datetime.now(timezone.utc)),"signals":len(state["signals"])})
 
 # ---------------- MAIN ----------------
-if __name__=="__main__":
-    logger.info("Starting adaptive ML trading bot with WS+REST")
-    symbols = fetch_top_symbols(limit=10)
-    Thread(target=start_ws, args=(symbols,"1m"), daemon=True).start()
-    Thread(target=scan_all_symbols,daemon=True).start()
-    app.run(host="0.0.0.0",port=PORT)
+import time
+
+def background_loop():
+    """
+    Основний цикл для постійного сканування символів
+    """
+    while True:
+        try:
+            scan_all_symbols()
+        except Exception as e:
+            logger.error(f"[LOOP] Background loop error: {e}")
+        time.sleep(SCAN_INTERVAL)
+
+def start_background():
+    """
+    Запускає WS і цикл сканування навіть під Gunicorn
+    """
+    try:
+        symbols = fetch_top_symbols(limit=10)
+        Thread(target=start_ws, args=(symbols,"1m"), daemon=True).start()
+        Thread(target=background_loop, daemon=True).start()
+        train_ml_model()
+        logger.info("✅ Background scanning & WS started.")
+    except Exception as e:
+        logger.error(f"[INIT] Failed to start background: {e}")
+
+# Запускаємо відразу при імпорті (щоб працювало і під Gunicorn, і локально)
+start_background()
+
+if __name__ == "__main__":
+    logger.info("🚀 Starting adaptive ML trading bot (dev mode)")
+    app.run(host="0.0.0.0", port=PORT)
