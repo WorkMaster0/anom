@@ -188,24 +188,25 @@ def get_rolling_vector(df, window=ROLLING_WINDOW):
 scaler = StandardScaler()
 ml_model = LogisticRegression()
 
-def fit_scaler_on_history(symbols):
+def fit_scaler_and_model(symbols):
+    """Fit scaler and a dummy logistic model on available history"""
     all_data = []
     for s in symbols:
         df = fetch_klines(s, "1m", 500)
         if df is None or len(df) < ROLLING_WINDOW:
             continue
-        dfs = {}
-        for tf in TIMEFRAMES:
-            dfs[tf] = extract_features(df)
+        dfs = {tf: extract_features(df) for tf in TIMEFRAMES}
         vec = get_multi_tf_vector(dfs)
         if vec is not None:
             all_data.append(vec)
     if all_data:
         combined = np.vstack(all_data)
         scaler.fit(combined)
-        logger.info(f"[Scaler] Fitted on {combined.shape[0]} samples with {combined.shape[1]} features")
+        # Fit a dummy logistic model
+        ml_model.fit(combined, np.zeros(combined.shape[0]))  # all zeros, just to avoid NotFittedError
+        logger.info(f"[Scaler+ML] Fitted on {combined.shape[0]} samples with {combined.shape[1]} features")
     else:
-        logger.warning("[Scaler] No data to fit scaler!")
+        logger.warning("[Scaler+ML] No data to fit scaler/model!")
 
 def fetch_multi_tf_klines(symbol):
     dfs = {}
@@ -247,6 +248,7 @@ def detect_signal_ml(dfs, symbol):
     return {"action":action,"entry":entry,"sl":sl,"tp1":tp1,"tp2":tp2,"tp3":tp3,
             "confidence":prob,"rr1":rr1,"features":vec.tolist(),"symbol":symbol}
 
+# ---------------- SIGNAL PLOTTING ----------------
 def plot_signal(df,symbol,signal):
     addplots=[]
     for tp in ["tp1","tp2","tp3"]:
@@ -287,8 +289,7 @@ def analyze_symbol(symbol):
         f"R/R1: {signal['rr1']:.2f}\n"
         f"(Timeframes: {', '.join(dfs.keys())})"
     )
-    sent = send_telegram(msg, photo)
-    logger.info(f"Signal for {symbol} sent: {sent}")
+    send_telegram(msg, photo)
     state["signals"][symbol] = {"signal": signal, "time": str(datetime.now(timezone.utc))}
     save_json_safe(STATE_FILE, state)
     history["signals"].append(signal)
@@ -350,8 +351,12 @@ def home():
 def startup_tasks():
     init_binance_client()
     symbols = fetch_top_symbols(limit=10)
-    fit_scaler_on_history(symbols)
+    fit_scaler_and_model(symbols)
     start_ws(symbols, "1m")
+    try:
+        send_telegram("⚡ Bot started and ready! Monitoring symbols: " + ", ".join(symbols))
+    except Exception as e:
+        logger.warning(f"Cannot send startup Telegram message: {e}")
     scan_all_symbols()
 
 if os.getenv("RENDER", "false").lower() == "true":
