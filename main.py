@@ -129,15 +129,24 @@ def handle_socket(msg):
         df.loc[t]=candle
         klines_data[symbol]=df.tail(1000)
 
+import asyncio
+
 def start_ws(symbols=None, interval="1m"):
     global twm
+    # Створюємо event loop для потоку
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
     twm = ThreadedWebsocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
     twm.start()
-    if symbols is None: symbols=["BTCUSDT"]
+    if symbols is None:
+        symbols = ["BTCUSDT"]
     for s in symbols:
         if s not in klines_data:
-            fetch_klines(s,interval,500)
-        twm.start_kline_socket(callback=handle_socket,symbol=s,interval=interval)
+            fetch_klines(s, interval, 500)
+        twm.start_kline_socket(callback=handle_socket, symbol=s, interval=interval)
     logger.info(f"[WS] Started for {symbols}")
 
 def get_latest_df(symbol):
