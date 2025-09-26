@@ -248,23 +248,32 @@ app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
 def home_route():
-    return jsonify({"status":"ok","time":str(datetime.now(timezone.utc)),"signals":len(state["signals"])})
+    return jsonify({
+        "status": "ok",
+        "time": str(datetime.now(timezone.utc)),
+        "signals": len(state["signals"])
+    })
 
 @app.route("/scan", methods=["POST"])
 def scan_endpoint():
     Thread(target=analyze_loop, daemon=True).start()
-    return jsonify({"ok": True,"message":"Scan loop started"})
+    return jsonify({"ok": True, "message": "Scan loop started"})
+
 
 # ---------------- STARTUP ----------------
 def startup():
+    logger.info("=== Startup initiated ===")
     init_binance_client()
-    symbols = ["BTCUSDT","ETHUSDT","BNBUSDT"]
+    symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
     fit_ml(symbols)
     start_ws(symbols)
     Thread(target=analyze_loop, daemon=True).start()
     send_telegram("⚡ Bot started and ready!")
     logger.info("Bot started and ready!")
 
+
+# ВАЖЛИВО: викликаємо startup() тут, щоб воно працювало і під gunicorn
+startup()
+
 if __name__ == "__main__":
-    startup()
     app.run(host="0.0.0.0", port=PORT)
