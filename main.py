@@ -193,7 +193,7 @@ def detect_signal(symbol):
         return None
 
     last = df.iloc[-1]
-    if prob < 0.7:
+    if prob < 0.3:
         return None
     action = "LONG" if last["ema_diff"] > 0 else "SHORT"
     entry = last["close"]
