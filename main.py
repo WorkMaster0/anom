@@ -150,8 +150,11 @@ def extract_features(df: pd.DataFrame):
     df = df.fillna(0)
     return df
 
+from sklearn.ensemble import RandomForestClassifier
+
 # ---------------- ML ----------------
 def fit_ml(symbols):
+    global ml_model
     all_X, all_y = [], []
     for s in symbols:
         df = fetch_klines(s, "1m", 500)
@@ -171,13 +174,22 @@ def fit_ml(symbols):
         X = imputer.fit_transform(X)
         scaler.fit(X)
         X_scaled = scaler.transform(X)
+
+        # Використаємо RandomForest замість LogisticRegression
+        ml_model = RandomForestClassifier(
+            n_estimators=200,
+            max_depth=8,
+            class_weight="balanced",
+            random_state=42,
+            n_jobs=-1
+        )
         ml_model.fit(X_scaled, y)
-        logger.info(f"[ML] Trained on {X.shape[0]} samples")
+        logger.info(f"[ML] Trained on {X.shape[0]} samples | Positive rate: {np.mean(y):.3f}")
     else:
         logger.warning("[ML] No data for training!")
 
 # ---------------- SIGNAL ----------------
-def detect_signal(symbol):
+def detect_signal(symbol, prob_threshold=0.55):
     df = fetch_klines(symbol, "1m", 500)
     if df is None:
         return None
@@ -187,11 +199,9 @@ def detect_signal(symbol):
     prob = ml_model.predict_proba(vec_scaled)[0, 1]
     last = df.iloc[-1]
 
-    # логування реальних ймовірностей
-    logger.info(f"[ML] {symbol} -> prob={prob:.3f}")
+    logger.info(f"[ML] {symbol} -> prob={prob:.3f} | close={last['close']:.2f}")
 
-    # ЗМЕНШЕНО поріг
-    if prob < 0.01:
+    if prob < prob_threshold:
         return None
 
     action = "LONG" if last["ema_diff"] > 0 else "SHORT"
@@ -208,6 +218,34 @@ def detect_signal(symbol):
         "tp1": tp1,
         "confidence": prob
     }
+
+# ---------------- ANALYZE LOOP ----------------
+def analyze_loop():
+    while True:
+        try:
+            logger.info("=== Starting scan cycle ===")
+            symbols = fetch_top_symbols()
+            logger.info(f"[SCAN] Checking {len(symbols)} symbols")
+            signals_found = 0
+            for s in symbols:
+                sig = detect_signal(s)
+                if sig:
+                    msg = f"⚡ Signal {sig['symbol']} {sig['action']} @ {sig['entry']:.2f} Conf: {sig['confidence']:.2f}"
+                    send_telegram(msg)
+                    logger.info(f"Signal found: {msg}")
+                    state["signals"][s] = sig
+                    history["signals"].append(sig)
+                    signals_found += 1
+                else:
+                    logger.info(f"No signal for {s}")
+            save_json_safe(STATE_FILE, state)
+            save_json_safe(HISTORY_FILE, history)
+            state["last_scan"] = str(datetime.now(timezone.utc))
+            logger.info(f"=== Scan finished | Signals: {signals_found}/{len(symbols)} ===")
+            time.sleep(SCAN_INTERVAL)
+        except Exception as e:
+            logger.error(f"Analyze loop crashed: {e}", exc_info=True)
+            time.sleep(10)
 
 # ---------------- TOP SYMBOLS ----------------
 def fetch_top_symbols(limit=50):
@@ -236,31 +274,6 @@ def fetch_top_symbols(limit=50):
     except Exception as e:
         logger.warning(f"Failed fetch_top_symbols: {e}")
         return ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
-
-# ---------------- ANALYZE LOOP ----------------
-def analyze_loop():
-    while True:
-        try:
-            logger.info("=== Starting scan cycle ===")
-            symbols = fetch_top_symbols()
-            for s in symbols:
-                sig = detect_signal(s)
-                if sig:
-                    msg = f"⚡ Signal {sig['symbol']} {sig['action']} @ {sig['entry']:.2f} Conf: {sig['confidence']:.2f}"
-                    send_telegram(msg)
-                    logger.info(f"Signal found: {msg}")
-                    state["signals"][s] = sig
-                    history["signals"].append(sig)
-                else:
-                    logger.info(f"No signal for {s}")
-            save_json_safe(STATE_FILE, state)
-            save_json_safe(HISTORY_FILE, history)
-            state["last_scan"] = str(datetime.now(timezone.utc))
-            logger.info("=== Scan finished ===")
-            time.sleep(SCAN_INTERVAL)
-        except Exception as e:
-            logger.error(f"Analyze loop crashed: {e}", exc_info=True)
-            time.sleep(10)
 
 # ---------------- FLASK ----------------
 app = Flask(__name__)
