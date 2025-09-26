@@ -191,7 +191,7 @@ def detect_signal(symbol):
     logger.info(f"[ML] {symbol} -> prob={prob:.3f}")
 
     # ЗМЕНШЕНО поріг
-    if prob < 0.55:
+    if prob < 0.01:
         return None
 
     action = "LONG" if last["ema_diff"] > 0 else "SHORT"
