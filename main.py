@@ -117,9 +117,12 @@ def handle_socket(msg):
         df.loc[t] = candle
         klines_data[symbol] = df.tail(1000)
 
+import asyncio
+
 def start_ws(symbols=None, interval="1m"):
     def run_ws():
         global twm
+        asyncio.set_event_loop(asyncio.new_event_loop())  # <<< ДОДАНО
         twm = ThreadedWebsocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
         twm.start()
         for s in symbols:
@@ -203,20 +206,29 @@ def detect_signal(symbol):
 def fetch_top_symbols(limit=50):
     try:
         tickers = binance_client.futures_ticker()
-        usdt_pairs = [t for t in tickers if t.get("symbol","").endswith("USDT")]
-        scores = []
+        usdt_pairs = [t for t in tickers if t.get("symbol", "").endswith("USDT")]
+        valid_symbols = []
         for t in usdt_pairs:
             try:
-                change_pct = abs(float(t.get("priceChangePercent",0)))
-                vol = float(t.get("quoteVolume",0))
-                score = change_pct*0.6 + vol*0.4
+                # Перевірка чи є реальні дані по символу
+                binance_client.get_klines(symbol=t["symbol"], interval="1m", limit=1)
+                valid_symbols.append(t)
+            except:
+                continue
+        scores = []
+        for t in valid_symbols:
+            try:
+                change_pct = abs(float(t.get("priceChangePercent", 0)))
+                vol = float(t.get("quoteVolume", 0))
+                score = change_pct * 0.6 + vol * 0.4
                 scores.append((t["symbol"], score))
-            except: continue
-        sorted_symbols = [s[0] for s in sorted(scores, key=lambda x:x[1], reverse=True)[:limit]]
+            except:
+                continue
+        sorted_symbols = [s[0] for s in sorted(scores, key=lambda x: x[1], reverse=True)[:limit]]
         return sorted_symbols
     except Exception as e:
         logger.warning(f"Failed fetch_top_symbols: {e}")
-        return ["BTCUSDT","ETHUSDT","BNBUSDT"]
+        return ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
 
 # ---------------- ANALYZE LOOP ----------------
 def analyze_loop():
