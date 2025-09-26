@@ -201,7 +201,7 @@ def detect_signal(symbol, prob_threshold=0.55):
 
     logger.info(f"[ML] {symbol} -> prob={prob:.3f} | close={last['close']:.2f}")
 
-    if prob < prob_threshold:
+    if prob < 0.1:
         return None
 
     action = "LONG" if last["ema_diff"] > 0 else "SHORT"
