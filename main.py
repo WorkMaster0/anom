@@ -178,29 +178,36 @@ def fit_ml(symbols):
 
 # ---------------- SIGNAL ----------------
 def detect_signal(symbol):
-    try:
-        df = fetch_klines(symbol, "1m", 500)
-        if df is None: return None
-        df = extract_features(df)
-        vec = df[["ema_diff","adx","rsi","macd_hist","atr","bb_width","vol_zscore"]].iloc[-1].values.reshape(1,-1)
-        vec_scaled = scaler.transform(imputer.transform(vec))
-        prob = ml_model.predict_proba(vec_scaled)[0,1]
-    except NotFittedError:
-        logger.warning("ML model not trained yet")
+    df = fetch_klines(symbol, "1m", 500)
+    if df is None:
         return None
-    except Exception as e:
-        logger.error(f"detect_signal failed for {symbol}: {e}")
+    df = extract_features(df)
+    vec = df[["ema_diff","adx","rsi","macd_hist","atr","bb_width","vol_zscore"]].iloc[-1].values.reshape(1, -1)
+    vec_scaled = scaler.transform(imputer.transform(vec))
+    prob = ml_model.predict_proba(vec_scaled)[0, 1]
+    last = df.iloc[-1]
+
+    # логування реальних ймовірностей
+    logger.info(f"[ML] {symbol} -> prob={prob:.3f}")
+
+    # ЗМЕНШЕНО поріг
+    if prob < 0.55:
         return None
 
-    last = df.iloc[-1]
-    if prob < 0.3:
-        return None
     action = "LONG" if last["ema_diff"] > 0 else "SHORT"
     entry = last["close"]
     atr = last["atr"]
-    sl = entry - 1.5*atr if action=="LONG" else entry + 1.5*atr
-    tp1 = entry + 1.5*atr if action=="LONG" else entry - 1.5*atr
-    return {"symbol":symbol,"action":action,"entry":entry,"sl":sl,"tp1":tp1,"confidence":prob}
+    sl = entry - 1.5 * atr if action == "LONG" else entry + 1.5 * atr
+    tp1 = entry + 1.5 * atr if action == "LONG" else entry - 1.5 * atr
+
+    return {
+        "symbol": symbol,
+        "action": action,
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "confidence": prob
+    }
 
 # ---------------- TOP SYMBOLS ----------------
 def fetch_top_symbols(limit=50):
