@@ -168,29 +168,51 @@ def start_ws(symbols=None, interval="1m"):
 # ---------------- FEATURES / PATTERNS ----------------
 def extract_features(df: pd.DataFrame):
     df = df.copy()
-    df["ema20"] = df["close"].ewm(span=20).mean()
-    df["ema50"] = df["close"].ewm(span=50).mean()
-    df["ema_diff"] = df["ema20"] - df["ema50"]
-    df["adx"] = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], window=14).adx()
-    df["rsi"] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
-    macd = ta.trend.MACD(df['close'])
-    df["macd_hist"] = macd.macd() - macd.macd_signal()
-    df["atr"] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=14).average_true_range()
-    bb = ta.volatility.BollingerBands(df['close'])
-    df["bb_width"] = bb.bollinger_hband() - bb.bollinger_lband()
-    df["vol_ma20"] = df["volume"].rolling(20).mean()
-    df["vol_zscore"] = (df["volume"] - df["vol_ma20"]) / df["vol_ma20"].rolling(20).std()
-    # candlestick patterns
-    df["hammer"] = (df["close"] > df["open"]) & ((df["low"] - df[["open","close"]].min(axis=1)) > 2*(df["close"] - df["open"]))
-    df["shooting_star"] = (df["open"] > df["close"]) & ((df["high"] - df[["open","close"]].max(axis=1)) > 2*(df["open"] - df["close"]))
-    df["support"] = df["low"].rolling(20).min()
-    df["resistance"] = df["high"].rolling(20).max()
-    df["false_break_high"] = (df["high"] > df["resistance"]) & (df["close"] < df["resistance"])
-    df["false_break_low"] = (df["low"] < df["support"]) & (df["close"] > df["support"])
-    df["retest_support"] = abs(df["close"] - df["support"]) / df["support"] < 0.003
-    df["retest_resistance"] = abs(df["close"] - df["resistance"]) / df["resistance"] < 0.003
-    df["accumulation_zone"] = (df["high"] - df["low"] < df["high"].rolling(20).max()*0.02) & (df["volume"] > df["vol_ma20"])
-    df["squeeze"] = df["atr"] < df["atr"].rolling(50).mean()*0.7
+    if len(df) < 20:
+        return df  # замало даних, повертаємо як є (без фіч)
+    try:
+        df["ema20"] = df["close"].ewm(span=20).mean()
+        df["ema50"] = df["close"].ewm(span=50).mean()
+        df["ema_diff"] = df["ema20"] - df["ema50"]
+        if len(df) >= 15:  # мінімум для ADX/RSI
+            df["adx"] = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], window=14).adx()
+            df["rsi"] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
+        else:
+            df["adx"], df["rsi"] = 0, 0
+        macd = ta.trend.MACD(df['close'])
+        df["macd_hist"] = macd.macd() - macd.macd_signal()
+        if len(df) >= 15:
+            df["atr"] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=14).average_true_range()
+        else:
+            df["atr"] = df["high"] - df["low"]
+
+        bb = ta.volatility.BollingerBands(df['close'])
+        df["bb_width"] = bb.bollinger_hband() - bb.bollinger_lband()
+
+        df["vol_ma20"] = df["volume"].rolling(20).mean()
+        df["vol_zscore"] = (df["volume"] - df["vol_ma20"]) / df["vol_ma20"].rolling(20).std()
+
+        # candlestick patterns
+        df["hammer"] = (df["close"] > df["open"]) & (
+            (df["low"] - df[["open", "close"]].min(axis=1)) > 2 * (df["close"] - df["open"])
+        )
+        df["shooting_star"] = (df["open"] > df["close"]) & (
+            (df["high"] - df[["open", "close"]].max(axis=1)) > 2 * (df["open"] - df["close"])
+        )
+
+        df["support"] = df["low"].rolling(20).min()
+        df["resistance"] = df["high"].rolling(20).max()
+        df["false_break_high"] = (df["high"] > df["resistance"]) & (df["close"] < df["resistance"])
+        df["false_break_low"] = (df["low"] < df["support"]) & (df["close"] > df["support"])
+        df["retest_support"] = abs(df["close"] - df["support"]) / df["support"] < 0.003
+        df["retest_resistance"] = abs(df["close"] - df["resistance"]) / df["resistance"] < 0.003
+        df["accumulation_zone"] = (
+            (df["high"] - df["low"] < df["high"].rolling(20).max() * 0.02)
+            & (df["volume"] > df["vol_ma20"])
+        )
+        df["squeeze"] = df["atr"] < df["atr"].rolling(50).mean() * 0.7
+    except Exception as e:
+        logger.debug(f"extract_features error: {e}")
     return df.fillna(0)
 
 # ---------------- ML helpers ----------------
@@ -366,24 +388,29 @@ def plot_signal(df, symbol, signal):
 
 # ---------------- ANALYSIS / SCAN ----------------
 def fetch_multi_tf_klines(symbol):
-    """Повертає dict TF->df на основі локального klines_data; якщо немає даних для symbol повертає None"""
     df = klines_data.get(symbol)
     if df is None or len(df) < ROLLING_WINDOW:
-        # попрохати REST як fallback
         df = fetch_klines(symbol, "1m", 1000)
         if df is None or len(df) < ROLLING_WINDOW:
             return None
-    # for simplicity we use same 1m df for all TFs (user can extend to fetch aggregated/resampled TFs)
+
     dfs = {}
-    for tf in TIMEFRAMES:
-        # use the same 1m data and resample if tf != '1m' (but keep features simple)
-        if tf == "15m":
-            dfs[tf] = extract_features(df.resample("15T").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna())
-        elif tf == "1h" or tf == "4h":
-            minutes = {"1h":"1H","4h":"4H"}[tf]
-            dfs[tf] = extract_features(df.resample(minutes).agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna())
-        else:
-            dfs[tf] = extract_features(df)
+    if len(df) >= 20:
+        dfs["15m"] = extract_features(
+            df.resample("15min").agg(
+                {"open":"first","high":"max","low":"min","close":"last","volume":"sum"}
+            ).dropna()
+        )
+        dfs["1h"] = extract_features(
+            df.resample("1h").agg(
+                {"open":"first","high":"max","low":"min","close":"last","volume":"sum"}
+            ).dropna()
+        )
+        dfs["4h"] = extract_features(
+            df.resample("4h").agg(
+                {"open":"first","high":"max","low":"min","close":"last","volume":"sum"}
+            ).dropna()
+        )
     return dfs
 
 def analyze_symbol(symbol):
