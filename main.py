@@ -1,4 +1,4 @@
-# main.py — повністю робочий файл (заміни ним поточний)
+# main.py — повністю робочий файл з усіма функціями і виправленнями
 import os, json, logging, requests, io, time
 import pandas as pd
 import numpy as np
@@ -31,19 +31,19 @@ HISTORY_FILE = "history.json"
 ROLLING_WINDOW = 10
 PARALLEL_WORKERS = 6
 TIMEFRAMES = ["15m", "1h", "4h"]
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "300"))  # сек
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "300"))
 ATR_THRESHOLD = float(os.getenv("ATR_THRESHOLD", "0.0005"))
 
 # ---------------- GLOBALS ----------------
 binance_client = None
-klines_data = {}           # symbol -> DataFrame (index=time)
+klines_data = {}
 twm = None
 state = {"signals": {}, "last_scan": None, "top_symbols": []}
 history = {"signals": []}
 json_lock = Lock()
 imputer = SimpleImputer(strategy="mean")
 scaler = StandardScaler()
-ml_model = None  # заповнюється в fit_ml()
+ml_model = None
 
 # ---------------- HELPERS: JSON ----------------
 def load_json_safe(path, default):
@@ -109,8 +109,7 @@ def init_binance_client():
         logger.info("Binance client initialized")
     return binance_client
 
-def fetch_klines_safe(symbol="BTCUSDT", interval="1m", limit=500):
-    """Safe fetch klines, returns None if symbol invalid."""
+def fetch_klines(symbol="BTCUSDT", interval="1m", limit=500):
     try:
         raw = binance_client.get_klines(symbol=symbol, interval=interval, limit=limit)
         df = pd.DataFrame(raw, columns=[
@@ -123,7 +122,7 @@ def fetch_klines_safe(symbol="BTCUSDT", interval="1m", limit=500):
         klines_data[symbol] = df
         return df
     except Exception as e:
-        logger.warning(f"[SKIP] {symbol} → cannot fetch klines ({e})")
+        logger.error(f"[ERROR] fetch_klines {symbol}: {e}")
         return None
 
 def handle_socket(msg):
@@ -134,7 +133,7 @@ def handle_socket(msg):
             t = pd.to_datetime(k["t"], unit="ms")
             candle = [float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]), float(k["v"])]
             if symbol not in klines_data:
-                fetch_klines_safe(symbol, "1m", 500)
+                fetch_klines(symbol, "1m", 500)
                 if symbol not in klines_data:
                     return
             df = klines_data[symbol]
@@ -156,7 +155,7 @@ def start_ws(symbols=None, interval="1m"):
             symbols = ["BTCUSDT"]
         for s in symbols:
             if s not in klines_data:
-                fetch_klines_safe(s, interval, 500)
+                fetch_klines(s, interval, 500)
             try:
                 twm.start_kline_socket(callback=handle_socket, symbol=s, interval=interval)
             except Exception as e:
@@ -164,26 +163,57 @@ def start_ws(symbols=None, interval="1m"):
         logger.info(f"[WS] Started for {symbols}")
     Thread(target=run_ws, daemon=True).start()
 
+# ---------------- TOP SYMBOLS ----------------
+last_top_update = None
+
+def fetch_top_symbols(limit=10, cache_minutes=10):
+    """Fetch top trading symbols, cached for `cache_minutes`."""
+    global last_top_update
+    init_binance_client()
+
+    if state.get("top_symbols") and last_top_update:
+        if datetime.now(timezone.utc) - last_top_update < timedelta(minutes=cache_minutes):
+            return state["top_symbols"]
+
+    try:
+        tickers = binance_client.futures_ticker()
+        info = binance_client.futures_exchange_info()
+        valid_symbols = {s["symbol"] for s in info["symbols"] if s["status"] == "TRADING"}
+        usdt_pairs = [t for t in tickers if t.get("symbol", "").endswith("USDT") and t["symbol"] in valid_symbols]
+
+        scores = []
+        for t in usdt_pairs:
+            try:
+                change_pct = abs(float(t.get("priceChangePercent", 0)))
+                vol = float(t.get("quoteVolume", 0))
+                scores.append((t["symbol"], change_pct * 0.6 + vol * 0.4))
+            except:
+                continue
+
+        sorted_symbols = [s[0] for s in sorted(scores, key=lambda x: x[1], reverse=True)[:limit]]
+        state["top_symbols"] = sorted_symbols
+        save_json_safe(STATE_FILE, state)
+        last_top_update = datetime.now(timezone.utc)
+        logger.info(f"[TOP] Selected valid trading symbols: {sorted_symbols}")
+        return sorted_symbols
+    except Exception as e:
+        logger.warning(f"fetch_top_symbols failed: {e}")
+        return state.get("top_symbols") or ["BTCUSDT","ETHUSDT","BNBUSDT"]
+
 # ---------------- FEATURES / PATTERNS ----------------
 def extract_features(df: pd.DataFrame):
     df = df.copy()
-    features = ["ema20","ema50","ema_diff","adx","rsi","macd_hist","atr","bb_width",
-                "vol_ma20","vol_zscore","hammer","shooting_star","false_break_high",
-                "false_break_low","retest_support","retest_resistance",
-                "accumulation_zone","squeeze"]
-    for f in features:
-        if f not in df.columns:
-            df[f] = 0
-
     if len(df) < 20:
-        return df.fillna(0)
-
+        return df
     try:
         df["ema20"] = df["close"].ewm(span=20).mean()
         df["ema50"] = df["close"].ewm(span=50).mean()
         df["ema_diff"] = df["ema20"] - df["ema50"]
-        df["adx"] = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], window=14).adx()
-        df["rsi"] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
+        if len(df) >= 15:
+            df["adx"] = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], window=14).adx()
+            df["rsi"] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
+        else:
+            df["adx"], df["rsi"] = 0,0
         macd = ta.trend.MACD(df['close'])
         df["macd_hist"] = macd.macd() - macd.macd_signal()
         df["atr"] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=14).average_true_range()
@@ -193,15 +223,16 @@ def extract_features(df: pd.DataFrame):
         df["vol_zscore"] = (df["volume"] - df["vol_ma20"]) / df["vol_ma20"].rolling(20).std()
         df["hammer"] = (df["close"] > df["open"]) & ((df["low"] - df[["open","close"]].min(axis=1)) > 2*(df["close"]-df["open"]))
         df["shooting_star"] = (df["open"] > df["close"]) & ((df["high"] - df[["open","close"]].max(axis=1)) > 2*(df["open"]-df["close"]))
-        df["false_break_high"] = (df["high"] > df["high"].rolling(20).max()) & (df["close"] < df["high"].rolling(20).max())
-        df["false_break_low"] = (df["low"] < df["low"].rolling(20).min()) & (df["close"] > df["low"].rolling(20).min())
-        df["retest_support"] = abs(df["close"] - df["low"].rolling(20).min()) / df["low"].rolling(20).min() < 0.003
-        df["retest_resistance"] = abs(df["close"] - df["high"].rolling(20).max()) / df["high"].rolling(20).max() < 0.003
-        df["accumulation_zone"] = ((df["high"] - df["low"]) < df["high"].rolling(20).max()*0.02) & (df["volume"] > df["vol_ma20"])
+        df["support"] = df["low"].rolling(20).min()
+        df["resistance"] = df["high"].rolling(20).max()
+        df["false_break_high"] = (df["high"] > df["resistance"]) & (df["close"] < df["resistance"])
+        df["false_break_low"] = (df["low"] < df["support"]) & (df["close"] > df["support"])
+        df["retest_support"] = abs(df["close"] - df["support"]) / df["support"] < 0.003
+        df["retest_resistance"] = abs(df["close"] - df["resistance"]) / df["resistance"] < 0.003
+        df["accumulation_zone"] = ((df["high"] - df["low"] < df["high"].rolling(20).max()*0.02) & (df["volume"] > df["vol_ma20"]))
         df["squeeze"] = df["atr"] < df["atr"].rolling(50).mean()*0.7
     except Exception as e:
         logger.debug(f"extract_features error: {e}")
-
     return df.fillna(0)
 
 # ---------------- ML helpers ----------------
@@ -214,80 +245,6 @@ def get_rolling_vector(df, window=ROLLING_WINDOW):
         vec = df[features].iloc[i-window:i].values.flatten()
         vectors.append(vec)
     return np.array(vectors)
-
-# ---------------- ML training ----------------
-def fit_ml(symbols):
-    global ml_model, scaler, imputer
-    logger.info("[ML] Building training dataset...")
-
-    X_parts, y_parts = [], []
-
-    for s in symbols:
-        df = klines_data.get(s)
-        if df is None:
-            df = fetch_klines_safe(s, "1m", 1500)
-        if df is None or len(df) < ROLLING_WINDOW + 2:
-            continue
-
-        df = extract_features(df)
-        vecs = get_rolling_vector(df, window=ROLLING_WINDOW)
-
-        future_ret = (df['close'].shift(-1) / df['close'] - 1).values
-        labels = (future_ret[ROLLING_WINDOW:] > ATR_THRESHOLD).astype(int)
-
-        if len(vecs) == 0 or len(labels) == 0:
-            continue
-        min_len = min(len(vecs), len(labels))
-        X_parts.append(vecs[-min_len:])
-        y_parts.append(labels[-min_len:])
-
-    if not X_parts:
-        logger.warning("[ML] No training data collected.")
-        ml_model = None
-        return
-
-    X = np.vstack(X_parts)
-    y = np.hstack(y_parts)
-    logger.info(f"[ML] Collected {X.shape[0]} samples | positive rate {np.mean(y):.3f}")
-
-    if len(np.unique(y)) < 2 or np.sum(y) < 5:
-        logger.warning("[ML] Not enough positive samples, using only patterns.")
-        ml_model = None
-        return
-
-    imputer.fit(X)
-    X_imputed = imputer.transform(X)
-    scaler.fit(X_imputed)
-    X_scaled = scaler.transform(X_imputed)
-
-    model = RandomForestClassifier(
-        n_estimators=300,
-        max_depth=12,
-        class_weight="balanced_subsample",
-        random_state=42,
-        n_jobs=-1,
-    )
-    model.fit(X_scaled, y)
-    ml_model = model
-    logger.info(f"[ML] Trained RandomForest on {X.shape[0]} samples")
-
-# ---------------- Detect / Patterns ----------------
-def detect_with_patterns(df):
-    last = df.iloc[-1]
-    if last.get("false_break_low", False) or last.get("retest_support", False) or last.get("hammer", False):
-        action = "LONG"
-    elif last.get("false_break_high", False) or last.get("retest_resistance", False) or last.get("shooting_star", False):
-        action = "SHORT"
-    else:
-        return None
-    entry = last["close"]
-    atr = last["atr"] if last["atr"] > 0 else (last["high"] - last["low"])
-    sl = entry - 1.5*atr if action == "LONG" else entry + 1.5*atr
-    tp1 = entry + 1.5*atr if action == "LONG" else entry - 1.5*atr
-    rr1 = (tp1-entry)/(entry-sl) if action == "LONG" else (entry-tp1)/(sl-entry)
-    if rr1 < 1.5:
-        return None
-    return {"symbol": None, "action": action, "entry": entry, "sl": sl, "tp1": tp1, "tp2": None, "tp3": None, "confidence": 0.5, "rr1": rr1}
 
 def get_multi_tf_vector(dfs):
     vectors = []
@@ -302,80 +259,186 @@ def get_multi_tf_vector(dfs):
         return None
     return np.concatenate(vectors)
 
+# ---------------- ML training ----------------
+def fit_ml(symbols):
+    global ml_model, scaler, imputer
+    logger.info("[ML] Building training dataset...")
+    X_parts, y_parts = [], []
+    for s in symbols:
+        df = klines_data.get(s)
+        if df is None:
+            df = fetch_klines(s, "1m", 1500)
+        if df is None or len(df) < ROLLING_WINDOW+2:
+            continue
+        df = extract_features(df)
+        vecs = get_rolling_vector(df)
+        future_ret = (df['close'].shift(-1)/df['close']-1).values
+        labels = (future_ret[ROLLING_WINDOW:] > ATR_THRESHOLD).astype(int)
+        if len(vecs) == 0 or len(labels) == 0:
+            continue
+        min_len = min(len(vecs), len(labels))
+        X_parts.append(vecs[-min_len:])
+        y_parts.append(labels[-min_len:])
+    if not X_parts:
+        logger.warning("[ML] No training data collected.")
+        ml_model = None
+        return
+    X = np.vstack(X_parts)
+    y = np.hstack(y_parts)
+    logger.info(f"[ML] Collected {X.shape[0]} samples | positive rate {np.mean(y):.3f}")
+    if len(np.unique(y)) < 2 or np.sum(y) < 5:
+        logger.warning("[ML] Not enough positive samples, using only patterns.")
+        ml_model = None
+        return
+    imputer.fit(X)
+    X_imputed = imputer.transform(X)
+    scaler.fit(X_imputed)
+    X_scaled = scaler.transform(X_imputed)
+    model = RandomForestClassifier(n_estimators=300, max_depth=12, class_weight="balanced_subsample",
+                                   random_state=42, n_jobs=-1)
+    model.fit(X_scaled, y)
+    ml_model = model
+    logger.info(f"[ML] Trained RandomForest on {X.shape[0]} samples")
+
+# ---------------- SIGNAL DETECTION ----------------
+def detect_with_patterns(df):
+    last = df.iloc[-1]
+    if last.get("false_break_low", False) or last.get("retest_support", False) or last.get("hammer", False):
+        action = "LONG"
+    elif last.get("false_break_high", False) or last.get("retest_resistance", False) or last.get("shooting_star", False):
+        action = "SHORT"
+    else:
+        return None
+    entry = last["close"]
+    atr = last["atr"] if last["atr"]>0 else (last["high"]-last["low"])
+    sl = entry-1.5*atr if action=="LONG" else entry+1.5*atr
+    tp1 = entry+1.5*atr if action=="LONG" else entry-1.5*atr
+    rr1 = (tp1-entry)/(entry-sl) if action=="LONG" else (entry-tp1)/(sl-entry)
+    if rr1<1.5:
+        return None
+    return {"symbol": None, "action":action, "entry":entry, "sl":sl, "tp1":tp1, "tp2":None, "tp3":None, "confidence":0.5, "rr1":rr1}
+
 def detect_signal_ml(dfs, symbol):
     global ml_model, scaler, imputer
     vec = get_multi_tf_vector(dfs)
     if vec is None:
         return None
-
     prob = 0.0
     if ml_model is not None:
         try:
-            X = imputer.transform(vec.reshape(1, -1))
+            X = imputer.transform(vec.reshape(1,-1))
             X_scaled = scaler.transform(X)
-            prob = float(ml_model.predict_proba(X_scaled)[0, 1])
+            prob = float(ml_model.predict_proba(X_scaled)[0,1])
         except Exception as e:
             logger.debug(f"[ML] predict error: {e}")
-
     last = dfs["15m"].iloc[-1]
-    logger.info(f"[DEBUG] {symbol} last_close={last['close']:.6f}, prob={prob:.3f}, "
-                f"features={last[['hammer','shooting_star','false_break_low','false_break_high']].to_dict()}")
-
-    if ml_model is not None and prob >= 0.55:
-        action = "LONG" if last["ema_diff"] > 0 else "SHORT"
+    logger.info(f"[DEBUG] {symbol} last_close={last['close']:.6f}, prob={prob:.3f}")
+    if ml_model is not None and prob>=0.55:
+        action = "LONG" if last["ema_diff"]>0 else "SHORT"
         atr = last["atr"]
         entry = last["close"]
-        if action == "LONG":
-            sl = entry - 1.5*atr; tp1 = entry + 1.5*atr; tp2 = entry + 3*atr; tp3 = entry + 5*atr
+        if action=="LONG":
+            sl=entry-1.5*atr; tp1=entry+1.5*atr; tp2=entry+3*atr; tp3=entry+5*atr
         else:
-            sl = entry + 1.5*atr; tp1 = entry - 1.5*atr; tp2 = entry - 3*atr; tp3 = entry - 5*atr
+            sl=entry+1.5*atr; tp1=entry-1.5*atr; tp2=entry-3*atr; tp3=entry-5*atr
         rr1 = (tp1-entry)/(entry-sl) if action=="LONG" else (entry-tp1)/(sl-entry)
-        if rr1 < 2: 
+        if rr1<2:
             return None
         return {"action":action,"entry":entry,"sl":sl,"tp1":tp1,"tp2":tp2,"tp3":tp3,"confidence":prob,"rr1":rr1,"symbol":symbol}
-
     patt = detect_with_patterns(dfs["15m"])
     if patt:
         patt["symbol"] = symbol
         return patt
     return None
 
-# ---------------- SCAN / ANALYSIS ----------------
-def enrich_features(df):
-    return extract_features(df)
+# ---------------- PLOTTING ----------------
+def plot_signal(df, symbol, signal):
+    try:
+        addplots=[]
+        for tp in ["tp1","tp2","tp3"]:
+            if signal.get(tp) is not None:
+                addplots.append(mpf.make_addplot([signal[tp]]*len(df), linestyle="--", color='green'))
+        addplots.append(mpf.make_addplot([signal["sl"]]*len(df), linestyle="--", color='red'))
+        addplots.append(mpf.make_addplot([signal["entry"]]*len(df), linestyle="--", color='blue'))
+        fig, ax = mpf.plot(df.tail(200), type='candle', style='yahoo', title=f"{symbol}-{signal['action']}",
+                           addplot=addplots, returnfig=True)
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', bbox_inches='tight')
+        buf.seek(0)
+        plt.close(fig)
+        return buf
+    except Exception as e:
+        logger.warning(f"plot_signal failed: {e}")
+        return None
+
+# ---------------- ANALYSIS ----------------
+def enrich_features(df: pd.DataFrame):
+    df = df.copy()
+    if df.empty:
+        return df
+    try:
+        df["ema20"] = df["close"].ewm(span=20).mean()
+        df["ema50"] = df["close"].ewm(span=50).mean()
+        df["ema_diff"] = df["ema20"]-df["ema50"]
+        if len(df)>=14:
+            df["adx"] = ta.trend.ADXIndicator(df['high'],df['low'],df['close'],window=14).adx()
+            df["rsi"] = ta.momentum.RSIIndicator(df['close'],window=14).rsi()
+        else:
+            df["adx"],df["rsi"]=0,0
+        macd=ta.trend.MACD(df['close'])
+        df["macd_hist"]=macd.macd()-macd.macd_signal()
+        df["atr"]=ta.volatility.AverageTrueRange(df['high'],df['low'],df['close'],window=14).average_true_range()
+        bb=ta.volatility.BollingerBands(df['close'])
+        df["bb_width"]=bb.bollinger_hband()-bb.bollinger_lband()
+        df["vol_ma20"]=df["volume"].rolling(20).mean()
+        df["vol_zscore"]=(df["volume"]-df["vol_ma20"])/df["vol_ma20"].rolling(20).std()
+        df["hammer"]=(df["close"]>df["open"])&((df["low"]-df[["open","close"]].min(axis=1))>2*(df["close"]-df["open"]))
+        df["shooting_star"]=(df["open"]>df["close"])&((df["high"]-df[["open","close"]].max(axis=1))>2*(df["open"]-df["close"]))
+        df["false_break_high"]=0
+        df["false_break_low"]=0
+        df["retest_support"]=0
+        df["retest_resistance"]=0
+        df["accumulation_zone"]=0
+        df["squeeze"]=0
+    except Exception as e:
+        logger.debug(f"enrich_features error: {e}")
+    return df.fillna(0)
 
 def analyze_symbol(symbol: str):
     try:
-        df = klines_data.get(symbol)
+        logger.info(f"[ANALYZE] Починаю аналіз {symbol}...")
+        df=klines_data.get(symbol)
         if df is None or df.empty:
-            df = fetch_klines_safe(symbol, "1m", 1000)
+            df=fetch_klines(symbol,"1m",1000)
         if df is None or df.empty:
             logger.warning(f"[SKIP] {symbol} → немає даних")
             return
-
-        dfs = {}
-        for tf, rule in [("15m", "15min"), ("1h", "1h"), ("4h", "4h")]:
-            df_resampled = df.resample(rule).agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
+        dfs={}
+        for tf,rule in [("15m","15min"),("1h","1h"),("4h","4h")]:
+            df_resampled=df.resample(rule).agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
             if not df_resampled.empty:
-                dfs[tf] = enrich_features(df_resampled)
-
+                dfs[tf]=enrich_features(df_resampled)
         if not dfs:
+            logger.warning(f"[SKIP] {symbol} → немає оброблених даних")
             return
-
-        signal = detect_signal_ml(dfs, symbol)
+        signal=detect_signal_ml(dfs,symbol)
         if signal:
-            photo = plot_signal(dfs.get("15m"), symbol, signal) if dfs.get("15m") is not None else None
-            msg = (f"⚡ SIGNAL {symbol}\nAction: {signal['action']}\nEntry: {signal['entry']:.6f}\n"
-                   f"SL: {signal['sl']:.6f}\nTP1: {signal.get('tp1',0):.6f}\nConf: {signal['confidence']:.2f}\n"
-                   f"R/R1: {signal.get('rr1',0):.2f}")
-            send_telegram(msg, photo)
-            state["signals"][symbol] = {"signal": signal, "time": str(datetime.now(timezone.utc))}
-            save_json_safe(STATE_FILE, state)
+            photo=plot_signal(dfs.get("15m"),symbol,signal) if dfs.get("15m") is not None else None
+            msg=(f"⚡ SIGNAL {symbol}\nAction: {signal['action']}\nEntry: {signal['entry']:.6f}\n"
+                 f"SL: {signal['sl']:.6f}\nTP1: {signal.get('tp1',0):.6f}\nConf: {signal['confidence']:.2f}\n"
+                 f"R/R1: {signal.get('rr1',0):.2f}")
+            send_telegram(msg,photo)
+            state["signals"][symbol]={"signal":signal,"time":str(datetime.now(timezone.utc))}
+            save_json_safe(STATE_FILE,state)
             history["signals"].append(signal)
-            save_json_safe(HISTORY_FILE, history)
+            save_json_safe(HISTORY_FILE,history)
+            logger.info(f"Sent signal for {symbol} (conf {signal['confidence']:.2f})")
+        else:
+            logger.info(f"[NO SIGNAL] {symbol} без сигналів")
     except Exception as e:
         logger.error(f"analyze_symbol error for {symbol}: {e}", exc_info=True)
 
+# ---------------- SCAN LOOP ----------------
 def scan_all_symbols_once():
     logger.info("Starting one full scan...")
     symbols = fetch_top_symbols(limit=10)
@@ -383,22 +446,22 @@ def scan_all_symbols_once():
         logger.warning("No symbols to scan")
         return
     total = len(symbols)
-    with ThreadPoolExecutor(max_workers=min(PARALLEL_WORKERS, total)) as exe:
-        futures = [exe.submit(analyze_symbol, s) for s in symbols]
-        for idx, f in enumerate(futures, start=1):
-            try:
-                f.result()
-            except Exception as e:
-                logger.error(f"scan error: {e}")
+    with ThreadPoolExecutor(max_workers=min(PARALLEL_WORKERS,total)) as exe:
+        futures=[exe.submit(analyze_symbol,s) for s in symbols]
+        for idx,f in enumerate(futures,start=1):
+            try: f.result()
+            except Exception as e: logger.error(f"scan error: {e}")
             logger.info(f"Processed {idx}/{total}")
-    state["last_scan"] = str(datetime.now(timezone.utc))
-    save_json_safe(STATE_FILE, state)
+    state["last_scan"]=str(datetime.now(timezone.utc))
+    save_json_safe(STATE_FILE,state)
     logger.info("Scan finished")
 
 def analyze_loop():
     while True:
         try:
+            logger.info("=== Starting scan cycle ===")
             scan_all_symbols_once()
+            logger.info("=== Scan cycle finished ===")
             time.sleep(SCAN_INTERVAL)
         except Exception as e:
             logger.error(f"analyze_loop crashed: {e}", exc_info=True)
@@ -412,32 +475,33 @@ def startup_tasks():
     if not symbols:
         logger.error("No symbols fetched at startup!")
         return
-    with ThreadPoolExecutor(max_workers=min(12, len(symbols))) as ex:
-        ex.map(lambda s: fetch_klines_safe(s, "1m", 1000), symbols)
+    logger.info(f"[Startup] Prefetching klines for {len(symbols)} symbols...")
+    with ThreadPoolExecutor(max_workers=min(12,len(symbols))) as ex:
+        ex.map(lambda s: fetch_klines(s,"1m",1000),symbols)
     fit_ml(symbols)
-    start_ws(symbols, "1m")
-    Thread(target=analyze_loop, daemon=True).start()
+    start_ws(symbols,"1m")
+    Thread(target=analyze_loop,daemon=True).start()
     try:
-        send_telegram("⚡ Bot started and ready! Monitoring: " + ", ".join(symbols[:10]))
+        send_telegram("⚡ Bot started and ready! Monitoring: "+", ".join(symbols[:10]))
     except Exception as e:
         logger.warning(f"Cannot send startup Telegram message: {e}")
     logger.info("=== Startup tasks launched ===")
 
 if __name__ != "__main__":
-    Thread(target=startup_tasks, daemon=True).start()
+    Thread(target=startup_tasks,daemon=True).start()
 
 # ---------------- FLASK ----------------
 app = Flask(__name__)
 
-@app.route("/scan", methods=["POST"])
+@app.route("/scan",methods=["POST"])
 def scan_endpoint():
-    Thread(target=scan_all_symbols_once, daemon=True).start()
-    return jsonify({"ok": True, "message": "Scan started"})
+    Thread(target=scan_all_symbols_once,daemon=True).start()
+    return jsonify({"ok":True,"message":"Scan started"})
 
-@app.route("/", methods=["GET"])
+@app.route("/",methods=["GET"])
 def home():
-    return jsonify({"status": "ok", "time": str(datetime.now(timezone.utc)), "signals": len(state["signals"])})
+    return jsonify({"status":"ok","time":str(datetime.now(timezone.utc)),"signals":len(state["signals"])})
 
-if __name__ == "__main__":
+if __name__=="__main__":
     startup_tasks()
-    app.run(host="0.0.0.0", port=PORT)
+    app.run(host="0.0.0.0",port=PORT)
