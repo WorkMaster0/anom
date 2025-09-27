@@ -206,29 +206,65 @@ def get_rolling_vector(df, window=ROLLING_WINDOW):
 
 # ---------------- ML training ----------------
 def fit_ml(symbols):
+    """Тренує RandomForest на даних із klines_data (якщо вистачає).
+       Якщо позитивних прикладів мало — модель не тренується."""
+    global ml_model, scaler, imputer
     logger.info("[ML] Building training dataset...")
-    all_data, all_labels = [], []
+
+    X_parts, y_parts = [], []
 
     for s in symbols:
         df = klines_data.get(s)
         if df is None:
             df = fetch_klines(s, "1m", 1500)
-        if df is None or len(df) < ROLLING_WINDOW:
+        if df is None or len(df) < ROLLING_WINDOW + 2:
             continue
 
-        dfs = {tf: extract_features(df.copy()) for tf in TIMEFRAMES}
-        vec = get_multi_tf_vector(dfs)
-        if vec is not None:
-            all_data.append(vec)
-            all_labels.append(1)  # placeholder labels (TODO: add real ones later)
+        df = extract_features(df)
+        vecs = get_rolling_vector(df, window=ROLLING_WINDOW)
 
-    if all_data:
-        X = np.vstack(all_data)
-        scaler.fit(X)
-        ml_model.fit(X, np.zeros(X.shape[0]))  # dummy labels
-        logger.info(f"[ML] Fitted on {X.shape[0]} samples with {X.shape[1]} features")
-    else:
-        logger.warning("[ML] No data to fit scaler/model!")
+        # майбутня дохідність на 1 свічку вперед
+        future_ret = (df['close'].shift(-1) / df['close'] - 1).values
+        labels = (future_ret[ROLLING_WINDOW:] > ATR_THRESHOLD).astype(int)
+
+        if len(vecs) == 0 or len(labels) == 0:
+            continue
+        min_len = min(len(vecs), len(labels))
+        X_parts.append(vecs[-min_len:])
+        y_parts.append(labels[-min_len:])
+
+    if not X_parts:
+        logger.warning("[ML] No training data collected.")
+        ml_model = None
+        return
+
+    X = np.vstack(X_parts)
+    y = np.hstack(y_parts)
+    logger.info(f"[ML] Collected {X.shape[0]} samples | positive rate {np.mean(y):.3f}")
+
+    # якщо дуже мало позитивних сигналів — не тренуємо
+    if len(np.unique(y)) < 2 or np.sum(y) < 5:
+        logger.warning("[ML] Not enough positive samples, using only patterns.")
+        ml_model = None
+        return
+
+    # підготовка даних
+    imputer.fit(X)
+    X_imputed = imputer.transform(X)
+    scaler.fit(X_imputed)
+    X_scaled = scaler.transform(X_imputed)
+
+    # тренування моделі
+    model = RandomForestClassifier(
+        n_estimators=300,
+        max_depth=12,
+        class_weight="balanced_subsample",
+        random_state=42,
+        n_jobs=-1,
+    )
+    model.fit(X_scaled, y)
+    ml_model = model
+    logger.info(f"[ML] Trained RandomForest on {X.shape[0]} samples")
 
 # ---------------- detect (ML + fallback) ----------------
 def detect_with_patterns(df):
