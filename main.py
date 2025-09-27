@@ -387,57 +387,90 @@ def plot_signal(df, symbol, signal):
         return None
 
 # ---------------- ANALYSIS / SCAN ----------------
-def fetch_multi_tf_klines(symbol):
-    df = klines_data.get(symbol)
-    if df is None or len(df) < ROLLING_WINDOW:
-        df = fetch_klines(symbol, "1m", 1000)
-        if df is None or len(df) < ROLLING_WINDOW:
-            return None
+def enrich_features(df: pd.DataFrame) -> pd.DataFrame:
+    import ta
+    df = df.copy()
+    if df.empty:
+        return df
 
-    dfs = {}
-    if len(df) >= 20:
-        dfs["15m"] = extract_features(
-            df.resample("15min").agg(
-                {"open":"first","high":"max","low":"min","close":"last","volume":"sum"}
-            ).dropna()
-        )
-        dfs["1h"] = extract_features(
-            df.resample("1h").agg(
-                {"open":"first","high":"max","low":"min","close":"last","volume":"sum"}
-            ).dropna()
-        )
-        dfs["4h"] = extract_features(
-            df.resample("4h").agg(
-                {"open":"first","high":"max","low":"min","close":"last","volume":"sum"}
-            ).dropna()
-        )
-    return dfs
-
-def analyze_symbol(symbol):
     try:
-        logger.debug(f"Analyzing {symbol}")
-        dfs = fetch_multi_tf_klines(symbol)
+        df["ema20"] = df["close"].ewm(span=20).mean()
+        df["ema50"] = df["close"].ewm(span=50).mean()
+        df["ema_diff"] = df["ema20"] - df["ema50"]
+
+        if len(df) >= 14:
+            df["adx"] = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], window=14).adx()
+            df["rsi"] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
+        else:
+            df["adx"], df["rsi"] = 0, 0
+
+        macd = ta.trend.MACD(df['close'])
+        df["macd_hist"] = macd.macd() - macd.macd_signal()
+
+        df["atr"] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=14).average_true_range()
+
+        bb = ta.volatility.BollingerBands(df['close'])
+        df["bb_width"] = bb.bollinger_hband() - bb.bollinger_lband()
+
+        df["vol_ma20"] = df["volume"].rolling(20).mean()
+        df["vol_zscore"] = (df["volume"] - df["vol_ma20"]) / df["vol_ma20"].rolling(20).std()
+
+        # Candlestick patterns
+        df["hammer"] = (df["close"] > df["open"]) & ((df["low"] - df[["open","close"]].min(axis=1)) > 2*(df["close"]-df["open"]))
+        df["shooting_star"] = (df["open"] > df["close"]) & ((df["high"] - df[["open","close"]].max(axis=1)) > 2*(df["open"]-df["close"]))
+
+        # Fallback / placeholders
+        df["false_break_high"] = 0
+        df["false_break_low"] = 0
+        df["retest_support"] = 0
+        df["retest_resistance"] = 0
+        df["accumulation_zone"] = 0
+        df["squeeze"] = 0
+    except Exception as e:
+        logger.debug(f"enrich_features error: {e}")
+    return df.fillna(0)
+
+def analyze_symbol(symbol: str):
+    try:
+        logger.info(f"[ANALYZE] Починаю аналіз {symbol}...")
+        df = klines_data.get(symbol)
+        if df is None or df.empty:
+            df = fetch_klines(symbol, "1m", 1000)
+        if df is None or df.empty:
+            logger.warning(f"[SKIP] {symbol} → немає даних")
+            return
+
+        # Build multi-TF dfs
+        dfs = {}
+        for tf, rule in [("15m", "15min"), ("1h", "1h"), ("4h", "4h")]:
+            df_resampled = df.resample(rule).agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
+            if not df_resampled.empty:
+                dfs[tf] = enrich_features(df_resampled)
+
         if not dfs:
-            logger.debug(f"No data for {symbol}")
+            logger.warning(f"[SKIP] {symbol} → немає оброблених даних")
             return
-        signal = detect_signal_ml(dfs, symbol)
-        if not signal:
-            logger.debug(f"No signal for {symbol}")
-            return
-        # prepare plot from 15m data (if available)
-        df_plot = dfs.get("15m")
-        photo = None
-        if df_plot is not None:
-            photo = plot_signal(df_plot, symbol, signal)
-        msg = (f"⚡ SIGNAL {symbol}\nAction: {signal['action']}\nEntry: {signal['entry']:.6f}\n"
-               f"SL: {signal['sl']:.6f}\nTP1: {signal.get('tp1',0):.6f}\nConf: {signal['confidence']:.2f}\n"
-               f"R/R1: {signal.get('rr1',0):.2f}")
-        send_telegram(msg, photo)
-        state["signals"][symbol] = {"signal": signal, "time": str(datetime.now(timezone.utc))}
-        save_json_safe(STATE_FILE, state)
-        history["signals"].append(signal)
-        save_json_safe(HISTORY_FILE, history)
-        logger.info(f"Sent signal for {symbol} (conf {signal['confidence']:.2f})")
+
+        # ML / pattern detection
+        try:
+            signal = detect_signal_ml(dfs, symbol)
+            if signal:
+                # Plot 15m chart
+                photo = plot_signal(dfs.get("15m"), symbol, signal) if dfs.get("15m") is not None else None
+                msg = (f"⚡ SIGNAL {symbol}\nAction: {signal['action']}\nEntry: {signal['entry']:.6f}\n"
+                       f"SL: {signal['sl']:.6f}\nTP1: {signal.get('tp1',0):.6f}\nConf: {signal['confidence']:.2f}\n"
+                       f"R/R1: {signal.get('rr1',0):.2f}")
+                send_telegram(msg, photo)
+                state["signals"][symbol] = {"signal": signal, "time": str(datetime.now(timezone.utc))}
+                save_json_safe(STATE_FILE, state)
+                history["signals"].append(signal)
+                save_json_safe(HISTORY_FILE, history)
+                logger.info(f"Sent signal for {symbol} (conf {signal['confidence']:.2f})")
+            else:
+                logger.info(f"[NO SIGNAL] {symbol} без сигналів")
+        except Exception as e:
+            logger.error(f"analyze_symbol ML error for {symbol}: {e}", exc_info=True)
+
     except Exception as e:
         logger.error(f"analyze_symbol error for {symbol}: {e}", exc_info=True)
 
