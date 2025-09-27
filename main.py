@@ -143,16 +143,19 @@ def handle_socket(msg):
         logger.debug(f"Socket handle error: {e}")
 
 def start_ws(symbols=None, interval="1m"):
+    if symbols is None:
+        symbols = ["BTCUSDT"]
+
     def run_ws():
         global twm
         try:
             asyncio.set_event_loop(asyncio.new_event_loop())
         except Exception:
             pass
+
         twm = ThreadedWebsocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
         twm.start()
-        if symbols is None:
-            symbols = ["BTCUSDT"]
+
         for s in symbols:
             if s not in klines_data:
                 fetch_klines(s, interval, 500)
@@ -160,79 +163,72 @@ def start_ws(symbols=None, interval="1m"):
                 twm.start_kline_socket(callback=handle_socket, symbol=s, interval=interval)
             except Exception as e:
                 logger.warning(f"Failed to start ws for {s}: {e}")
+
         logger.info(f"[WS] Started for {symbols}")
+
     Thread(target=run_ws, daemon=True).start()
 
 # ---------------- TOP SYMBOLS ----------------
-last_top_update = None
-
-def fetch_top_symbols(limit=10, cache_minutes=10):
-    """Fetch top trading symbols, cached for `cache_minutes`."""
-    global last_top_update
-    init_binance_client()
-
-    if state.get("top_symbols") and last_top_update:
-        if datetime.now(timezone.utc) - last_top_update < timedelta(minutes=cache_minutes):
-            return state["top_symbols"]
-
+def fetch_top_symbols(limit=20):
+    """
+    Отримує топ монети USDT Perpetual Futures за обсягом.
+    """
     try:
         tickers = binance_client.futures_ticker()
         info = binance_client.futures_exchange_info()
-        valid_symbols = {s["symbol"] for s in info["symbols"] if s["status"] == "TRADING"}
-        usdt_pairs = [t for t in tickers if t.get("symbol", "").endswith("USDT") and t["symbol"] in valid_symbols]
+        valid_symbols = {
+            s["symbol"] for s in info["symbols"]
+            if s["status"] == "TRADING" and s["contractType"] == "PERPETUAL" and s["quoteAsset"] == "USDT"
+        }
 
-        scores = []
-        for t in usdt_pairs:
-            try:
-                change_pct = abs(float(t.get("priceChangePercent", 0)))
-                vol = float(t.get("quoteVolume", 0))
-                scores.append((t["symbol"], change_pct * 0.6 + vol * 0.4))
-            except:
-                continue
+        df = pd.DataFrame(tickers)
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+        df = df[df["symbol"].isin(valid_symbols)]
+        df = df.sort_values("volume", ascending=False).head(limit)
+        symbols = df["symbol"].tolist()
 
-        sorted_symbols = [s[0] for s in sorted(scores, key=lambda x: x[1], reverse=True)[:limit]]
-        state["top_symbols"] = sorted_symbols
-        save_json_safe(STATE_FILE, state)
-        last_top_update = datetime.now(timezone.utc)
-        logger.info(f"[TOP] Selected valid trading symbols: {sorted_symbols}")
-        return sorted_symbols
+        logger.info(f"[TOP] Selected valid trading symbols: {symbols}")
+        return symbols
     except Exception as e:
-        logger.warning(f"fetch_top_symbols failed: {e}")
-        return state.get("top_symbols") or ["BTCUSDT","ETHUSDT","BNBUSDT"]
+        logger.error(f"[TOP] Failed to fetch top symbols: {e}")
+        return ["BTCUSDT", "ETHUSDT"]
 
 # ---------------- FEATURES / PATTERNS ----------------
 def extract_features(df: pd.DataFrame):
     df = df.copy()
-    if len(df) < 20:
-        return df
+
     try:
-        df["ema20"] = df["close"].ewm(span=20).mean()
-        df["ema50"] = df["close"].ewm(span=50).mean()
-        df["ema_diff"] = df["ema20"] - df["ema50"]
-        if len(df) >= 15:
-            df["adx"] = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], window=14).adx()
-            df["rsi"] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
-        else:
-            df["adx"], df["rsi"] = 0,0
-        macd = ta.trend.MACD(df['close'])
-        df["macd_hist"] = macd.macd() - macd.macd_signal()
-        df["atr"] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=14).average_true_range()
-        bb = ta.volatility.BollingerBands(df['close'])
-        df["bb_width"] = bb.bollinger_hband() - bb.bollinger_lband()
-        df["vol_ma20"] = df["volume"].rolling(20).mean()
-        df["vol_zscore"] = (df["volume"] - df["vol_ma20"]) / df["vol_ma20"].rolling(20).std()
-        df["hammer"] = (df["close"] > df["open"]) & ((df["low"] - df[["open","close"]].min(axis=1)) > 2*(df["close"]-df["open"]))
-        df["shooting_star"] = (df["open"] > df["close"]) & ((df["high"] - df[["open","close"]].max(axis=1)) > 2*(df["open"]-df["close"]))
-        df["support"] = df["low"].rolling(20).min()
-        df["resistance"] = df["high"].rolling(20).max()
-        df["false_break_high"] = (df["high"] > df["resistance"]) & (df["close"] < df["resistance"])
-        df["false_break_low"] = (df["low"] < df["support"]) & (df["close"] > df["support"])
-        df["retest_support"] = abs(df["close"] - df["support"]) / df["support"] < 0.003
-        df["retest_resistance"] = abs(df["close"] - df["resistance"]) / df["resistance"] < 0.003
-        df["accumulation_zone"] = ((df["high"] - df["low"] < df["high"].rolling(20).max()*0.02) & (df["volume"] > df["vol_ma20"]))
-        df["squeeze"] = df["atr"] < df["atr"].rolling(50).mean()*0.7
+        df["rsi"] = ta.momentum.RSIIndicator(df["close"]).rsi()
+        df["adx"] = ta.trend.ADXIndicator(df["high"], df["low"], df["close"]).adx()
+        macd = ta.trend.MACD(df["close"])
+        df["macd_hist"] = macd.macd_diff()
+        df["atr"] = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"]).average_true_range()
+        bb = ta.volatility.BollingerBands(df["close"])
+        df["bb_width"] = (bb.bollinger_hband() - bb.bollinger_lband()) / df["close"]
+        df["vol_zscore"] = (df["volume"] - df["volume"].rolling(20).mean()) / df["volume"].rolling(20).std()
+
+        # Патерни
+        df["hammer"] = (df["close"] > df["open"]) & ((df["low"] < df["open"]) | (df["low"] < df["close"]))
+        df["shooting_star"] = (df["open"] > df["close"]) & ((df["high"] > df["open"]) | (df["high"] > df["close"]))
+        df["false_break_high"] = (df["high"] > df["high"].shift(1)) & (df["close"] < df["high"].shift(1))
+        df["false_break_low"] = (df["low"] < df["low"].shift(1)) & (df["close"] > df["low"].shift(1))
+        df["retest_support"] = (df["low"] <= df["low"].rolling(20).min())
+        df["retest_resistance"] = (df["high"] >= df["high"].rolling(20).max())
+        df["accumulation_zone"] = (df["close"].rolling(10).mean() - df["close"].rolling(50).mean()) > 0
+        df["squeeze"] = df["bb_width"] < df["bb_width"].rolling(20).quantile(0.2)
     except Exception as e:
-        logger.debug(f"extract_features error: {e}")
+        logger.warning(f"[Features] Error extracting features: {e}")
+
+    # 🔑 гарантуємо наявність усіх потрібних колонок
+    needed = [
+        "adx","rsi","macd_hist","atr","bb_width","vol_zscore",
+        "hammer","shooting_star","false_break_high","false_break_low",
+        "retest_support","retest_resistance","accumulation_zone","squeeze"
+    ]
+    for col in needed:
+        if col not in df.columns:
+            df[col] = 0
+
     return df.fillna(0)
 
 # ---------------- ML helpers ----------------
