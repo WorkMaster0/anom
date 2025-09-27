@@ -1,6 +1,8 @@
 import os, json, logging, requests, io, time
-import pandas as pd, numpy as np
-import matplotlib.pyplot as plt, mplfinance as mpf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import mplfinance as mpf
 import ta
 from datetime import datetime, timezone, timedelta
 from threading import Thread, Lock
@@ -21,12 +23,14 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
-PORT = int(os.getenv("PORT", 5000))
+PORT = int(os.getenv("PORT", "5000"))
+STATE_FILE = "state.json"
+HISTORY_FILE = "history.json"
 ROLLING_WINDOW = 10
-SCAN_INTERVAL = 300
-ATR_THRESHOLD = 0.002
 PARALLEL_WORKERS = 4
 TIMEFRAMES = ["15m", "1h", "4h"]
+SCAN_INTERVAL = 300
+ATR_THRESHOLD = 0.002
 
 # ---------------- GLOBALS ----------------
 binance_client = None
@@ -59,8 +63,8 @@ def save_json_safe(path, data):
     except Exception as e:
         logger.warning(f"Failed to save {path}: {e}")
 
-state = load_json_safe("state.json", state)
-history = load_json_safe("history.json", history)
+state = load_json_safe(STATE_FILE, state)
+history = load_json_safe(HISTORY_FILE, history)
 
 def escape_md_v2(text):
     escape_chars = r"_*[]()~`>#+-=|{}.!"
@@ -68,22 +72,28 @@ def escape_md_v2(text):
         text = text.replace(c, f"\\{c}")
     return text
 
-def send_telegram(msg, photo=None):
+def send_telegram(msg, photo=None, max_retries=3):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         logger.warning("Telegram token or chat_id not set, skipping send.")
         return False
-    try:
-        if photo:
-            files = {'photo': ('signal.png', photo, 'image/png')}
-            data = {'chat_id': CHAT_ID, 'caption': escape_md_v2(msg), 'parse_mode': 'MarkdownV2'}
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto", data=data, files=files, timeout=10)
-        else:
-            payload = {"chat_id": CHAT_ID, "text": escape_md_v2(msg), "parse_mode": "MarkdownV2"}
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=10)
-        return True
-    except Exception as e:
-        logger.warning(f"Telegram send exception: {e}")
-        return False
+    for attempt in range(1, max_retries + 1):
+        try:
+            if photo:
+                files = {'photo': ('signal.png', photo, 'image/png')}
+                data = {'chat_id': CHAT_ID, 'caption': escape_md_v2(msg), 'parse_mode': 'MarkdownV2'}
+                resp = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+                                     data=data, files=files, timeout=10)
+            else:
+                payload = {"chat_id": CHAT_ID, "text": escape_md_v2(msg), "parse_mode": "MarkdownV2"}
+                resp = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                                     json=payload, timeout=10)
+            if resp.status_code == 200:
+                logger.info(f"Telegram message sent successfully (attempt {attempt})")
+                return True
+        except Exception as e:
+            logger.warning(f"Telegram send exception (attempt {attempt}): {e}")
+    logger.error("Telegram send failed after max retries")
+    return False
 
 # ---------------- BINANCE ----------------
 def init_binance_client():
@@ -104,7 +114,7 @@ def fetch_klines(symbol="BTCUSDT", interval="1m", limit=500):
         klines_data[symbol] = df
         return df
     except Exception as e:
-        logger.warning(f"[ERROR] fetch_klines {symbol}: {e}")
+        logger.error(f"[ERROR] fetch_klines {symbol}: {e}")
         return None
 
 def handle_socket(msg):
@@ -140,15 +150,12 @@ def extract_features(df: pd.DataFrame):
     df["adx"] = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], window=14).adx()
     df["rsi"] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
     macd = ta.trend.MACD(df['close'])
-    df["macd"] = macd.macd()
-    df["macd_signal"] = macd.macd_signal()
-    df["macd_hist"] = df["macd"] - df["macd_signal"]
+    df["macd_hist"] = macd.macd() - macd.macd_signal()
     df["atr"] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=14).average_true_range()
     bb = ta.volatility.BollingerBands(df['close'])
     df["bb_width"] = bb.bollinger_hband() - bb.bollinger_lband()
     df["vol_ma20"] = df["volume"].rolling(20).mean()
     df["vol_zscore"] = (df["volume"] - df["vol_ma20"]) / df["vol_ma20"].rolling(20).std()
-    # Патерни
     df["hammer"] = (df["close"] > df["open"]) & ((df["low"] - df[["open","close"]].min(axis=1)) > 2*(df["close"] - df["open"]))
     df["shooting_star"] = (df["open"] > df["close"]) & ((df["high"] - df[["open","close"]].max(axis=1)) > 2*(df["open"] - df["close"]))
     df["support"] = df["low"].rolling(20).min()
@@ -172,116 +179,164 @@ def get_rolling_vector(df, window=ROLLING_WINDOW):
         vectors.append(vec)
     return np.array(vectors)
 
-def fit_ml(symbols):
-    all_X, all_y = [], []
-    for s in symbols:
-        df = klines_data.get(s) or fetch_klines(s, "1m", 500)
-        if df is None or len(df) < ROLLING_WINDOW + 1:
-            continue
-        df = extract_features(df)
-        df['future_return'] = df['close'].shift(-1)/df['close'] - 1
-        df['label'] = (df['future_return'] > ATR_THRESHOLD).astype(int)
-        vecs = get_rolling_vector(df)
-        labels = df['label'].values[ROLLING_WINDOW:]
-        min_len = min(len(vecs), len(labels))
-        all_X.append(vecs[-min_len:])
-        all_y.append(labels[-min_len:])
-    if all_X:
-        X = np.vstack(all_X)
-        y = np.hstack(all_y)
-        X_scaled = scaler.fit_transform(X)
-        ml_model.fit(X_scaled, y)
-        logger.info(f"[ML] Trained on {X.shape[0]} samples | Positive rate: {np.mean(y):.3f}")
-    else:
-        logger.warning("[ML] No data for training!")
+def get_multi_tf_vector(dfs):
+    vectors = []
+    for tf in TIMEFRAMES:
+        df = dfs.get(tf)
+        if df is None: continue
+        vec = get_rolling_vector(df)
+        if len(vec) > 0:
+            vectors.append(vec[-1])
+    if vectors:
+        return np.concatenate(vectors)
+    return None
 
-def detect_signal(symbol, prob_threshold=0.55):
+def fit_scaler_and_model(symbols):
+    all_data = []
+    all_labels = []
+    for s in symbols:
+        df = fetch_klines(s, "1m", 500)
+        if df is None or len(df) < ROLLING_WINDOW: continue
+        dfs = {tf: extract_features(df) for tf in TIMEFRAMES}
+        vec = get_multi_tf_vector(dfs)
+        if vec is not None:
+            all_data.append(vec)
+            all_labels.append(1)  # placeholder, model needs labels for training
+    if all_data:
+        X = np.vstack(all_data)
+        scaler.fit(X)
+        ml_model.fit(X, np.zeros(X.shape[0]))  # dummy labels, use real when available
+        logger.info(f"[ML] Fitted on {X.shape[0]} samples with {X.shape[1]} features")
+    else:
+        logger.warning("[ML] No data to fit scaler/model!")
+
+# ---------------- SIGNAL ----------------
+def fetch_multi_tf_klines(symbol):
+    dfs = {}
     df = klines_data.get(symbol)
-    if df is None or len(df) < ROLLING_WINDOW:
-        df = fetch_klines(symbol, "1m", 500)
-        if df is None: return None
-    df = extract_features(df)
-    vec = get_rolling_vector(df)[-1].reshape(1,-1)
-    vec_scaled = scaler.transform(vec)
-    prob = ml_model.predict_proba(vec_scaled)[0,1]
-    last = df.iloc[-1]
-    logger.info(f"[ML] {symbol} -> prob={prob:.3f}")
-    if prob < prob_threshold:
-        return None
+    if df is None or len(df) < ROLLING_WINDOW: return None
+    for tf in TIMEFRAMES:
+        dfs[tf] = extract_features(df)
+    return dfs
+
+def detect_signal_ml(dfs, symbol):
+    vec = get_multi_tf_vector(dfs)
+    if vec is None: return None
+    vec_scaled = scaler.transform(vec.reshape(1,-1))
+    prob = ml_model.predict_proba(vec_scaled)[0,1] if hasattr(ml_model,"predict_proba") else 0.8
+    last = dfs["15m"].iloc[-1]
+    if prob < 0.7: return None
     action = "LONG" if last["ema_diff"] > 0 else "SHORT"
-    entry = last["close"]
     atr = last["atr"]
-    sl = entry - 1.5*atr if action=="LONG" else entry + 1.5*atr
-    tp1 = entry + 1.5*atr if action=="LONG" else entry - 1.5*atr
-    return {"symbol":symbol,"action":action,"entry":entry,"sl":sl,"tp1":tp1,"confidence":prob}
+    entry = last["close"]
+    if action=="LONG":
+        sl=entry-1.5*atr; tp1=entry+1.5*atr; tp2=entry+3*atr; tp3=entry+5*atr
+    else:
+        sl=entry+1.5*atr; tp1=entry-1.5*atr; tp2=entry-3*atr; tp3=entry-5*atr
+    rr1 = (tp1-entry)/(entry-sl) if action=="LONG" else (entry-tp1)/(sl-entry)
+    if rr1<2: return None
+    return {"action":action,"entry":entry,"sl":sl,"tp1":tp1,"tp2":tp2,"tp3":tp3,
+            "confidence":prob,"rr1":rr1,"features":vec.tolist(),"symbol":symbol}
+
+# ---------------- PLOT ----------------
+def plot_signal(df,symbol,signal):
+    addplots=[]
+    for tp in ["tp1","tp2","tp3"]:
+        addplots.append(mpf.make_addplot([signal[tp]]*len(df), linestyle="--", color='green'))
+    addplots.append(mpf.make_addplot([signal["sl"]]*len(df), linestyle="--", color='red'))
+    addplots.append(mpf.make_addplot([signal["entry"]]*len(df), linestyle="--", color='blue'))
+    fig, ax = mpf.plot(df.tail(200), type='candle', style='yahoo',
+                       title=f"{symbol}-{signal['action']}", addplot=addplots, returnfig=True)
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', bbox_inches='tight')
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+# ---------------- ANALYSIS ----------------
+def analyze_symbol(symbol):
+    logger.info(f"Analyzing {symbol}")
+    dfs = fetch_multi_tf_klines(symbol)
+    if not dfs: return
+    signal = detect_signal_ml(dfs, symbol)
+    if not signal: return
+    try:
+        photo = plot_signal(dfs["15m"], symbol, signal)
+    except:
+        photo = None
+    msg = (f"⚡ SIGNAL {symbol}\nAction: {signal['action']}\nEntry: {signal['entry']:.6f}\n"
+           f"SL: {signal['sl']:.6f}\nTP1: {signal['tp1']:.6f}\nConf: {signal['confidence']:.2f}\n"
+           f"R/R1: {signal['rr1']:.2f}")
+    send_telegram(msg, photo)
+    state["signals"][symbol] = {"signal": signal, "time": str(datetime.now(timezone.utc))}
+    save_json_safe(STATE_FILE, state)
+    history["signals"].append(signal)
+    save_json_safe(HISTORY_FILE, history)
 
 # ---------------- TOP SYMBOLS ----------------
 last_top_update = None
 def fetch_top_symbols(limit=10, cache_minutes=10):
     global last_top_update
     if state.get("top_symbols") and last_top_update:
-        if datetime.now(timezone.utc) - last_top_update < timedelta(minutes=cache_minutes):
+        if datetime.now(timezone.utc)-last_top_update < timedelta(minutes=cache_minutes):
             return state["top_symbols"]
     try:
         tickers = binance_client.futures_ticker()
         usdt_pairs = [t for t in tickers if t.get("symbol","").endswith("USDT")]
-        scores = []
+        scores=[]
         for t in usdt_pairs:
             try:
                 change_pct = abs(float(t.get("priceChangePercent",0)))
                 vol = float(t.get("quoteVolume",0))
-                score = change_pct*0.6 + vol*0.4
-                scores.append((t["symbol"], score))
-            except Exception: continue
-        sorted_symbols = [s[0] for s in sorted(scores, key=lambda x:x[1], reverse=True)[:limit]]
-        state["top_symbols"] = sorted_symbols
-        save_json_safe("state.json", state)
+                scores.append((t["symbol"], change_pct*0.6+vol*0.4))
+            except: continue
+        sorted_symbols=[s[0] for s in sorted(scores,key=lambda x:x[1],reverse=True)[:limit]]
+        state["top_symbols"]=sorted_symbols
+        save_json_safe(STATE_FILE, state)
         last_top_update = datetime.now(timezone.utc)
         return sorted_symbols
     except Exception as e:
-        logger.warning(f"Failed to fetch top symbols: {e}")
+        logger.warning(f"fetch_top_symbols failed: {e}")
         return state.get("top_symbols") or ["BTCUSDT","ETHUSDT","BNBUSDT"]
 
-# ---------------- SCAN LOOP ----------------
-def analyze_loop():
-    while True:
-        try:
-            logger.info("=== Starting scan cycle ===")
-            symbols = fetch_top_symbols()
-            signals_found = 0
-            for s in symbols:
-                sig = detect_signal(s)
-                if sig:
-                    msg = f"⚡ Signal {sig['symbol']} {sig['action']} @ {sig['entry']:.2f} Conf: {sig['confidence']:.2f}"
-                    send_telegram(msg)
-                    state["signals"][s] = sig
-                    history["signals"].append(sig)
-                    signals_found += 1
-            state["last_scan"] = str(datetime.now(timezone.utc))
-            save_json_safe("state.json", state)
-            save_json_safe("history.json", history)
-            logger.info(f"=== Scan finished | Signals: {signals_found}/{len(symbols)} ===")
-            time.sleep(SCAN_INTERVAL)
-        except Exception as e:
-            logger.error(f"Analyze loop crashed: {e}", exc_info=True)
-            time.sleep(10)
-
-# ---------------- STARTUP ----------------
-def startup():
-    init_binance_client()
-    symbols = fetch_top_symbols(limit=10)
-    fit_ml(symbols)
-    start_ws(symbols)
-    Thread(target=analyze_loop, daemon=True).start()
-    send_telegram("⚡ Bot started and ready!")
+# ---------------- MASTER SCAN ----------------
+def scan_all_symbols():
+    logger.info("Starting scan...")
+    symbols = fetch_top_symbols()
+    if not symbols: return
+    total=len(symbols)
+    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as exe:
+        futures=[exe.submit(analyze_symbol,s) for s in symbols]
+        for idx,f in enumerate(futures, start=1):
+            try: f.result()
+            except Exception as e: logger.error(f"Error: {e}")
+            logger.info(f"Processed {idx}/{total} symbols")
+            time.sleep(0.2)
+    state["last_scan"]=str(datetime.now(timezone.utc))
+    save_json_safe(STATE_FILE, state)
+    logger.info("Scan completed")
 
 # ---------------- FLASK ----------------
 app = Flask(__name__)
-@app.route("/", methods=["GET"])
-def home(): return jsonify({"status":"ok","time":str(datetime.now(timezone.utc)),"signals":len(state["signals"])})
 @app.route("/scan", methods=["POST"])
-def scan_endpoint(): Thread(target=analyze_loop, daemon=True).start(); return jsonify({"ok":True,"message":"Scan started"})
+def scan_endpoint():
+    Thread(target=scan_all_symbols, daemon=True).start()
+    return jsonify({"ok":True,"message":"Scan started"})
 
-if __name__ == "__main__":
-    startup()
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({"status":"ok","time":str(datetime.now(timezone.utc)),"signals":len(state["signals"])})
+
+# ---------------- STARTUP ----------------
+def startup_tasks():
+    init_binance_client()
+    symbols = fetch_top_symbols(limit=10)
+    if not symbols: return
+    fit_scaler_and_model(symbols)
+    start_ws(symbols,"1m")
+    send_telegram("⚡ Bot started and ready! Monitoring: "+", ".join(symbols))
+    scan_all_symbols()
+
+if __name__=="__main__":
+    startup_tasks()
     app.run(host="0.0.0.0", port=PORT)
