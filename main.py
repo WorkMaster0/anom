@@ -486,7 +486,9 @@ def fetch_top_symbols(limit=10, cache_minutes=10):
 
     try:
         tickers = binance_client.futures_ticker()
-        valid_symbols = {s["symbol"] for s in binance_client.futures_exchange_info()["symbols"]}
+        info = binance_client.futures_exchange_info()
+        valid_symbols = {s["symbol"] for s in info["symbols"] if s["status"] == "TRADING"}
+
         usdt_pairs = [t for t in tickers if t.get("symbol", "").endswith("USDT") and t["symbol"] in valid_symbols]
 
         scores = []
@@ -503,11 +505,54 @@ def fetch_top_symbols(limit=10, cache_minutes=10):
         save_json_safe(STATE_FILE, state)
         last_top_update = datetime.now(timezone.utc)
 
-        logger.info(f"[TOP] Selected symbols: {sorted_symbols}")
+        logger.info(f"[TOP] Selected valid trading symbols: {sorted_symbols}")
         return sorted_symbols
     except Exception as e:
         logger.warning(f"fetch_top_symbols failed: {e}")
         return state.get("top_symbols") or ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
+
+# ---------------- DEBUG: сигналів ----------------
+def detect_signal_ml(dfs, symbol):
+    global ml_model, scaler, imputer
+    vec = get_multi_tf_vector(dfs)
+    if vec is None:
+        return None
+
+    prob = 0.0
+    if ml_model is not None:
+        try:
+            X = imputer.transform(vec.reshape(1, -1))
+            X_scaled = scaler.transform(X)
+            prob = float(ml_model.predict_proba(X_scaled)[0, 1])
+        except Exception as e:
+            logger.debug(f"[ML] predict error: {e}")
+
+    last = dfs["15m"].iloc[-1]
+
+    # Додаткове логування для дебагу
+    logger.info(f"[DEBUG] {symbol} last_close={last['close']:.6f}, prob={prob:.3f}, "
+                f"features={last[['hammer','shooting_star','false_break_low','false_break_high']].to_dict()}")
+
+    # Перевірка ML threshold
+    if ml_model is not None and prob >= 0.55:
+        action = "LONG" if last["ema_diff"] > 0 else "SHORT"
+        atr = last["atr"]
+        entry = last["close"]
+        if action == "LONG":
+            sl = entry - 1.5*atr; tp1 = entry + 1.5*atr; tp2 = entry + 3*atr; tp3 = entry + 5*atr
+        else:
+            sl = entry + 1.5*atr; tp1 = entry - 1.5*atr; tp2 = entry - 3*atr; tp3 = entry - 5*atr
+        rr1 = (tp1-entry)/(entry-sl) if action=="LONG" else (entry-tp1)/(sl-entry)
+        if rr1 < 2: 
+            return None
+        return {"action":action,"entry":entry,"sl":sl,"tp1":tp1,"tp2":tp2,"tp3":tp3,"confidence":prob,"rr1":rr1,"symbol":symbol}
+
+    # fallback на pattern
+    patt = detect_with_patterns(dfs["15m"])
+    if patt:
+        patt["symbol"] = symbol
+        return patt
+    return None
 
 # ---------------- SCAN LOOP (periodic) ----------------
 def scan_all_symbols_once():
