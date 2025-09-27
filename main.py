@@ -1,503 +1,273 @@
-# main.py — повністю робочий файл з усіма функціями і виправленнями
-import os, json, logging, requests, io, time
+# backtest_pattern_combos.py
+import time, math, json, os
+from datetime import datetime, timedelta, timezone
+import requests
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import mplfinance as mpf
+import traceback
+from collections import defaultdict, Counter
+
+# --------- Параметри -------------
+API_KEY = "stNlgF28IUaYQIgVzJPQe2q5uvC715YFrc2xIpMVyyFe0ER6A8jfDem0rOTbxQXU"     # опціонально
+API_SECRET = "vyvwQBhjIGgLoV6jZbvCz7pfCtEFWUMlXIkw343E5PgzZlAHbEjGsRPzN8h9yeQq"  # опціонально
+BINANCE_FAPI = "https://fapi.binance.com"
+TOP_N = 12                       # скільки символів брати (щоб швидше)
+INTERVAL = "15m"
+DAYS = 92                        # ~3 місяці
+LIMIT = 1500                     # max per request
+FUTURE_LOOKAHEAD_BARS = 48      # скільки барів вперед дивимось на досягення TP/SL (48*15m = 12 год)
+MIN_BARS_REQUIRED = 60
+OUT_CSV = "combo_stats.csv"
+
+# ---- Встав твої функції apply_pro_features та detect_signal_pro тут або імпортуй їх ----
+# Для зручності я вставляю копію — якщо ти вже маєш їх у модулі, імпортуй замість вставки.
+# --------------------------------------------------
 import ta
-from datetime import datetime, timezone, timedelta
-from threading import Thread, Lock
-from concurrent.futures import ThreadPoolExecutor
-from flask import Flask, jsonify
-from binance.client import Client
-from binance.streams import ThreadedWebsocketManager
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import StandardScaler
-from sklearn.impute import SimpleImputer
-import asyncio
-
-# ---------------- LOGGING ----------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("ml-adaptive-bot")
-
-# ---------------- CONFIG ----------------
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-CHAT_ID = os.getenv("CHAT_ID", "")
-PORT = int(os.getenv("PORT", "5000"))
-STATE_FILE = "state.json"
-HISTORY_FILE = "history.json"
-ROLLING_WINDOW = 10
-PARALLEL_WORKERS = 6
-TIMEFRAMES = ["15m", "1h", "4h"]
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "300"))
-ATR_THRESHOLD = float(os.getenv("ATR_THRESHOLD", "0.0005"))
-
-# ---------------- GLOBALS ----------------
-binance_client = None
-klines_data = {}
-twm = None
-state = {"signals": {}, "last_scan": None, "top_symbols": []}
-history = {"signals": []}
-json_lock = Lock()
-imputer = SimpleImputer(strategy="mean")
-scaler = StandardScaler()
-ml_model = None
-
-# ---------------- HELPERS: JSON ----------------
-def load_json_safe(path, default):
-    try:
-        if os.path.exists(path):
-            with open(path, "r") as f:
-                return json.load(f)
-    except Exception as e:
-        logger.warning(f"Failed to load {path}: {e}")
-    return default
-
-def save_json_safe(path, data):
-    try:
-        with json_lock:
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            tmp = path + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(data, f, indent=2, default=str)
-            os.replace(tmp, path)
-    except Exception as e:
-        logger.warning(f"Failed to save {path}: {e}")
-
-state = load_json_safe(STATE_FILE, state)
-history = load_json_safe(HISTORY_FILE, history)
-
-# ---------------- TELEGRAM ----------------
-def escape_md_v2(text):
-    escape_chars = r"_*[]()~`>#+-=|{}.!"
-    for c in escape_chars:
-        text = text.replace(c, f"\\{c}")
-    return text
-
-def send_telegram(msg, photo=None, max_retries=3):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        logger.warning("Telegram token or chat_id not set, skipping send.")
-        return False
-    for attempt in range(1, max_retries + 1):
-        try:
-            if photo:
-                files = {'photo': ('signal.png', photo, 'image/png')}
-                data = {'chat_id': CHAT_ID, 'caption': escape_md_v2(msg), 'parse_mode': 'MarkdownV2'}
-                resp = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
-                                     data=data, files=files, timeout=10)
-            else:
-                payload = {"chat_id": CHAT_ID, "text": escape_md_v2(msg), "parse_mode": "MarkdownV2"}
-                resp = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                                     json=payload, timeout=10)
-            if resp.status_code == 200:
-                logger.info(f"Telegram message sent successfully (attempt {attempt})")
-                return True
-            else:
-                logger.warning(f"Telegram API returned {resp.status_code}: {resp.text}")
-        except Exception as e:
-            logger.warning(f"Telegram send exception (attempt {attempt}): {e}")
-    logger.error("Telegram send failed after max retries")
-    return False
-
-# ---------------- BINANCE ----------------
-def init_binance_client():
-    global binance_client
-    if binance_client is None:
-        binance_client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
-        logger.info("Binance client initialized")
-    return binance_client
-
-def fetch_klines(symbol="BTCUSDT", interval="1m", limit=500):
-    try:
-        raw = binance_client.get_klines(symbol=symbol, interval=interval, limit=limit)
-        df = pd.DataFrame(raw, columns=[
-            "time","open","high","low","close","volume",
-            "close_time","qav","num_trades","taker_base_vol","taker_quote_vol","ignore"
-        ])
-        df["time"] = pd.to_datetime(df["time"], unit="ms")
-        df.set_index("time", inplace=True)
-        df = df[["open","high","low","close","volume"]].astype(float)
-        klines_data[symbol] = df
-        return df
-    except Exception as e:
-        logger.error(f"[ERROR] fetch_klines {symbol}: {e}")
-        return None
-
-def handle_socket(msg):
-    try:
-        if msg.get("e") == "kline":
-            k = msg["k"]
-            symbol = msg["s"]
-            t = pd.to_datetime(k["t"], unit="ms")
-            candle = [float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]), float(k["v"])]
-            if symbol not in klines_data:
-                fetch_klines(symbol, "1m", 500)
-                if symbol not in klines_data:
-                    return
-            df = klines_data[symbol]
-            df.loc[t] = candle
-            klines_data[symbol] = df.tail(2000)
-    except Exception as e:
-        logger.debug(f"Socket handle error: {e}")
-
-def start_ws(symbols=None, interval="1m"):
-    if symbols is None:
-        symbols = ["BTCUSDT"]
-
-    def run_ws():
-        global twm
-        try:
-            asyncio.set_event_loop(asyncio.new_event_loop())
-        except Exception:
-            pass
-
-        twm = ThreadedWebsocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
-        twm.start()
-
-        for s in symbols:
-            if s not in klines_data:
-                fetch_klines(s, interval, 500)
-            try:
-                twm.start_kline_socket(callback=handle_socket, symbol=s, interval=interval)
-            except Exception as e:
-                logger.warning(f"Failed to start ws for {s}: {e}")
-
-        logger.info(f"[WS] Started for {symbols}")
-
-    Thread(target=run_ws, daemon=True).start()
-
-# ---------------- TOP SYMBOLS ----------------
-def fetch_top_symbols(limit=20):
-    """
-    Отримує топ монети USDT Perpetual Futures за обсягом.
-    """
-    try:
-        tickers = binance_client.futures_ticker()
-        info = binance_client.futures_exchange_info()
-        valid_symbols = {
-            s["symbol"] for s in info["symbols"]
-            if s["status"] == "TRADING" and s["contractType"] == "PERPETUAL" and s["quoteAsset"] == "USDT"
-        }
-
-        df = pd.DataFrame(tickers)
-        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
-        df = df[df["symbol"].isin(valid_symbols)]
-        df = df.sort_values("volume", ascending=False).head(limit)
-        symbols = df["symbol"].tolist()
-
-        logger.info(f"[TOP] Selected valid trading symbols: {symbols}")
-        return symbols
-    except Exception as e:
-        logger.error(f"[TOP] Failed to fetch top symbols: {e}")
-        return ["BTCUSDT", "ETHUSDT"]
-
-# ---------------- FEATURES / PATTERNS ----------------
-def extract_features(df: pd.DataFrame):
+def apply_pro_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    df["support"] = df["low"].rolling(20).min()
+    df["resistance"] = df["high"].rolling(20).max()
+    df["vol_ma20"] = df["volume"].rolling(20).mean()
+    df["vol_spike"] = df["volume"] > 1.5 * df["vol_ma20"]
+    df["volume_cluster"] = df["volume"] > 2 * df["vol_ma20"]
+    df["body"] = df["close"] - df["open"]
+    df["range"] = df["high"] - df["low"]
+    df["upper_shadow"] = df["high"] - df[["close","open"]].max(axis=1)
+    df["lower_shadow"] = df[["close","open"]].min(axis=1) - df["low"]
+    df["liquidity_grab_long"] = (df["low"] < df["support"]) & (df["close"] > df["support"])
+    df["liquidity_grab_short"] = (df["high"] > df["resistance"]) & (df["close"] < df["resistance"])
+    df["false_break_high"] = (df["high"] > df["resistance"]) & (df["close"] < df["resistance"])
+    df["false_break_low"] = (df["low"] < df["support"]) & (df["close"] > df["support"])
+    df["bull_trap"] = (df["close"] < df["open"]) & (df["high"] > df["resistance"])
+    df["bear_trap"] = (df["close"] > df["open"]) & (df["low"] < df["support"])
+    df["retest_support"] = abs(df["close"] - df["support"]) / df["support"] < 0.003
+    df["retest_resistance"] = abs(df["close"] - df["resistance"]) / df["resistance"] < 0.003
+    df["trend_ma"] = df["close"].rolling(20).mean()
+    df["trend_up"] = df["close"] > df["trend_ma"]
+    df["trend_down"] = df["close"] < df["trend_ma"]
+    df["long_lower_wick"] = df["lower_shadow"] > 2 * abs(df["body"])
+    df["long_upper_wick"] = df["upper_shadow"] > 2 * abs(df["body"])
+    df["imbalance_up"] = (df["body"] > 0) & (df["body"] > df["range"] * 0.6)
+    df["imbalance_down"] = (df["body"] < 0) & (abs(df["body"]) > df["range"] * 0.6)
+    df["atr"] = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"], window=14).average_true_range()
+    df["squeeze"] = df["atr"] < df["atr"].rolling(50).mean() * 0.7
+    df["delta_div_long"] = (df["body"] > 0) & (df["volume"] < df["vol_ma20"])
+    df["delta_div_short"] = (df["body"] < 0) & (df["volume"] < df["vol_ma20"])
+    df["breakout_cont_long"] = (df["close"] > df["resistance"]) & (df["volume"] > df["vol_ma20"])
+    df["breakout_cont_short"] = (df["close"] < df["support"]) & (df["volume"] > df["vol_ma20"])
+    df["combo_bullish"] = df["imbalance_up"] & df["vol_spike"] & df["trend_up"]
+    df["combo_bearish"] = df["imbalance_down"] & df["vol_spike"] & df["trend_down"]
+    df["accumulation_zone"] = ((df["range"] < df["range"].rolling(20).mean() * 0.5) &
+                                (df["volume"] > df["vol_ma20"]))
+    return df
 
-    try:
-        df["rsi"] = ta.momentum.RSIIndicator(df["close"]).rsi()
-        df["adx"] = ta.trend.ADXIndicator(df["high"], df["low"], df["close"]).adx()
-        macd = ta.trend.MACD(df["close"])
-        df["macd_hist"] = macd.macd_diff()
-        df["atr"] = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"]).average_true_range()
-        bb = ta.volatility.BollingerBands(df["close"])
-        df["bb_width"] = (bb.bollinger_hband() - bb.bollinger_lband()) / df["close"]
-        df["vol_zscore"] = (df["volume"] - df["volume"].rolling(20).mean()) / df["volume"].rolling(20).std()
-
-        # Патерни
-        df["hammer"] = (df["close"] > df["open"]) & ((df["low"] < df["open"]) | (df["low"] < df["close"]))
-        df["shooting_star"] = (df["open"] > df["close"]) & ((df["high"] > df["open"]) | (df["high"] > df["close"]))
-        df["false_break_high"] = (df["high"] > df["high"].shift(1)) & (df["close"] < df["high"].shift(1))
-        df["false_break_low"] = (df["low"] < df["low"].shift(1)) & (df["close"] > df["low"].shift(1))
-        df["retest_support"] = (df["low"] <= df["low"].rolling(20).min())
-        df["retest_resistance"] = (df["high"] >= df["high"].rolling(20).max())
-        df["accumulation_zone"] = (df["close"].rolling(10).mean() - df["close"].rolling(50).mean()) > 0
-        df["squeeze"] = df["bb_width"] < df["bb_width"].rolling(20).quantile(0.2)
-    except Exception as e:
-        logger.warning(f"[Features] Error extracting features: {e}")
-
-    # 🔑 гарантуємо наявність усіх потрібних колонок
-    needed = [
-        "adx","rsi","macd_hist","atr","bb_width","vol_zscore",
-        "hammer","shooting_star","false_break_high","false_break_low",
-        "retest_support","retest_resistance","accumulation_zone","squeeze"
-    ]
-    for col in needed:
-        if col not in df.columns:
-            df[col] = 0
-
-    return df.fillna(0)
-
-# ---------------- ML helpers ----------------
-def get_rolling_vector(df, window=ROLLING_WINDOW):
-    features = ["ema_diff","adx","rsi","macd_hist","atr","bb_width","vol_zscore",
-                "hammer","shooting_star","false_break_high","false_break_low",
-                "retest_support","retest_resistance","accumulation_zone","squeeze"]
-    vectors = []
-    for i in range(window, len(df)):
-        vec = df[features].iloc[i-window:i].values.flatten()
-        vectors.append(vec)
-    return np.array(vectors)
-
-def get_multi_tf_vector(dfs):
-    vectors = []
-    for tf in TIMEFRAMES:
-        df = dfs.get(tf)
-        if df is None:
-            continue
-        vecs = get_rolling_vector(df)
-        if len(vecs) > 0:
-            vectors.append(vecs[-1])
-    if not vectors:
-        return None
-    return np.concatenate(vectors)
-
-# ---------------- ML training ----------------
-def fit_ml(symbols):
-    global ml_model, scaler, imputer
-    logger.info("[ML] Building training dataset...")
-    X_parts, y_parts = [], []
-    for s in symbols:
-        df = klines_data.get(s)
-        if df is None:
-            df = fetch_klines(s, "1m", 1500)
-        if df is None or len(df) < ROLLING_WINDOW+2:
-            continue
-        df = extract_features(df)
-        vecs = get_rolling_vector(df)
-        future_ret = (df['close'].shift(-1)/df['close']-1).values
-        labels = (future_ret[ROLLING_WINDOW:] > ATR_THRESHOLD).astype(int)
-        if len(vecs) == 0 or len(labels) == 0:
-            continue
-        min_len = min(len(vecs), len(labels))
-        X_parts.append(vecs[-min_len:])
-        y_parts.append(labels[-min_len:])
-    if not X_parts:
-        logger.warning("[ML] No training data collected.")
-        ml_model = None
-        return
-    X = np.vstack(X_parts)
-    y = np.hstack(y_parts)
-    logger.info(f"[ML] Collected {X.shape[0]} samples | positive rate {np.mean(y):.3f}")
-    if len(np.unique(y)) < 2 or np.sum(y) < 5:
-        logger.warning("[ML] Not enough positive samples, using only patterns.")
-        ml_model = None
-        return
-    imputer.fit(X)
-    X_imputed = imputer.transform(X)
-    scaler.fit(X_imputed)
-    X_scaled = scaler.transform(X_imputed)
-    model = RandomForestClassifier(n_estimators=300, max_depth=12, class_weight="balanced_subsample",
-                                   random_state=42, n_jobs=-1)
-    model.fit(X_scaled, y)
-    ml_model = model
-    logger.info(f"[ML] Trained RandomForest on {X.shape[0]} samples")
-
-# ---------------- SIGNAL DETECTION ----------------
-def detect_with_patterns(df):
+def detect_signal_pro(df: pd.DataFrame):
     last = df.iloc[-1]
-    if last.get("false_break_low", False) or last.get("retest_support", False) or last.get("hammer", False):
+    votes = []
+    confidence = 0.5
+    pretop = False
+    if last["liquidity_grab_long"]: votes.append("liquidity_grab_long"); confidence += 0.08
+    if last["liquidity_grab_short"]: votes.append("liquidity_grab_short"); confidence += 0.08
+    if last["bull_trap"]: votes.append("bull_trap"); confidence += 0.05
+    if last["bear_trap"]: votes.append("bear_trap"); confidence += 0.05
+    if last["false_break_high"]: votes.append("false_break_high"); confidence += 0.05
+    if last["false_break_low"]: votes.append("false_break_low"); confidence += 0.05
+    if last["volume_cluster"]: votes.append("volume_cluster"); confidence += 0.05
+    if last["breakout_cont_long"]: votes.append("breakout_cont_long"); confidence += 0.07
+    if last["breakout_cont_short"]: votes.append("breakout_cont_short"); confidence += 0.07
+    if last["imbalance_up"]: votes.append("imbalance_up"); confidence += 0.05
+    if last["imbalance_down"]: votes.append("imbalance_down"); confidence += 0.05
+    if last["squeeze"]: votes.append("volatility_squeeze"); confidence += 0.03
+    if last["trend_up"]: votes.append("trend_up"); confidence += 0.05
+    if last["trend_down"]: votes.append("trend_down"); confidence += 0.05
+    if last["long_lower_wick"]: votes.append("long_lower_wick"); confidence += 0.04
+    if last["long_upper_wick"]: votes.append("long_upper_wick"); confidence += 0.04
+    if last["retest_support"]: votes.append("retest_support"); confidence += 0.05
+    if last["retest_resistance"]: votes.append("retest_resistance"); confidence += 0.05
+    if last["delta_div_long"]: votes.append("delta_div_long"); confidence += 0.06
+    if last["delta_div_short"]: votes.append("delta_div_short"); confidence += 0.06
+    if last["combo_bullish"]: votes.append("combo_bullish"); confidence += 0.1
+    if last["combo_bearish"]: votes.append("combo_bearish"); confidence += 0.1
+    if last["accumulation_zone"]: votes.append("accumulation_zone"); confidence += 0.03
+    if len(df) >= 10 and (last["close"] - df["close"].iloc[-10]) / df["close"].iloc[-10] > 0.10:
+        pretop = True
+        votes.append("pretop"); confidence += 0.1
+    action = "WATCH"
+    if "combo_bullish" in votes or "breakout_cont_long" in votes or "delta_div_long" in votes:
         action = "LONG"
-    elif last.get("false_break_high", False) or last.get("retest_resistance", False) or last.get("shooting_star", False):
+    elif "combo_bearish" in votes or "breakout_cont_short" in votes or "delta_div_short" in votes:
         action = "SHORT"
     else:
-        return None
-    entry = last["close"]
-    atr = last["atr"] if last["atr"]>0 else (last["high"]-last["low"])
-    sl = entry-1.5*atr if action=="LONG" else entry+1.5*atr
-    tp1 = entry+1.5*atr if action=="LONG" else entry-1.5*atr
-    rr1 = (tp1-entry)/(entry-sl) if action=="LONG" else (entry-tp1)/(sl-entry)
-    if rr1<1.5:
-        return None
-    return {"symbol": None, "action":action, "entry":entry, "sl":sl, "tp1":tp1, "tp2":None, "tp3":None, "confidence":0.5, "rr1":rr1}
+        near_resistance = last["close"] >= last["resistance"] * 0.98 if not pd.isna(last["resistance"]) else False
+        near_support = last["close"] <= last["support"] * 1.02 if not pd.isna(last["support"]) else False
+        if near_resistance: action = "SHORT"
+        elif near_support: action = "LONG"
+    confidence = max(0.0, min(1.0, confidence))
+    return action, votes, pretop, last, confidence
 
-def detect_signal_ml(dfs, symbol):
-    global ml_model, scaler, imputer
-    vec = get_multi_tf_vector(dfs)
-    if vec is None:
-        return None
-    prob = 0.0
-    if ml_model is not None:
-        try:
-            X = imputer.transform(vec.reshape(1,-1))
-            X_scaled = scaler.transform(X)
-            prob = float(ml_model.predict_proba(X_scaled)[0,1])
-        except Exception as e:
-            logger.debug(f"[ML] predict error: {e}")
-    last = dfs["15m"].iloc[-1]
-    logger.info(f"[DEBUG] {symbol} last_close={last['close']:.6f}, prob={prob:.3f}")
-    if ml_model is not None and prob>=0.55:
-        action = "LONG" if last["ema_diff"]>0 else "SHORT"
-        atr = last["atr"]
-        entry = last["close"]
-        if action=="LONG":
-            sl=entry-1.5*atr; tp1=entry+1.5*atr; tp2=entry+3*atr; tp3=entry+5*atr
-        else:
-            sl=entry+1.5*atr; tp1=entry-1.5*atr; tp2=entry-3*atr; tp3=entry-5*atr
-        rr1 = (tp1-entry)/(entry-sl) if action=="LONG" else (entry-tp1)/(sl-entry)
-        if rr1<2:
-            return None
-        return {"action":action,"entry":entry,"sl":sl,"tp1":tp1,"tp2":tp2,"tp3":tp3,"confidence":prob,"rr1":rr1,"symbol":symbol}
-    patt = detect_with_patterns(dfs["15m"])
-    if patt:
-        patt["symbol"] = symbol
-        return patt
-    return None
+# -------------- утиліти для завантаження -------------
+def unix_ms(dt):
+    return int(dt.replace(tzinfo=timezone.utc).timestamp()*1000)
 
-# ---------------- PLOTTING ----------------
-def plot_signal(df, symbol, signal):
-    try:
-        addplots=[]
-        for tp in ["tp1","tp2","tp3"]:
-            if signal.get(tp) is not None:
-                addplots.append(mpf.make_addplot([signal[tp]]*len(df), linestyle="--", color='green'))
-        addplots.append(mpf.make_addplot([signal["sl"]]*len(df), linestyle="--", color='red'))
-        addplots.append(mpf.make_addplot([signal["entry"]]*len(df), linestyle="--", color='blue'))
-        fig, ax = mpf.plot(df.tail(200), type='candle', style='yahoo', title=f"{symbol}-{signal['action']}",
-                           addplot=addplots, returnfig=True)
-        buf = io.BytesIO()
-        fig.savefig(buf, format='png', bbox_inches='tight')
-        buf.seek(0)
-        plt.close(fig)
-        return buf
-    except Exception as e:
-        logger.warning(f"plot_signal failed: {e}")
-        return None
+def fetch_top_symbols(limit=TOP_N):
+    # повертає top по абсолютній зміні % за 24h
+    r = requests.get(f"{BINANCE_FAPI}/fapi/v1/ticker/24hr", timeout=15)
+    arr = r.json()
+    usdt = [t for t in arr if t["symbol"].endswith("USDT")]
+    usdt_sorted = sorted(usdt, key=lambda x: abs(float(x.get("priceChangePercent", 0))), reverse=True)
+    return [d["symbol"] for d in usdt_sorted[:limit]]
 
-# ---------------- ANALYSIS ----------------
-def enrich_features(df: pd.DataFrame):
-    df = df.copy()
-    if df.empty:
-        return df
-    try:
-        df["ema20"] = df["close"].ewm(span=20).mean()
-        df["ema50"] = df["close"].ewm(span=50).mean()
-        df["ema_diff"] = df["ema20"]-df["ema50"]
-        if len(df)>=14:
-            df["adx"] = ta.trend.ADXIndicator(df['high'],df['low'],df['close'],window=14).adx()
-            df["rsi"] = ta.momentum.RSIIndicator(df['close'],window=14).rsi()
-        else:
-            df["adx"],df["rsi"]=0,0
-        macd=ta.trend.MACD(df['close'])
-        df["macd_hist"]=macd.macd()-macd.macd_signal()
-        df["atr"]=ta.volatility.AverageTrueRange(df['high'],df['low'],df['close'],window=14).average_true_range()
-        bb=ta.volatility.BollingerBands(df['close'])
-        df["bb_width"]=bb.bollinger_hband()-bb.bollinger_lband()
-        df["vol_ma20"]=df["volume"].rolling(20).mean()
-        df["vol_zscore"]=(df["volume"]-df["vol_ma20"])/df["vol_ma20"].rolling(20).std()
-        df["hammer"]=(df["close"]>df["open"])&((df["low"]-df[["open","close"]].min(axis=1))>2*(df["close"]-df["open"]))
-        df["shooting_star"]=(df["open"]>df["close"])&((df["high"]-df[["open","close"]].max(axis=1))>2*(df["open"]-df["close"]))
-        df["false_break_high"]=0
-        df["false_break_low"]=0
-        df["retest_support"]=0
-        df["retest_resistance"]=0
-        df["accumulation_zone"]=0
-        df["squeeze"]=0
-    except Exception as e:
-        logger.debug(f"enrich_features error: {e}")
-    return df.fillna(0)
-
-def analyze_symbol(symbol: str):
-    try:
-        logger.info(f"[ANALYZE] Починаю аналіз {symbol}...")
-        df=klines_data.get(symbol)
-        if df is None or df.empty:
-            df=fetch_klines(symbol,"1m",1000)
-        if df is None or df.empty:
-            logger.warning(f"[SKIP] {symbol} → немає даних")
-            return
-        dfs={}
-        for tf,rule in [("15m","15min"),("1h","1h"),("4h","4h")]:
-            df_resampled=df.resample(rule).agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
-            if not df_resampled.empty:
-                dfs[tf]=enrich_features(df_resampled)
-        if not dfs:
-            logger.warning(f"[SKIP] {symbol} → немає оброблених даних")
-            return
-        signal=detect_signal_ml(dfs,symbol)
-        if signal:
-            photo=plot_signal(dfs.get("15m"),symbol,signal) if dfs.get("15m") is not None else None
-            msg=(f"⚡ SIGNAL {symbol}\nAction: {signal['action']}\nEntry: {signal['entry']:.6f}\n"
-                 f"SL: {signal['sl']:.6f}\nTP1: {signal.get('tp1',0):.6f}\nConf: {signal['confidence']:.2f}\n"
-                 f"R/R1: {signal.get('rr1',0):.2f}")
-            send_telegram(msg,photo)
-            state["signals"][symbol]={"signal":signal,"time":str(datetime.now(timezone.utc))}
-            save_json_safe(STATE_FILE,state)
-            history["signals"].append(signal)
-            save_json_safe(HISTORY_FILE,history)
-            logger.info(f"Sent signal for {symbol} (conf {signal['confidence']:.2f})")
-        else:
-            logger.info(f"[NO SIGNAL] {symbol} без сигналів")
-    except Exception as e:
-        logger.error(f"analyze_symbol error for {symbol}: {e}", exc_info=True)
-
-# ---------------- SCAN LOOP ----------------
-def scan_all_symbols_once():
-    logger.info("Starting one full scan...")
-    symbols = fetch_top_symbols(limit=10)
-    if not symbols:
-        logger.warning("No symbols to scan")
-        return
-    total = len(symbols)
-    with ThreadPoolExecutor(max_workers=min(PARALLEL_WORKERS,total)) as exe:
-        futures=[exe.submit(analyze_symbol,s) for s in symbols]
-        for idx,f in enumerate(futures,start=1):
-            try: f.result()
-            except Exception as e: logger.error(f"scan error: {e}")
-            logger.info(f"Processed {idx}/{total}")
-    state["last_scan"]=str(datetime.now(timezone.utc))
-    save_json_safe(STATE_FILE,state)
-    logger.info("Scan finished")
-
-def analyze_loop():
+def fetch_klines_range(symbol, interval, start_ms, end_ms):
+    out = []
+    cur_start = start_ms
     while True:
-        try:
-            logger.info("=== Starting scan cycle ===")
-            scan_all_symbols_once()
-            logger.info("=== Scan cycle finished ===")
-            time.sleep(SCAN_INTERVAL)
-        except Exception as e:
-            logger.error(f"analyze_loop crashed: {e}", exc_info=True)
-            time.sleep(10)
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "startTime": cur_start,
+            "endTime": end_ms,
+            "limit": LIMIT
+        }
+        r = requests.get(f"{BINANCE_FAPI}/fapi/v1/klines", params=params, timeout=20)
+        data = r.json()
+        if not data:
+            break
+        out.extend(data)
+        if len(data) < LIMIT:
+            break
+        # advance: last open time + interval
+        last_open = int(data[-1][0])
+        # next start = last_open + 1 ms OR compute interval length
+        cur_start = last_open + 1
+        # safety sleep to avoid rate limits
+        time.sleep(0.2)
+    # convert to df
+    df = pd.DataFrame(out, columns=[
+        "open_time","open","high","low","close","volume",
+        "close_time","quote_asset_volume","trades",
+        "taker_buy_base","taker_buy_quote","ignore"
+    ])
+    if df.empty:
+        return None
+    for col in ["open","high","low","close","volume"]:
+        df[col] = df[col].astype(float)
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+    df.set_index("open_time", inplace=True)
+    return df
 
-# ---------------- STARTUP ----------------
-def startup_tasks():
-    logger.info("=== Startup initiated ===")
-    init_binance_client()
-    symbols = fetch_top_symbols(limit=20)
-    if not symbols:
-        logger.error("No symbols fetched at startup!")
-        return
-    logger.info(f"[Startup] Prefetching klines for {len(symbols)} symbols...")
-    with ThreadPoolExecutor(max_workers=min(12,len(symbols))) as ex:
-        ex.map(lambda s: fetch_klines(s,"1m",1000),symbols)
-    fit_ml(symbols)
-    start_ws(symbols,"1m")
-    Thread(target=analyze_loop,daemon=True).start()
+# --------------- симулятор сигналів ----------------
+def simulate_signals_on_df(df):
+    df = df.copy()
+    df = apply_pro_features(df)
+    results = []  # list of dicts for each signal occurrence
+    # iterate over bars starting from MIN_BARS_REQUIRED to end-1
+    for i in range(MIN_BARS_REQUIRED, len(df)-1):
+        window = df.iloc[:i+1].copy()
+        action, votes, pretop, last, confidence = detect_signal_pro(window)
+        if action == "WATCH":
+            continue
+        # compute entry/sl/tp as in твоєму коді (use last row values)
+        if action == "LONG":
+            entry = last["support"] * 1.001
+            stop_loss = last["support"] * 0.99
+            tp1 = entry + (last["resistance"] - entry) * 0.33
+            tp2 = entry + (last["resistance"] - entry) * 0.66
+            tp3 = last["resistance"]
+        else:
+            entry = last["resistance"] * 0.999
+            stop_loss = last["resistance"] * 1.01
+            tp1 = entry - (entry - last["support"]) * 0.33
+            tp2 = entry - (entry - last["support"]) * 0.66
+            tp3 = last["support"]
+        # simulate next FUTURE_LOOKAHEAD_BARS bars
+        future = df.iloc[i+1 : i+1+FUTURE_LOOKAHEAD_BARS]
+        hit = {"tp1": False, "tp2": False, "tp3": False, "sl": False, "time_to_hit": None}
+        for j, (_, frow) in enumerate(future.iterrows(), start=1):
+            # For LONG: high >= tp => hit; low <= sl => sl
+            if action == "LONG":
+                if not hit["tp1"] and frow["high"] >= tp1: hit["tp1"] = True; hit["time_to_hit"] = j
+                if not hit["tp2"] and frow["high"] >= tp2: hit["tp2"] = True
+                if not hit["tp3"] and frow["high"] >= tp3: hit["tp3"] = True
+                if frow["low"] <= stop_loss:
+                    hit["sl"] = True
+                    if hit["time_to_hit"] is None:
+                        hit["time_to_hit"] = j
+                    break
+            else:
+                if not hit["tp1"] and frow["low"] <= tp1: hit["tp1"] = True; hit["time_to_hit"] = j
+                if not hit["tp2"] and frow["low"] <= tp2: hit["tp2"] = True
+                if not hit["tp3"] and frow["low"] <= tp3: hit["tp3"] = True
+                if frow["high"] >= stop_loss:
+                    hit["sl"] = True
+                    if hit["time_to_hit"] is None:
+                        hit["time_to_hit"] = j
+                    break
+        # quality metrics
+        rr1 = (tp1 - entry)/(entry - stop_loss) if action=="LONG" else (entry - tp1)/(stop_loss - entry)
+        rr2 = (tp2 - entry)/(entry - stop_loss) if action=="LONG" else (entry - tp2)/(stop_loss - entry)
+        rr3 = (tp3 - entry)/(entry - stop_loss) if action=="LONG" else (entry - tp3)/(stop_loss - entry)
+        results.append({
+            "time": last.name, "action": action, "votes": tuple(sorted(votes)),
+            "entry": entry, "sl": stop_loss, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+            "hit_tp1": hit["tp1"], "hit_tp2": hit["tp2"], "hit_tp3": hit["tp3"], "hit_sl": hit["sl"],
+            "time_to_hit": hit["time_to_hit"], "rr1": rr1, "rr2": rr2, "rr3": rr3, "confidence": confidence
+        })
+    return results
+
+# --------------- головна логіка ---------------
+def main():
     try:
-        send_telegram("⚡ Bot started and ready! Monitoring: "+", ".join(symbols[:10]))
+        end = datetime.utcnow().replace(tzinfo=timezone.utc)
+        start = end - timedelta(days=DAYS)
+        start_ms = unix_ms(start)
+        end_ms = unix_ms(end)
+        symbols = fetch_top_symbols(limit=TOP_N)
+        print("Top symbols:", symbols)
+        all_results = []
+        for sym in symbols:
+            print("Fetching", sym)
+            df = fetch_klines_range(sym, INTERVAL, start_ms, end_ms)
+            if df is None or len(df) < MIN_BARS_REQUIRED:
+                print("skip", sym, "not enough bars")
+                continue
+            res = simulate_signals_on_df(df)
+            print(f"  signals found: {len(res)}")
+            for r in res:
+                r["symbol"] = sym
+            all_results.extend(res)
+            # safety sleep
+            time.sleep(0.5)
+        if not all_results:
+            print("No signals in dataset.")
+            return
+        dfres = pd.DataFrame(all_results)
+        # aggregate by (action, votes)
+        agg = []
+        grouped = dfres.groupby(["action","votes"])
+        for (action,votes), g in grouped:
+            cnt = len(g)
+            hit1 = g["hit_tp1"].mean()
+            hit2 = g["hit_tp2"].mean()
+            hit3 = g["hit_tp3"].mean()
+            sl_rate = g["hit_sl"].mean()
+            mean_rr1 = g["rr1"].replace([np.inf, -np.inf], np.nan).mean()
+            median_time = g["time_to_hit"].dropna().median()
+            agg.append({
+                "action": action, "votes": "|".join(votes), "count": cnt,
+                "hit1": hit1, "hit2": hit2, "hit3": hit3, "sl_rate": sl_rate,
+                "mean_rr1": mean_rr1, "median_time_to_hit_bars": median_time
+            })
+        aggdf = pd.DataFrame(agg).sort_values(["action","hit1"], ascending=[True, False])
+        aggdf.to_csv(OUT_CSV, index=False)
+        print("Saved aggregated combo stats to", OUT_CSV)
+        # print top 5 for each action
+        for act in ["LONG","SHORT"]:
+            top = aggdf[aggdf["action"]==act].sort_values("hit1", ascending=False).head(5)
+            print("\nTop combos for", act)
+            print(top[["votes","count","hit1","hit2","hit3","sl_rate","mean_rr1","median_time_to_hit_bars"]].to_string(index=False))
     except Exception as e:
-        logger.warning(f"Cannot send startup Telegram message: {e}")
-    logger.info("=== Startup tasks launched ===")
+        print("Error:", e)
+        traceback.print_exc()
 
-if __name__ != "__main__":
-    Thread(target=startup_tasks,daemon=True).start()
-
-# ---------------- FLASK ----------------
-app = Flask(__name__)
-
-@app.route("/scan",methods=["POST"])
-def scan_endpoint():
-    Thread(target=scan_all_symbols_once,daemon=True).start()
-    return jsonify({"ok":True,"message":"Scan started"})
-
-@app.route("/",methods=["GET"])
-def home():
-    return jsonify({"status":"ok","time":str(datetime.now(timezone.utc)),"signals":len(state["signals"])})
-
-if __name__=="__main__":
-    startup_tasks()
-    app.run(host="0.0.0.0",port=PORT)
+if __name__ == "__main__":
+    main()
