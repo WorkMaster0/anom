@@ -205,72 +205,30 @@ def get_rolling_vector(df, window=ROLLING_WINDOW):
     return np.array(vectors)
 
 # ---------------- ML training ----------------
-def fit_ml(symbols, min_samples=200):
-    """
-    Збирає дані по symbols з klines_data (або з API) і тренує RandomForest.
-    Якщо мало позитивних прикладів — модель не тренується (залишиться None),
-    в такому випадку бот використовує патерни як fallback.
-    """
-    global ml_model, scaler, imputer
+def fit_ml(symbols):
     logger.info("[ML] Building training dataset...")
-    X_parts = []
-    y_parts = []
-    with ThreadPoolExecutor(max_workers=min(8, max(1, len(symbols)))) as ex:
-        futures = {ex.submit(fetch_klines, s, "1m", 1500): s for s in symbols}
-        for f in futures:
-            try:
-                _ = f.result()
-            except Exception as e:
-                logger.debug(f"prefetch error: {e}")
+    all_data, all_labels = [], []
 
     for s in symbols:
-        df = klines_data.get(s) or fetch_klines(s, "1m", 1500)
-        if df is None or len(df) < ROLLING_WINDOW + 2:
+        df = klines_data.get(s)
+        if df is None:
+            df = fetch_klines(s, "1m", 1500)
+        if df is None or len(df) < ROLLING_WINDOW:
             continue
-        df = extract_features(df)
-        vecs = get_rolling_vector(df, window=ROLLING_WINDOW)
-        # labels aligned with vecs: label for position i corresponds to df index i+window
-        future_ret = (df['close'].shift(-1) / df['close'] - 1).values
-        labels = future_ret[ROLLING_WINDOW:]
-        if len(vecs) == 0 or len(labels) == 0:
-            continue
-        min_len = min(len(vecs), len(labels))
-        X_parts.append(vecs[-min_len:])
-        y_parts.append(labels[-min_len:])
 
-    if not X_parts:
-        logger.warning("[ML] No training data collected.")
-        ml_model = None
-        return
+        dfs = {tf: extract_features(df.copy()) for tf in TIMEFRAMES}
+        vec = get_multi_tf_vector(dfs)
+        if vec is not None:
+            all_data.append(vec)
+            all_labels.append(1)  # placeholder labels (TODO: add real ones later)
 
-    X = np.vstack(X_parts)
-    y = np.hstack(y_parts)
-    y = (y > ATR_THRESHOLD).astype(int)
-
-    logger.info(f"[ML] Collected {X.shape[0]} samples | positive rate {np.mean(y):.4f}")
-
-    # require at least some positives
-    if len(np.unique(y)) < 2 or np.sum(y) < 5:
-        logger.warning("[ML] Not enough positive samples to train ML model. Will use pattern fallback.")
-        ml_model = None
-        return
-
-    # impute + scale
-    imputer.fit(X)
-    X_imputed = imputer.transform(X)
-    scaler.fit(X_imputed)
-    X_scaled = scaler.transform(X_imputed)
-
-    model = RandomForestClassifier(
-        n_estimators=300,
-        max_depth=12,
-        class_weight="balanced_subsample",
-        random_state=42,
-        n_jobs=-1,
-    )
-    model.fit(X_scaled, y)
-    ml_model = model
-    logger.info(f"[ML] Trained RandomForest on {X.shape[0]} samples")
+    if all_data:
+        X = np.vstack(all_data)
+        scaler.fit(X)
+        ml_model.fit(X, np.zeros(X.shape[0]))  # dummy labels
+        logger.info(f"[ML] Fitted on {X.shape[0]} samples with {X.shape[1]} features")
+    else:
+        logger.warning("[ML] No data to fit scaler/model!")
 
 # ---------------- detect (ML + fallback) ----------------
 def detect_with_patterns(df):
@@ -421,33 +379,39 @@ def analyze_symbol(symbol):
         logger.error(f"analyze_symbol error for {symbol}: {e}", exc_info=True)
 
 # ---------------- TOP SYMBOLS ----------------
-_last_top_update = None
+last_top_update = None
+
 def fetch_top_symbols(limit=10, cache_minutes=10):
-    global _last_top_update
-    if state.get("top_symbols") and _last_top_update:
-        if datetime.now(timezone.utc) - _last_top_update < timedelta(minutes=cache_minutes):
+    global last_top_update
+
+    if state.get("top_symbols") and last_top_update:
+        if datetime.now(timezone.utc) - last_top_update < timedelta(minutes=cache_minutes):
             return state["top_symbols"]
+
     try:
         tickers = binance_client.futures_ticker()
-        usdt_pairs = [t for t in tickers if t.get("symbol","").endswith("USDT")]
+        valid_symbols = {s["symbol"] for s in binance_client.futures_exchange_info()["symbols"]}
+        usdt_pairs = [t for t in tickers if t.get("symbol", "").endswith("USDT") and t["symbol"] in valid_symbols]
+
         scores = []
         for t in usdt_pairs:
             try:
                 change_pct = abs(float(t.get("priceChangePercent", 0)))
                 vol = float(t.get("quoteVolume", 0))
-                scores.append((t["symbol"], change_pct*0.6 + vol*0.4))
-            except Exception:
+                scores.append((t["symbol"], change_pct * 0.6 + vol * 0.4))
+            except:
                 continue
-        if not scores:
-            return ["BTCUSDT","ETHUSDT","BNBUSDT"]
-        sorted_symbols = [s[0] for s in sorted(scores, key=lambda x:x[1], reverse=True)[:limit]]
+
+        sorted_symbols = [s[0] for s in sorted(scores, key=lambda x: x[1], reverse=True)[:limit]]
         state["top_symbols"] = sorted_symbols
         save_json_safe(STATE_FILE, state)
-        _last_top_update = datetime.now(timezone.utc)
+        last_top_update = datetime.now(timezone.utc)
+
+        logger.info(f"[TOP] Selected symbols: {sorted_symbols}")
         return sorted_symbols
     except Exception as e:
-        logger.warning(f"Failed fetch_top_symbols: {e}")
-        return state.get("top_symbols") or ["BTCUSDT","ETHUSDT","BNBUSDT"]
+        logger.warning(f"fetch_top_symbols failed: {e}")
+        return state.get("top_symbols") or ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
 
 # ---------------- SCAN LOOP (periodic) ----------------
 def scan_all_symbols_once():
