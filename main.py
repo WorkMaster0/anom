@@ -4,7 +4,6 @@ import json
 import logging
 import re
 from datetime import datetime, timezone, timedelta
-from threading import Thread
 from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -27,9 +26,7 @@ logger = logging.getLogger("trade-bot")
 # ---------------- CONFIG ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
-PORT = int(os.getenv("PORT", "5000"))
 PARALLEL_WORKERS = int(os.getenv("PARALLEL_WORKERS", "6"))
-EMA_SCAN_LIMIT = 500
 STATE_FILE = "state.json"
 CONF_THRESHOLD_MEDIUM = 0.3
 
@@ -159,6 +156,7 @@ def detect_signal_pro(df: pd.DataFrame):
     votes = []
     confidence = 0.5
 
+    # signals
     if last["liquidity_grab_long"]: votes.append("liquidity_grab_long"); confidence += 0.08
     if last["liquidity_grab_short"]: votes.append("liquidity_grab_short"); confidence += 0.08
     if last["bull_trap"]: votes.append("bull_trap"); confidence += 0.05
@@ -210,6 +208,29 @@ def calculate_quality_score_pro(df, votes, confidence):
         elif p in weak_signals: score += 0.02
     return min(score, 1.0)
 
+# ---------------- PLOT ----------------
+def plot_signal_chart(df, symbol, entry, sl, action):
+    df_plot = df.tail(80).copy()
+    df_plot.index.name = "Date"
+    add_plots = [
+        mpf.make_addplot([entry]*len(df_plot), color="green", linestyle="--"),
+        mpf.make_addplot([sl]*len(df_plot), color="red", linestyle="--"),
+    ]
+    fig, ax = mpf.plot(
+        df_plot,
+        type="candle",
+        style="charles",
+        volume=True,
+        addplot=add_plots,
+        title=f"{symbol} | {action}",
+        returnfig=True
+    )
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    buf.seek(0)
+    plt.close(fig)
+    return buf.getvalue()
+
 # ---------------- BACKTEST ----------------
 def backtest_patterns():
     logger.info("=== BACKTEST STARTED ===")
@@ -218,8 +239,8 @@ def backtest_patterns():
     all_wins = 0
     all_trades = 0
 
-    end_time = datetime.utcnow()
-    start_time = end_time - timedelta(days=90)  # 3 місяці
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(days=90)
     interval = "15m"
     limit_per_call = 500
 
@@ -239,11 +260,9 @@ def backtest_patterns():
             all_trades +=1
             if win: all_wins +=1
 
-    # baseline
     baseline = all_wins / all_trades if all_trades>0 else 0.5
     logger.info("Baseline winrate across all trades: %.2f", baseline)
 
-    # статистика по паттернах
     combos = {}
     for r in results:
         key = r["votes"]
@@ -261,6 +280,15 @@ def backtest_patterns():
     df_stats = pd.DataFrame(stats).sort_values("winrate",ascending=False)
     df_stats.to_csv("patterns_stats.csv", index=False)
     logger.info("=== BACKTEST FINISHED ===")
+
+    # Send top5 to Telegram
+    if not df_stats.empty:
+        top5 = df_stats.head(5)
+        msg = "📊 Backtest Top 5 Patterns (3m, 15m TF):\n"
+        for _, row in top5.iterrows():
+            msg += f"- {row['pattern_combo'][:40]}... | WR={row['winrate']:.2f} | p={row['p_value']:.3f}\n"
+        send_telegram(msg)
+
     return df_stats
 
 # ---------------- LIVE BOT ----------------
@@ -278,8 +306,20 @@ def analyze_and_alert(symbol: str):
     MIN_SCORE = 0.65
     MIN_RR = 2.0
     if confidence>=MIN_CONFIDENCE and score>=MIN_SCORE and rr1>=MIN_RR:
-        msg = f"⚡ TRADE SIGNAL\nSymbol: {symbol}\nAction: {action}\nEntry: {entry:.6f}\nStop-Loss: {sl:.6f}\nConfidence: {confidence:.2f}\nQuality Score: {score:.2f}\nPatterns: {','.join(votes)}"
-        send_telegram(msg)
+        emoji = "🟢" if action=="LONG" else "🔴"
+        msg = (
+            f"⚡ TRADE SIGNAL {emoji}\n"
+            f"Symbol: {symbol}\n"
+            f"Direction: {action}\n"
+            f"Entry: {entry:.6f}\n"
+            f"Stop-Loss: {sl:.6f}\n"
+            f"Risk/Reward: {rr1:.2f}\n"
+            f"Confidence: {confidence:.2f}\n"
+            f"Quality Score: {score:.2f}\n"
+            f"Patterns: {', '.join(votes)}"
+        )
+        chart = plot_signal_chart(df, symbol, entry, sl, action)
+        send_telegram(msg, photo=chart)
 
 def scan_all_symbols():
     symbols = fetch_top_symbols(limit=30)
@@ -293,7 +333,6 @@ if __name__=="__main__":
     logger.info("Starting bot: Backtest + Live")
     df_stats = backtest_patterns()
     logger.info("Top combos:\n%s", df_stats.head(10))
-    # Live scanning loop
     while True:
         scan_all_symbols()
         time.sleep(15*60)  # 15m таймфрейм
