@@ -14,7 +14,7 @@ import mplfinance as mpf
 import numpy as np
 import io
 from binance.client import Client
-from scipy.stats import binom_test
+from scipy.stats import binomtest
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(
@@ -255,7 +255,7 @@ def backtest_patterns():
     stats = []
     for k,v in combos.items():
         wr = v["wins"]/v["trades"]
-        pval = binom_test(v["wins"], v["trades"], baseline)
+        pval = binomtest(v["wins"], v["trades"], baseline).pvalue
         stats.append({"pattern_combo":k,"trades":v["trades"],"winrate":wr,"baseline":baseline,"p_value":pval,"significance":pval<0.05})
 
     df_stats = pd.DataFrame(stats).sort_values("winrate",ascending=False)
