@@ -17,6 +17,7 @@ from binance.client import Client
 from scipy.stats import binomtest
 import http.server
 import socketserver
+from PIL import Image
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(
@@ -64,62 +65,36 @@ MARKDOWNV2_ESCAPE = r"_*[]()~`>#+-=|{}.!"
 def escape_md_v2(text: str) -> str:
     return re.sub(f"([{re.escape(MARKDOWNV2_ESCAPE)}])", r"\\\1", str(text))
 
-def send_telegram(text: str, photo=None, retries=3):
+def send_telegram(text: str, photo=None):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return
-
     try:
         if photo:
-            # Зменшуємо графік, якщо він великий
-            buf = io.BytesIO(photo)
-            buf.seek(0)
+            # Використовуємо PIL для сумісності ANTIALIAS
             try:
-                from PIL import Image
-                img = Image.open(buf)
-                max_size = (800, 600)
-                img.thumbnail(max_size, Image.ANTIALIAS)
-                buf2 = io.BytesIO()
-                img.save(buf2, format="PNG")
-                buf2.seek(0)
-                photo = buf2.getvalue()
+                img = Image.open(io.BytesIO(photo))
+                buf = io.BytesIO()
+                img.save(buf, format='PNG')
+                buf.seek(0)
+                files = {'photo': ('signal.png', buf, 'image/png')}
             except Exception as e:
                 logger.warning("PIL resize failed, sending original: %s", e)
+                files = {'photo': ('signal.png', photo, 'image/png')}
 
-            files = {'photo': ('signal.png', photo, 'image/png')}
             data = {'chat_id': CHAT_ID, 'caption': escape_md_v2(text), 'parse_mode': 'MarkdownV2'}
-            
-            for attempt in range(1, retries+1):
-                try:
-                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto", data=data, files=files, timeout=30)
-                    return
-                except requests.exceptions.ReadTimeout:
-                    logger.warning("Telegram sendPhoto timeout, attempt %d/%d", attempt, retries)
-                    time.sleep(2)
-                except Exception as e:
-                    logger.exception("Telegram sendPhoto error: %s", e)
-                    break
-
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto", data=data, files=files, timeout=15)
         else:
             payload = {"chat_id": CHAT_ID, "text": escape_md_v2(text), "parse_mode": "MarkdownV2"}
-            for attempt in range(1, retries+1):
-                try:
-                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=30)
-                    return
-                except requests.exceptions.ReadTimeout:
-                    logger.warning("Telegram sendMessage timeout, attempt %d/%d", attempt, retries)
-                    time.sleep(2)
-                except Exception as e:
-                    logger.exception("Telegram sendMessage error: %s", e)
-                    break
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=15)
     except Exception as e:
-        logger.exception("send_telegram unexpected error: %s", e)
+        logger.exception("send_telegram error: %s", e)
 
 # ---------------- FETCH / KLINES ----------------
 BINANCE_REST_URL = "https://fapi.binance.com/fapi/v1/klines"
 
 def fetch_klines_rest(symbol, interval="15m", limit=500):
     try:
-        resp = requests.get(BINANCE_REST_URL, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=5)
+        resp = requests.get(BINANCE_REST_URL, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=10)
         data = resp.json()
         df = pd.DataFrame(data, columns=[
             "open_time","open","high","low","close","volume",
@@ -154,6 +129,7 @@ def fetch_top_symbols(limit=30):
 # ---------------- FEATURE ENGINEERING ----------------
 def apply_pro_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    # Старі фічі
     df["support"] = df["low"].rolling(20).min()
     df["resistance"] = df["high"].rolling(20).max()
     df["vol_ma20"] = df["volume"].rolling(20).mean()
@@ -187,6 +163,33 @@ def apply_pro_features(df: pd.DataFrame) -> pd.DataFrame:
     df["combo_bullish"] = df["imbalance_up"] & df["vol_spike"] & df["trend_up"]
     df["combo_bearish"] = df["imbalance_down"] & df["vol_spike"] & df["trend_down"]
     df["accumulation_zone"] = (df["range"] < df["range"].rolling(20).mean() * 0.5) & (df["volume"] > df["vol_ma20"])
+
+    # ---------------- НОВІ ФІЧІ ----------------
+    # 1. Climax Spike
+    df["climax_spike"] = (df["volume"] > 3*df["vol_ma20"]) & (abs(df["body"]) > 1.5*df["range"])
+    # 2. False Break Reversal
+    df["false_break_reversal"] = ((df["high"] > df["resistance"]) & (df["close"] < df["resistance"])) | \
+                                 ((df["low"] < df["support"]) & (df["close"] > df["support"]))
+    # 3. Trend Exhaustion
+    df["trend_exhaustion"] = ((df["trend_up"] & (df["atr"] < df["atr"].rolling(14).mean())) | \
+                              (df["trend_down"] & (df["atr"] < df["atr"].rolling(14).mean())))
+    # 4. Volume Divergence
+    df["volume_divergence"] = ((df["close"].diff() > 0) & (df["volume"] < df["vol_ma20"])) | \
+                              ((df["close"].diff() < 0) & (df["volume"] < df["vol_ma20"]))
+    # 5. Long Wick Rejection
+    df["long_wick_rejection"] = ((df["upper_shadow"] > 2*abs(df["body"])) & (df["close"] < df["open"])) | \
+                                ((df["lower_shadow"] > 2*abs(df["body"])) & (df["close"] > df["open"]))
+    # 6. ATR Breakout
+    df["atr_breakout"] = (df["range"] > df["atr"].rolling(20).mean()*1.5)
+    # 7. Inside Bar
+    df["inside_bar"] = (df["high"] < df["high"].shift(1)) & (df["low"] > df["low"].shift(1))
+    # 8. Outside Bar
+    df["outside_bar"] = (df["high"] > df["high"].shift(1)) & (df["low"] < df["low"].shift(1))
+    # 9. Closing Momentum
+    df["closing_momentum"] = df["close"].diff() > df["close"].diff().rolling(5).mean()
+    # 10. Volume Spike Reversal
+    df["volume_spike_reversal"] = (df["vol_spike"] & ((df["body"] < 0) & df["trend_up"] | (df["body"] > 0) & df["trend_down"]))
+
     return df
 
 # ---------------- SIGNAL DETECTION ----------------
@@ -195,23 +198,31 @@ def detect_signal_pro(df: pd.DataFrame):
     votes = []
     confidence = 0.5
 
-    # signals
-    for signal, inc in [("liquidity_grab_long",0.08), ("liquidity_grab_short",0.08), ("bull_trap",0.05),
-                        ("bear_trap",0.05), ("false_break_high",0.05), ("false_break_low",0.05),
-                        ("volume_cluster",0.05), ("breakout_cont_long",0.07), ("breakout_cont_short",0.07),
-                        ("imbalance_up",0.05), ("imbalance_down",0.05), ("squeeze",0.03),
-                        ("trend_up",0.05), ("trend_down",0.05), ("long_lower_wick",0.04),
-                        ("long_upper_wick",0.04), ("retest_support",0.05), ("retest_resistance",0.05),
-                        ("delta_div_long",0.06), ("delta_div_short",0.06),
-                        ("combo_bullish",0.1), ("combo_bearish",0.1), ("accumulation_zone",0.03)]:
+    all_signals = [
+        ("liquidity_grab_long",0.08), ("liquidity_grab_short",0.08), ("bull_trap",0.05),
+        ("bear_trap",0.05), ("false_break_high",0.05), ("false_break_low",0.05),
+        ("volume_cluster",0.05), ("breakout_cont_long",0.07), ("breakout_cont_short",0.07),
+        ("imbalance_up",0.05), ("imbalance_down",0.05), ("squeeze",0.03),
+        ("trend_up",0.05), ("trend_down",0.05), ("long_lower_wick",0.04),
+        ("long_upper_wick",0.04), ("retest_support",0.05), ("retest_resistance",0.05),
+        ("delta_div_long",0.06), ("delta_div_short",0.06),
+        ("combo_bullish",0.1), ("combo_bearish",0.1), ("accumulation_zone",0.03),
+        # Нові сигнали
+        ("climax_spike",0.07), ("false_break_reversal",0.06), ("trend_exhaustion",0.05),
+        ("volume_divergence",0.05), ("long_wick_rejection",0.04),
+        ("atr_breakout",0.05), ("inside_bar",0.03), ("outside_bar",0.03),
+        ("closing_momentum",0.04), ("volume_spike_reversal",0.06)
+    ]
+
+    for signal, inc in all_signals:
         if last.get(signal, False):
             votes.append(signal)
             confidence += inc
 
     action = "WATCH"
-    if "combo_bullish" in votes or "breakout_cont_long" in votes or "delta_div_long" in votes:
+    if any(s in votes for s in ["combo_bullish","breakout_cont_long","delta_div_long","climax_spike","volume_spike_reversal"]):
         action = "LONG"
-    elif "combo_bearish" in votes or "breakout_cont_short" in votes or "delta_div_short" in votes:
+    elif any(s in votes for s in ["combo_bearish","breakout_cont_short","delta_div_short","trend_exhaustion","false_break_reversal"]):
         action = "SHORT"
     else:
         near_resistance = last["close"] >= last["resistance"] * 0.98
@@ -226,10 +237,12 @@ def detect_signal_pro(df: pd.DataFrame):
 def calculate_quality_score_pro(df, votes, confidence):
     score = confidence
     strong_signals = ["combo_bullish","combo_bearish","liquidity_grab_long","liquidity_grab_short",
-                      "delta_div_long","delta_div_short","breakout_cont_long","breakout_cont_short"]
+                      "delta_div_long","delta_div_short","breakout_cont_long","breakout_cont_short",
+                      "climax_spike","volume_spike_reversal","false_break_reversal","trend_exhaustion"]
     medium_signals = ["bull_trap","bear_trap","false_break_high","false_break_low",
-                      "volume_cluster","retest_support","retest_resistance"]
-    weak_signals = ["trend_up","trend_down","long_lower_wick","long_upper_wick","squeeze","accumulation_zone"]
+                      "volume_cluster","retest_support","retest_resistance","atr_breakout","closing_momentum"]
+    weak_signals = ["trend_up","trend_down","long_lower_wick","long_upper_wick","squeeze","accumulation_zone",
+                    "volume_divergence","long_wick_rejection","inside_bar","outside_bar"]
 
     for p in votes:
         if p in strong_signals: score += 0.1
@@ -310,7 +323,7 @@ def backtest_patterns():
     # Send top5 to Telegram
     if not df_stats.empty:
         top5 = df_stats.head(5)
-        msg = "📊 Backtest Top 5 Patterns (3m, 15m TF):\n"
+        msg = "📊 Backtest Top 5 Patterns (15m TF):\n"
         for _, row in top5.iterrows():
             msg += f"- {row['pattern_combo'][:40]}... | WR={row['winrate']:.2f} | p={row['p_value']:.3f}\n"
         send_telegram(msg)
