@@ -64,19 +64,55 @@ MARKDOWNV2_ESCAPE = r"_*[]()~`>#+-=|{}.!"
 def escape_md_v2(text: str) -> str:
     return re.sub(f"([{re.escape(MARKDOWNV2_ESCAPE)}])", r"\\\1", str(text))
 
-def send_telegram(text: str, photo=None):
+def send_telegram(text: str, photo=None, retries=3):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return
+
     try:
         if photo:
+            # Зменшуємо графік, якщо він великий
+            buf = io.BytesIO(photo)
+            buf.seek(0)
+            try:
+                from PIL import Image
+                img = Image.open(buf)
+                max_size = (800, 600)
+                img.thumbnail(max_size, Image.ANTIALIAS)
+                buf2 = io.BytesIO()
+                img.save(buf2, format="PNG")
+                buf2.seek(0)
+                photo = buf2.getvalue()
+            except Exception as e:
+                logger.warning("PIL resize failed, sending original: %s", e)
+
             files = {'photo': ('signal.png', photo, 'image/png')}
             data = {'chat_id': CHAT_ID, 'caption': escape_md_v2(text), 'parse_mode': 'MarkdownV2'}
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto", data=data, files=files, timeout=10)
+            
+            for attempt in range(1, retries+1):
+                try:
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto", data=data, files=files, timeout=30)
+                    return
+                except requests.exceptions.ReadTimeout:
+                    logger.warning("Telegram sendPhoto timeout, attempt %d/%d", attempt, retries)
+                    time.sleep(2)
+                except Exception as e:
+                    logger.exception("Telegram sendPhoto error: %s", e)
+                    break
+
         else:
             payload = {"chat_id": CHAT_ID, "text": escape_md_v2(text), "parse_mode": "MarkdownV2"}
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=10)
+            for attempt in range(1, retries+1):
+                try:
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=30)
+                    return
+                except requests.exceptions.ReadTimeout:
+                    logger.warning("Telegram sendMessage timeout, attempt %d/%d", attempt, retries)
+                    time.sleep(2)
+                except Exception as e:
+                    logger.exception("Telegram sendMessage error: %s", e)
+                    break
     except Exception as e:
-        logger.exception("send_telegram error: %s", e)
+        logger.exception("send_telegram unexpected error: %s", e)
 
 # ---------------- FETCH / KLINES ----------------
 BINANCE_REST_URL = "https://fapi.binance.com/fapi/v1/klines"
