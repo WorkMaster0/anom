@@ -3,6 +3,7 @@ import time
 import json
 import logging
 import re
+import threading
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
@@ -14,6 +15,8 @@ import numpy as np
 import io
 from binance.client import Client
 from scipy.stats import binomtest
+import http.server
+import socketserver
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(
@@ -155,30 +158,19 @@ def detect_signal_pro(df: pd.DataFrame):
     last = df.iloc[-1]
     votes = []
     confidence = 0.5
-    # сигнали
-    if last["liquidity_grab_long"]: votes.append("liquidity_grab_long"); confidence += 0.08
-    if last["liquidity_grab_short"]: votes.append("liquidity_grab_short"); confidence += 0.08
-    if last["bull_trap"]: votes.append("bull_trap"); confidence += 0.05
-    if last["bear_trap"]: votes.append("bear_trap"); confidence += 0.05
-    if last["false_break_high"]: votes.append("false_break_high"); confidence += 0.05
-    if last["false_break_low"]: votes.append("false_break_low"); confidence += 0.05
-    if last["volume_cluster"]: votes.append("volume_cluster"); confidence += 0.05
-    if last["breakout_cont_long"]: votes.append("breakout_cont_long"); confidence += 0.07
-    if last["breakout_cont_short"]: votes.append("breakout_cont_short"); confidence += 0.07
-    if last["imbalance_up"]: votes.append("imbalance_up"); confidence += 0.05
-    if last["imbalance_down"]: votes.append("imbalance_down"); confidence += 0.05
-    if last["squeeze"]: votes.append("volatility_squeeze"); confidence += 0.03
-    if last["trend_up"]: votes.append("trend_up"); confidence += 0.05
-    if last["trend_down"]: votes.append("trend_down"); confidence += 0.05
-    if last["long_lower_wick"]: votes.append("long_lower_wick"); confidence += 0.04
-    if last["long_upper_wick"]: votes.append("long_upper_wick"); confidence += 0.04
-    if last["retest_support"]: votes.append("retest_support"); confidence += 0.05
-    if last["retest_resistance"]: votes.append("retest_resistance"); confidence += 0.05
-    if last["delta_div_long"]: votes.append("delta_div_long"); confidence += 0.06
-    if last["delta_div_short"]: votes.append("delta_div_short"); confidence += 0.06
-    if last["combo_bullish"]: votes.append("combo_bullish"); confidence += 0.1
-    if last["combo_bearish"]: votes.append("combo_bearish"); confidence += 0.1
-    if last["accumulation_zone"]: votes.append("accumulation_zone"); confidence += 0.03
+
+    # signals
+    for signal, inc in [("liquidity_grab_long",0.08), ("liquidity_grab_short",0.08), ("bull_trap",0.05),
+                        ("bear_trap",0.05), ("false_break_high",0.05), ("false_break_low",0.05),
+                        ("volume_cluster",0.05), ("breakout_cont_long",0.07), ("breakout_cont_short",0.07),
+                        ("imbalance_up",0.05), ("imbalance_down",0.05), ("squeeze",0.03),
+                        ("trend_up",0.05), ("trend_down",0.05), ("long_lower_wick",0.04),
+                        ("long_upper_wick",0.04), ("retest_support",0.05), ("retest_resistance",0.05),
+                        ("delta_div_long",0.06), ("delta_div_short",0.06),
+                        ("combo_bullish",0.1), ("combo_bearish",0.1), ("accumulation_zone",0.03)]:
+        if last.get(signal, False):
+            votes.append(signal)
+            confidence += inc
 
     action = "WATCH"
     if "combo_bullish" in votes or "breakout_cont_long" in votes or "delta_div_long" in votes:
@@ -197,9 +189,11 @@ def detect_signal_pro(df: pd.DataFrame):
 # ---------------- QUALITY SCORE ----------------
 def calculate_quality_score_pro(df, votes, confidence):
     score = confidence
-    strong_signals = ["combo_bullish","combo_bearish","liquidity_grab_long","liquidity_grab_short","delta_div_long","delta_div_short","breakout_cont_long","breakout_cont_short"]
-    medium_signals = ["bull_trap","bear_trap","false_break_high","false_break_low","volume_cluster","retest_support","retest_resistance"]
-    weak_signals = ["trend_up","trend_down","long_lower_wick","long_upper_wick","volatility_squeeze","accumulation_zone"]
+    strong_signals = ["combo_bullish","combo_bearish","liquidity_grab_long","liquidity_grab_short",
+                      "delta_div_long","delta_div_short","breakout_cont_long","breakout_cont_short"]
+    medium_signals = ["bull_trap","bear_trap","false_break_high","false_break_low",
+                      "volume_cluster","retest_support","retest_resistance"]
+    weak_signals = ["trend_up","trend_down","long_lower_wick","long_upper_wick","squeeze","accumulation_zone"]
 
     for p in votes:
         if p in strong_signals: score += 0.1
@@ -230,38 +224,6 @@ def plot_signal_chart(df, symbol, entry, sl, action):
     plt.close(fig)
     return buf.getvalue()
 
-def plot_equity_curve(results):
-    equity = 0
-    curve = []
-    for r in results:
-        equity += 1 if r["win"] else -1
-        curve.append(equity)
-    plt.figure(figsize=(10,5))
-    plt.plot(curve, label="Equity")
-    plt.axhline(0, color="gray", linestyle="--")
-    plt.title("Equity Curve (Backtest)")
-    plt.xlabel("Trades")
-    plt.ylabel("PnL (units)")
-    plt.legend()
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png")
-    buf.seek(0)
-    plt.close()
-    return buf.getvalue()
-
-def plot_pattern_heatmap(df_stats):
-    pivot = df_stats.sort_values("winrate", ascending=False).head(15)
-    plt.figure(figsize=(8,5))
-    plt.barh(pivot["pattern_combo"], pivot["winrate"], color="steelblue")
-    plt.title("Top Pattern Winrates")
-    plt.xlabel("Winrate")
-    plt.tight_layout()
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png")
-    buf.seek(0)
-    plt.close()
-    return buf.getvalue()
-
 # ---------------- BACKTEST ----------------
 def backtest_patterns():
     logger.info("=== BACKTEST STARTED ===")
@@ -269,9 +231,11 @@ def backtest_patterns():
     results = []
     all_wins = 0
     all_trades = 0
+    interval = "15m"
+    limit_per_call = 500
 
     for symbol in symbols:
-        df = fetch_klines_rest(symbol, interval="15m", limit=1000)
+        df = fetch_klines_rest(symbol, interval=interval, limit=limit_per_call*2)
         if df is None or len(df) < 50:
             continue
         df = apply_pro_features(df)
@@ -282,7 +246,7 @@ def backtest_patterns():
             entry = last["support"]*1.001 if action=="LONG" else last["resistance"]*0.999
             sl = last["support"]*0.99 if action=="LONG" else last["resistance"]*1.01
             win = (last["close"] > entry) if action=="LONG" else (last["close"] < entry)
-            results.append({"symbol": symbol,"action":action,"votes":",".join(votes),"win":win,"df":df.iloc[:i+1]})
+            results.append({"symbol": symbol,"action":action,"votes":",".join(votes),"win":win})
             all_trades +=1
             if win: all_wins +=1
 
@@ -307,72 +271,45 @@ def backtest_patterns():
     df_stats.to_csv("patterns_stats.csv", index=False)
     logger.info("=== BACKTEST FINISHED ===")
 
+    # Send top5 to Telegram
     if not df_stats.empty:
-        # текст
         top5 = df_stats.head(5)
-        msg = f"📊 Backtest Summary (15m TF)\nTotal trades: {all_trades}\nBaseline WR: {baseline:.2f}\n\nTop 5 Patterns:\n"
+        msg = "📊 Backtest Top 5 Patterns (3m, 15m TF):\n"
         for _, row in top5.iterrows():
-            msg += f"- {row['pattern_combo'][:40]}... | WR={row['winrate']:.2f} | N={row['trades']}\n"
+            msg += f"- {row['pattern_combo'][:40]}... | WR={row['winrate']:.2f} | p={row['p_value']:.3f}\n"
         send_telegram(msg)
-
-        # equity
-        eq_img = plot_equity_curve(results)
-        send_telegram("📈 Equity Curve", photo=eq_img)
-
-        # heatmap
-        heatmap_img = plot_pattern_heatmap(df_stats)
-        send_telegram("🔥 Pattern Winrates Heatmap", photo=heatmap_img)
-
-        # приклади угод для топ патернів
-        for _, row in top5.iterrows():
-            example = next((r for r in results if r["votes"] == row["pattern_combo"]), None)
-            if example:
-                entry = example["df"].iloc[-1]["close"]
-                sl = example["df"].iloc[-1]["support"]*0.99 if example["action"]=="LONG" else example["df"].iloc[-1]["resistance"]*1.01
-                chart = plot_signal_chart(example["df"], example["symbol"], entry, sl, example["action"])
-                send_telegram(f"📌 Example trade for {row['pattern_combo']}", photo=chart)
 
     return df_stats
 
-# ---------------- LIVE ALERTS ----------------
-def analyze_and_alert(symbol):
-    df = fetch_klines_rest(symbol, interval="15m", limit=150)
-    if df is None or len(df) < 50:
-        return
+# ---------------- LIVE BOT ----------------
+def analyze_and_alert(symbol: str):
+    df = fetch_klines_rest(symbol, limit=200)
+    if df is None or len(df)<40: return
     df = apply_pro_features(df)
     action, votes, last, confidence = detect_signal_pro(df)
-    if action == "WATCH":
-        return
-    score = calculate_quality_score_pro(df, votes, confidence)
+    if action=="WATCH": return
     entry = last["support"]*1.001 if action=="LONG" else last["resistance"]*0.999
     sl = last["support"]*0.99 if action=="LONG" else last["resistance"]*1.01
-    rr1 = abs(last["close"]-entry)/abs(entry-sl) if sl!=entry else 0
-    MIN_CONFIDENCE = 0.3
+    score = calculate_quality_score_pro(df, votes, confidence)
+    rr1 = abs(last["resistance"]-entry)/(entry-sl) if action=="LONG" else abs(last["support"]-entry)/(sl-entry)
+    MIN_CONFIDENCE = CONF_THRESHOLD_MEDIUM
     MIN_SCORE = 0.65
-    MIN_RR = 1.5
-    if confidence < MIN_CONFIDENCE or score < MIN_SCORE or rr1 < MIN_RR:
-        return
-
-    key = f"{symbol}_{df.index[-1]}"
-    if state["signals"].get(key):
-        return
-    state["signals"][key] = {"time": str(datetime.now(timezone.utc)), "action": action}
-    save_json_safe(STATE_FILE, state)
-
-    emoji = "🟢" if action=="LONG" else "🔴"
-    msg = (
-        f"⚡ TRADE SIGNAL {emoji}\n"
-        f"Symbol: {symbol}\n"
-        f"Direction: {action}\n"
-        f"Entry: {entry:.6f}\n"
-        f"Stop-Loss: {sl:.6f}\n"
-        f"Risk/Reward: {rr1:.2f}\n"
-        f"Confidence: {confidence:.2f}\n"
-        f"Quality Score: {score:.2f}\n"
-        f"Patterns: {', '.join(votes)}"
-    )
-    chart = plot_signal_chart(df, symbol, entry, sl, action)
-    send_telegram(msg, photo=chart)
+    MIN_RR = 2.0
+    if confidence>=MIN_CONFIDENCE and score>=MIN_SCORE and rr1>=MIN_RR:
+        emoji = "🟢" if action=="LONG" else "🔴"
+        msg = (
+            f"⚡ TRADE SIGNAL {emoji}\n"
+            f"Symbol: {symbol}\n"
+            f"Direction: {action}\n"
+            f"Entry: {entry:.6f}\n"
+            f"Stop-Loss: {sl:.6f}\n"
+            f"Risk/Reward: {rr1:.2f}\n"
+            f"Confidence: {confidence:.2f}\n"
+            f"Quality Score: {score:.2f}\n"
+            f"Patterns: {', '.join(votes)}"
+        )
+        chart = plot_signal_chart(df, symbol, entry, sl, action)
+        send_telegram(msg, photo=chart)
 
 def scan_all_symbols():
     symbols = fetch_top_symbols(limit=30)
@@ -381,11 +318,25 @@ def scan_all_symbols():
     state["last_scan"]=str(datetime.now(timezone.utc))
     save_json_safe(STATE_FILE,state)
 
+# ---------------- HTTP SERVER ----------------
+def start_http():
+    port = int(os.environ.get("PORT", 5000))
+    Handler = http.server.SimpleHTTPRequestHandler
+    with socketserver.TCPServer(("", port), Handler) as httpd:
+        logger.info(f"HTTP server listening on port {port}")
+        httpd.serve_forever()
+
 # ---------------- MAIN ----------------
 if __name__=="__main__":
+    # Запускаємо веб-сервер у окремому потоці
+    threading.Thread(target=start_http, daemon=True).start()
+
+    # Бек-тест
     logger.info("Starting bot: Backtest + Live")
     df_stats = backtest_patterns()
     logger.info("Top combos:\n%s", df_stats.head(10))
+
+    # Live-цикл
     while True:
         scan_all_symbols()
         time.sleep(15*60)  # 15m таймфрейм
