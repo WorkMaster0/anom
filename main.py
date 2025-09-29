@@ -785,7 +785,7 @@ def analyze_and_alert(symbol: str):
         feat = [1 if name in votes_set else 0 for name in SIGNAL_NAMES_ORDER]
         prob = model.predict_proba([feat])[0][1]
         # soft threshold: require model probability reasonably > 0.5
-        if prob < 0.55:
+        if prob < 0.1:
             logger.info("ML filter blocked signal for %s (p=%.2f)", symbol, prob)
             return
     except Exception:
