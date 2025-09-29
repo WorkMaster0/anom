@@ -3,8 +3,7 @@ import time
 import json
 import logging
 import re
-import threading
-from datetime import datetime, timezone
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -15,8 +14,6 @@ import numpy as np
 import io
 from binance.client import Client
 from scipy.stats import binomtest
-import http.server
-import socketserver
 from PIL import Image
 
 # ---------------- LOGGING ----------------
@@ -70,16 +67,7 @@ def send_telegram(text: str, photo=None):
         return
     try:
         if photo:
-            try:
-                img = Image.open(io.BytesIO(photo))
-                buf = io.BytesIO()
-                img.save(buf, format='PNG')
-                buf.seek(0)
-                files = {'photo': ('signal.png', buf, 'image/png')}
-            except Exception as e:
-                logger.warning("PIL resize failed, sending original: %s", e)
-                files = {'photo': ('signal.png', photo, 'image/png')}
-
+            files = {'photo': ('signal.png', photo, 'image/png')}
             data = {'chat_id': CHAT_ID, 'caption': escape_md_v2(text), 'parse_mode': 'MarkdownV2'}
             requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto", data=data, files=files, timeout=15)
         else:
@@ -91,7 +79,7 @@ def send_telegram(text: str, photo=None):
 # ---------------- FETCH / KLINES ----------------
 BINANCE_REST_URL = "https://fapi.binance.com/fapi/v1/klines"
 
-def fetch_klines_rest(symbol, interval="3m", limit=500):
+def fetch_klines_rest(symbol, interval="3m", limit=2500):  # збільшено у 5 разів
     try:
         resp = requests.get(BINANCE_REST_URL, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=10)
         data = resp.json()
@@ -128,130 +116,60 @@ def fetch_top_symbols(limit=30):
 # ---------------- FEATURE ENGINEERING ----------------
 def apply_pro_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-
-    # Старі фічі
     df["support"] = df["low"].rolling(20).min()
     df["resistance"] = df["high"].rolling(20).max()
     df["vol_ma20"] = df["volume"].rolling(20).mean()
     df["vol_spike"] = df["volume"] > 1.5 * df["vol_ma20"]
-    df["volume_cluster"] = df["volume"] > 2 * df["vol_ma20"]
     df["body"] = df["close"] - df["open"]
     df["range"] = df["high"] - df["low"]
-    df["upper_shadow"] = df["high"] - df[["close", "open"]].max(axis=1)
-    df["lower_shadow"] = df[["close", "open"]].min(axis=1) - df["low"]
-    df["liquidity_grab_long"] = (df["low"] < df["support"]) & (df["close"] > df["support"])
-    df["liquidity_grab_short"] = (df["high"] > df["resistance"]) & (df["close"] < df["resistance"])
-    df["false_break_high"] = (df["high"] > df["resistance"]) & (df["close"] < df["resistance"])
-    df["false_break_low"] = (df["low"] < df["support"]) & (df["close"] > df["support"])
-    df["bull_trap"] = (df["close"] < df["open"]) & (df["high"] > df["resistance"])
-    df["bear_trap"] = (df["close"] > df["open"]) & (df["low"] < df["support"])
-    df["retest_support"] = abs(df["close"] - df["support"]) / df["support"] < 0.003
-    df["retest_resistance"] = abs(df["close"] - df["resistance"]) / df["resistance"] < 0.003
-    df["trend_ma"] = df["close"].rolling(20).mean()
-    df["trend_up"] = df["close"] > df["trend_ma"]
-    df["trend_down"] = df["close"] < df["trend_ma"]
-    df["long_lower_wick"] = df["lower_shadow"] > 2 * abs(df["body"])
-    df["long_upper_wick"] = df["upper_shadow"] > 2 * abs(df["body"])
-    df["imbalance_up"] = (df["body"] > 0) & (df["body"] > df["range"] * 0.6)
-    df["imbalance_down"] = (df["body"] < 0) & (abs(df["body"]) > df["range"] * 0.6)
     df["atr"] = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"], window=14).average_true_range()
-    df["squeeze"] = df["atr"] < df["atr"].rolling(50).mean() * 0.7
-    df["delta_div_long"] = (df["body"] > 0) & (df["volume"] < df["vol_ma20"])
-    df["delta_div_short"] = (df["body"] < 0) & (df["volume"] < df["vol_ma20"])
-    df["breakout_cont_long"] = (df["close"] > df["resistance"]) & (df["volume"] > df["vol_ma20"])
-    df["breakout_cont_short"] = (df["close"] < df["support"]) & (df["volume"] > df["vol_ma20"])
-    df["combo_bullish"] = df["imbalance_up"] & df["vol_spike"] & df["trend_up"]
-    df["combo_bearish"] = df["imbalance_down"] & df["vol_spike"] & df["trend_down"]
-    df["accumulation_zone"] = (df["range"] < df["range"].rolling(20).mean() * 0.5) & (df["volume"] > df["vol_ma20"])
-
-    # Нові фічі (10 попередніх)
-    df["climax_spike"] = (df["volume"] > 3*df["vol_ma20"]) & (abs(df["body"]) > 1.5*df["range"])
-    df["false_break_reversal"] = ((df["high"] > df["resistance"]) & (df["close"] < df["resistance"])) | \
-                                 ((df["low"] < df["support"]) & (df["close"] > df["support"]))
-    df["trend_exhaustion"] = ((df["trend_up"] & (df["atr"] < df["atr"].rolling(14).mean())) | \
-                              (df["trend_down"] & (df["atr"] < df["atr"].rolling(14).mean())))
-    df["volume_divergence"] = ((df["close"].diff() > 0) & (df["volume"] < df["vol_ma20"])) | \
-                              ((df["close"].diff() < 0) & (df["volume"] < df["vol_ma20"]))
-    df["long_wick_rejection"] = ((df["upper_shadow"] > 2*abs(df["body"])) & (df["close"] < df["open"])) | \
-                                ((df["lower_shadow"] > 2*abs(df["body"])) & (df["close"] > df["open"]))
-    df["atr_breakout"] = (df["range"] > df["atr"].rolling(20).mean()*1.5)
-    df["inside_bar"] = (df["high"] < df["high"].shift(1)) & (df["low"] > df["low"].shift(1))
-    df["outside_bar"] = (df["high"] > df["high"].shift(1)) & (df["low"] < df["low"].shift(1))
-    df["closing_momentum"] = df["close"].diff() > df["close"].diff().rolling(5).mean()
-    df["volume_spike_reversal"] = (df["vol_spike"] & ((df["body"] < 0) & df["trend_up"] | (df["body"] > 0) & df["trend_down"]))
-
-    # --- 6-а фіча: Power Reversal ---
-    df["power_reversal"] = ((df["body"] > 0) & (df["close"] > df["resistance"]) & df["vol_spike"]) | \
-                           ((df["body"] < 0) & (df["close"] < df["support"]) & df["vol_spike"])
-
     return df
 
 # ---------------- SIGNAL DETECTION ----------------
 def detect_signal_pro(df: pd.DataFrame):
     last = df.iloc[-1]
-    votes = []
     confidence = 0.5
-
-    all_signals = [
-        ("liquidity_grab_long",0.08), ("liquidity_grab_short",0.08), ("bull_trap",0.05),
-        ("bear_trap",0.05), ("false_break_high",0.05), ("false_break_low",0.05),
-        ("volume_cluster",0.05), ("breakout_cont_long",0.07), ("breakout_cont_short",0.07),
-        ("imbalance_up",0.05), ("imbalance_down",0.05), ("squeeze",0.03),
-        ("trend_up",0.05), ("trend_down",0.05), ("long_lower_wick",0.04),
-        ("long_upper_wick",0.04), ("retest_support",0.05), ("retest_resistance",0.05),
-        ("delta_div_long",0.06), ("delta_div_short",0.06),
-        ("combo_bullish",0.1), ("combo_bearish",0.1), ("accumulation_zone",0.03),
-        ("climax_spike",0.07), ("false_break_reversal",0.06), ("trend_exhaustion",0.05),
-        ("volume_divergence",0.05), ("long_wick_rejection",0.04),
-        ("atr_breakout",0.05), ("inside_bar",0.03), ("outside_bar",0.03),
-        ("closing_momentum",0.04), ("volume_spike_reversal",0.06),
-        ("power_reversal",0.12)  # нова фіча-сигнал
-    ]
-
-    for signal, inc in all_signals:
-        if last.get(signal, False):
-            votes.append(signal)
-            confidence += inc
-
     action = "WATCH"
-    if any(s in votes for s in ["combo_bullish","breakout_cont_long","delta_div_long","climax_spike","volume_spike_reversal","power_reversal"]):
+
+    if last["close"] > last["resistance"]:
         action = "LONG"
-    elif any(s in votes for s in ["combo_bearish","breakout_cont_short","delta_div_short","trend_exhaustion","false_break_reversal","power_reversal"]):
+        confidence += 0.3
+    elif last["close"] < last["support"]:
         action = "SHORT"
-    else:
-        near_resistance = last["close"] >= last["resistance"] * 0.98
-        near_support = last["close"] <= last["support"] * 1.02
-        if near_resistance: action = "SHORT"
-        elif near_support: action = "LONG"
+        confidence += 0.3
 
     confidence = max(0.0, min(1.0, confidence))
-    return action, votes, last, confidence
+    return action, ["basic"], last, confidence
+
+# ---------------- LEVELS ----------------
+def calculate_levels(last, action):
+    atr = last["atr"] if not pd.isna(last["atr"]) else (last["high"] - last["low"])
+    entry = last["close"]
+    if action == "LONG":
+        sl = last["support"]
+        tp = entry + 3.0 * atr
+    else:
+        sl = last["resistance"]
+        tp = entry - 3.0 * atr
+    return entry, sl, tp
 
 # ---------------- QUALITY SCORE ----------------
 def calculate_quality_score_pro(df, votes, confidence):
-    score = confidence
-    strong_signals = ["combo_bullish","combo_bearish","liquidity_grab_long","liquidity_grab_short",
-                      "delta_div_long","delta_div_short","breakout_cont_long","breakout_cont_short",
-                      "climax_spike","volume_spike_reversal","false_break_reversal","trend_exhaustion",
-                      "power_reversal"]
-    medium_signals = ["bull_trap","bear_trap","false_break_high","false_break_low",
-                      "volume_cluster","retest_support","retest_resistance","atr_breakout","closing_momentum"]
-    weak_signals = ["trend_up","trend_down","long_lower_wick","long_upper_wick","squeeze","accumulation_zone",
-                    "volume_divergence","long_wick_rejection","inside_bar","outside_bar"]
-
-    for p in votes:
-        if p in strong_signals: score += 0.1
-        elif p in medium_signals: score += 0.05
-        elif p in weak_signals: score += 0.02
-    return min(score, 1.0)
+    score = confidence + len(votes) * 0.05
+    if votes:
+        score = score / (1 + len(votes) / 3)
+    return max(0.0, min(1.0, score))
 
 # ---------------- PLOT ----------------
-def plot_signal_chart(df, symbol, entry, sl, action):
-    df_plot = df.tail(80).copy()
+def plot_signal_chart(df, symbol, entry, sl, tp, action):
+    df_plot = df.tail(400).copy()
     df_plot.index.name = "Date"
     add_plots = [
         mpf.make_addplot([entry]*len(df_plot), color="green", linestyle="--"),
         mpf.make_addplot([sl]*len(df_plot), color="red", linestyle="--"),
+        mpf.make_addplot([tp]*len(df_plot), color="blue", linestyle="--"),
+        mpf.make_addplot(df_plot["support"], color="gray", linestyle=":"),
+        mpf.make_addplot(df_plot["resistance"], color="black", linestyle=":"),
     ]
     fig, ax = mpf.plot(
         df_plot,
@@ -268,53 +186,6 @@ def plot_signal_chart(df, symbol, entry, sl, action):
     plt.close(fig)
     return buf.getvalue()
 
-# ---------------- BACKTEST ----------------
-def backtest_patterns():
-    logger.info("=== BACKTEST STARTED ===")
-    symbols = fetch_top_symbols(limit=30)
-    results = []
-    all_wins = 0
-    all_trades = 0
-    interval = "3m"
-    limit_per_call = 500
-
-    for symbol in symbols:
-        df = fetch_klines_rest(symbol, interval=interval, limit=limit_per_call*2)
-        if df is None or len(df) < 50:
-            continue
-        df = apply_pro_features(df)
-        for i in range(20, len(df)):
-            sub_df = df.iloc[:i+1]
-            action, votes, last, confidence = detect_signal_pro(sub_df)
-            if action == "WATCH": continue
-            entry = last["support"]*1.001 if action=="LONG" else last["resistance"]*0.999
-            sl = last["support"]*0.99 if action=="LONG" else last["resistance"]*1.01
-            win = (last["close"] > entry) if action=="LONG" else (last["close"] < entry)
-            results.append({"symbol": symbol,"action":action,"votes":",".join(votes),"win":win})
-            all_trades +=1
-            if win: all_wins +=1
-
-    baseline = all_wins / all_trades if all_trades>0 else 0.5
-    logger.info("Baseline winrate across all trades: %.2f", baseline)
-
-    combos = {}
-    for r in results:
-        key = r["votes"]
-        if key not in combos: combos[key]={"wins":0,"total":0}
-        combos[key]["total"]+=1
-        if r["win"]: combos[key]["wins"]+=1
-
-    combo_stats = []
-    for k,v in combos.items():
-        if v["total"]<5: continue
-        winrate = v["wins"]/v["total"]
-        pval = binomtest(v["wins"],v["total"],baseline).pvalue
-        combo_stats.append({"pattern_combo":k,"trades":v["total"],"winrate":winrate,"baseline":baseline,"pval":pval,"significance":pval<0.05})
-    df_combo = pd.DataFrame(combo_stats).sort_values("winrate",ascending=False)
-    logger.info("=== BACKTEST FINISHED ===")
-    logger.info("Top combos:\n%s", df_combo.head(10))
-    df_combo.to_csv("patterns_stats.csv",index=False)
-
 # ---------------- LIVE ----------------
 def live_loop():
     logger.info("=== LIVE STARTED ===")
@@ -322,20 +193,20 @@ def live_loop():
         try:
             symbols = fetch_top_symbols(limit=30)
             def process_symbol(symbol):
-                df = fetch_klines_rest(symbol, "3m", limit=500)
+                df = fetch_klines_rest(symbol, "3m", limit=2500)
                 if df is None: return
                 df = apply_pro_features(df)
                 action, votes, last, confidence = detect_signal_pro(df)
                 quality = calculate_quality_score_pro(df, votes, confidence)
                 if action!="WATCH" and quality>=0.6:
-                    entry = last["close"]
-                    sl = last["support"]*0.99 if action=="LONG" else last["resistance"]*1.01
-                    chart = plot_signal_chart(df, symbol, entry, sl, action)
+                    entry, sl, tp = calculate_levels(last, action)
+                    chart = plot_signal_chart(df, symbol, entry, sl, tp, action)
                     msg = (
                         f"⚡ TRADE SIGNAL\n"
                         f"Symbol: {symbol}\n"
                         f"Action: {action}\n"
-                        f"Entry: {entry:.6f}\n"
+                        f"Entry (Market): {entry:.6f}\n"
+                        f"Take-Profit: {tp:.6f}\n"
                         f"Stop-Loss: {sl:.6f}\n"
                         f"Confidence: {confidence:.2f}\n"
                         f"Quality Score: {quality:.2f}\n"
@@ -351,6 +222,5 @@ def live_loop():
 
 # ---------------- MAIN ----------------
 if __name__ == "__main__":
-    logger.info("Starting bot: Backtest + Live")
-    backtest_patterns()
+    logger.info("Starting bot in LIVE mode")
     live_loop()
