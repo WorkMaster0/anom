@@ -486,49 +486,29 @@ def calculate_quality_score_pro(df, votes, confidence):
     return score
 
 # ---------------- CALCULATE LEVELS (market entry + TP/SL) ----------------
-def calculate_levels(df, signal):
+def calculate_levels(last, signal):
     """
-    Комбінований підхід: Support/Resistance коли доступні,
-    fallback → ATR з RR >= 3.
+    Розрахунок TP/SL по останньому рядку (Series) та ATR/Support/Resistance
+    з RR >= 3.
     """
-    close = float(df["close"].iloc[-1])
-    atr = float(df["atr"].iloc[-1]) if "atr" in df and not pd.isna(df["atr"].iloc[-1]) else close * 0.005
+    close = float(last["close"])
+    atr = float(last["atr"]) if "atr" in last and not pd.isna(last["atr"]) else close * 0.005
 
-    # Витягуємо останні значення support/resistance
-    support = df["support"].iloc[-1] if "support" in df else None
-    resistance = df["resistance"].iloc[-1] if "resistance" in df else None
+    support = last.get("support", None)
+    resistance = last.get("resistance", None)
 
     if signal == "LONG":
-        # --- Stop Loss ---
-        if support and not pd.isna(support):
-            stop = float(support) * 0.995
-        else:
-            stop = close - atr
-
-        # --- Take Profit ---
-        if resistance and not pd.isna(resistance):
-            tp = float(resistance) * 0.999
-            # Якщо TP занадто близько → використовуємо ATR з RR=3
-            if (tp - close) < 3 * (close - stop):
-                tp = close + (close - stop) * 3
-        else:
-            tp = close + (close - stop) * 3
+        stop = float(support)*0.995 if support not in [None, np.nan] else close - atr
+        tp = float(resistance)*0.999 if resistance not in [None, np.nan] else close + (close - stop)*3
+        # Гарантія RR >= 3
+        if (tp - close) < 3*(close - stop):
+            tp = close + (close - stop)*3
 
     elif signal == "SHORT":
-        # --- Stop Loss ---
-        if resistance and not pd.isna(resistance):
-            stop = float(resistance) * 1.005
-        else:
-            stop = close + atr
-
-        # --- Take Profit ---
-        if support and not pd.isna(support):
-            tp = float(support) * 1.001
-            if (close - tp) < 3 * (stop - close):
-                tp = close - (stop - close) * 3
-        else:
-            tp = close - (stop - close) * 3
-
+        stop = float(resistance)*1.005 if resistance not in [None, np.nan] else close + atr
+        tp = float(support)*1.001 if support not in [None, np.nan] else close - (stop - close)*3
+        if (close - tp) < 3*(stop - close):
+            tp = close - (stop - close)*3
     else:
         return None, None, None
 
