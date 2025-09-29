@@ -34,8 +34,8 @@ CHAT_ID = os.getenv("CHAT_ID", "")
 PORT = int(os.getenv("PORT", "5000"))
 PARALLEL_WORKERS = int(os.getenv("PARALLEL_WORKERS", "6"))
 STATE_FILE = "state.json"
-CONF_THRESHOLD_MEDIUM = 0.3
-MIN_SCORE_TO_ALERT = 0.60  # мінімальний quality score для надсилання
+CONF_THRESHOLD_MEDIUM = 0.01
+MIN_SCORE_TO_ALERT = 0.01  # мінімальний quality score для надсилання
 PLOT_CANDLES = 400  # показувати стільки свічок на графіку
 
 # ---------------- BINANCE CLIENT ----------------
