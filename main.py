@@ -486,44 +486,54 @@ def calculate_quality_score_pro(df, votes, confidence):
     return score
 
 # ---------------- CALCULATE LEVELS (market entry + TP/SL) ----------------
-def calculate_levels(last, action):
+def calculate_levels(df, signal):
     """
-    Market entry (last close). TP/SL базуються на support/resistance коли доступні,
-    інакше на ATR (1.5 для SL, 3.0 для TP).
+    Комбінований підхід: Support/Resistance коли доступні,
+    fallback → ATR з RR >= 3.
     """
-    entry = float(last["close"])
-    atr = float(last["atr"]) if not pd.isna(last.get("atr", np.nan)) else float(last["high"] - last["low"])
+    close = float(df["close"].iloc[-1])
+    atr = float(df["atr"].iloc[-1]) if "atr" in df and not pd.isna(df["atr"].iloc[-1]) else close * 0.005
 
-    if action == "LONG":
-        # SL на support (з невеликим buffer), TP на resistance або ATR multiple
-        if not pd.isna(last.get("support", np.nan)) and last.get("support", None) not in [None, np.nan]:
-            sl = float(last["support"]) * 0.995
-        else:
-            sl = entry - 1.5 * atr
-        if not pd.isna(last.get("resistance", np.nan)) and last.get("resistance", None) not in [None, np.nan]:
-            tp = float(last["resistance"]) * 0.999
-            # якщо TP дуже близько до entry — використати ATR
-            if (tp - entry) < 0.5 * atr:
-                tp = entry + 3.0 * atr
-        else:
-            tp = entry + 3.0 * atr
+    # Витягуємо останні значення support/resistance
+    support = df["support"].iloc[-1] if "support" in df else None
+    resistance = df["resistance"].iloc[-1] if "resistance" in df else None
 
-    elif action == "SHORT":
-        if not pd.isna(last.get("resistance", np.nan)) and last.get("resistance", None) not in [None, np.nan]:
-            sl = float(last["resistance"]) * 1.005
+    if signal == "LONG":
+        # --- Stop Loss ---
+        if support and not pd.isna(support):
+            stop = float(support) * 0.995
         else:
-            sl = entry + 1.5 * atr
-        if not pd.isna(last.get("support", np.nan)) and last.get("support", None) not in [None, np.nan]:
-            tp = float(last["support"]) * 1.001
-            if (entry - tp) < 0.5 * atr:
-                tp = entry - 3.0 * atr
+            stop = close - atr
+
+        # --- Take Profit ---
+        if resistance and not pd.isna(resistance):
+            tp = float(resistance) * 0.999
+            # Якщо TP занадто близько → використовуємо ATR з RR=3
+            if (tp - close) < 3 * (close - stop):
+                tp = close + (close - stop) * 3
         else:
-            tp = entry - 3.0 * atr
+            tp = close + (close - stop) * 3
+
+    elif signal == "SHORT":
+        # --- Stop Loss ---
+        if resistance and not pd.isna(resistance):
+            stop = float(resistance) * 1.005
+        else:
+            stop = close + atr
+
+        # --- Take Profit ---
+        if support and not pd.isna(support):
+            tp = float(support) * 1.001
+            if (close - tp) < 3 * (stop - close):
+                tp = close - (stop - close) * 3
+        else:
+            tp = close - (stop - close) * 3
+
     else:
-        sl = entry
-        tp = entry
+        return None, None, None
 
-    return entry, sl, tp
+    rr = abs((tp - close) / (close - stop)) if stop != close else 0
+    return tp, stop, rr
 
 # ---------------- PLOT (candles + support/resistance + global pattern shading) ----------------
 def plot_signal_chart(df, symbol, entry, sl, tp, action):
