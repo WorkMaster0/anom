@@ -486,171 +486,106 @@ def calculate_quality_score_pro(df, votes, confidence):
     return score
 
 # ---------------- CALCULATE LEVELS (market entry + TP/SL) ----------------
-def calculate_levels(last, signal):
-    """
-    Розрахунок TP/SL по останньому рядку (Series) та ATR/Support/Resistance
-    з RR >= 3.
-    """
-    close = float(last["close"])
-    atr = float(last["atr"]) if "atr" in last and not pd.isna(last["atr"]) else close * 0.005
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+import io
 
-    support = last.get("support", None)
-    resistance = last.get("resistance", None)
+
+def calculate_levels(df, signal, rr_target=3.0, lookback=50):
+    """
+    Розрахунок TP/SL з мінімальним RR, під останні свічки, для будь-яких цін.
+    """
+    if df is None or len(df) < 5:
+        return None, None, None
+
+    close = df["close"].iloc[-1]
+
+    # ATR: або беремо з df, або рахуємо самі
+    if "atr" in df and not pd.isna(df["atr"].iloc[-1]):
+        atr = df["atr"].iloc[-1]
+    else:
+        atr = (df["high"].iloc[-lookback:] - df["low"].iloc[-lookback:]).mean()
+        if atr == 0 or np.isnan(atr):
+            atr = close * 0.005  # fallback: 0.5% від ціни
+
+    entry = close
+    max_move = close * 0.5  # обмеження ±50% від ціни
 
     if signal == "LONG":
-        stop = float(support)*0.995 if support not in [None, np.nan] else close - atr
-        tp = float(resistance)*0.999 if resistance not in [None, np.nan] else close + (close - stop)*3
-        # Гарантія RR >= 3
-        if (tp - close) < 3*(close - stop):
-            tp = close + (close - stop)*3
-
+        stop = max(entry - atr, entry - max_move)
+        target = entry + (entry - stop) * rr_target
+        target = min(target, entry + max_move)
     elif signal == "SHORT":
-        stop = float(resistance)*1.005 if resistance not in [None, np.nan] else close + atr
-        tp = float(support)*1.001 if support not in [None, np.nan] else close - (stop - close)*3
-        if (close - tp) < 3*(stop - close):
-            tp = close - (stop - close)*3
+        stop = min(entry + atr, entry + max_move)
+        target = entry - (stop - entry) * rr_target
+        target = max(target, entry - max_move)
     else:
         return None, None, None
 
-    rr = abs((tp - close) / (close - stop)) if stop != close else 0
-    return tp, stop, rr
+    # fallback якщо занадто близько
+    if abs(target - entry) < atr * 0.5:
+        if signal == "LONG":
+            target = entry + atr * rr_target
+            stop = entry - atr
+        else:
+            target = entry - atr * rr_target
+            stop = entry + atr
 
-# ---------------- PLOT (candles + support/resistance + global pattern shading) ----------------
+    return entry, stop, target
+
+
 def plot_signal_chart(df, symbol, entry, sl, tp, action):
     """
-    Малюємо останні PLOT_CANDLES свічок, додаємо entry/sl/tp та підтримку/опір,
-    а також верх/низ трикутника чи каналу (приблизно).
-    Повертає байти PNG.
+    Малює простий графік ціни з Entry/SL/TP.
     """
-    df_plot = df.tail(PLOT_CANDLES).copy()
-    df_plot.index.name = "Date"
+    df = df.tail(300)
+    fig, ax = plt.subplots(figsize=(10, 5))
 
-    # horizontal series
-    support_series = pd.Series(df_plot["support"].values, index=df_plot.index)
-    resistance_series = pd.Series(df_plot["resistance"].values, index=df_plot.index)
+    ax.plot(df.index, df["close"], label="Close", color="blue")
 
-    addplots = [
-        mpf.make_addplot(support_series, panel=0, type='line', width=0.5, linestyle=':', alpha=0.6),
-        mpf.make_addplot(resistance_series, panel=0, type='line', width=0.5, linestyle=':', alpha=0.6)
-    ]
+    ax.axhline(entry, color="orange", linestyle="--", label=f"Entry {entry:.5f}")
+    ax.axhline(sl, color="red", linestyle="--", label=f"SL {sl:.5f}")
+    ax.axhline(tp, color="green", linestyle="--", label=f"TP {tp:.5f}")
 
-    entry_color = 'green' if action == "LONG" else 'red'
-    tp_color = 'blue'
-    sl_color = 'orange'
+    ax.set_title(f"{symbol} Signal {action}", fontsize=14)
+    ax.legend()
 
-    fig, axes = mpf.plot(
-        df_plot,
-        type='candle',
-        style='charles',
-        volume=True,
-        addplot=addplots,
-        title=f"{symbol} | {action}",
-        returnfig=True,
-        figsize=(14, 9),
-        tight_layout=True
-    )
-
-    # axes -> list: axes[0] main, axes[2] volume (differs by mpf version)
-    price_ax = axes[0] if isinstance(axes, (list, tuple)) else axes
-
-    # horizontal lines
-    price_ax.axhline(entry, color=entry_color, linestyle='--', linewidth=1.25, alpha=0.9, label='Entry')
-    price_ax.axhline(tp, color=tp_color, linestyle='--', linewidth=1.0, alpha=0.9, label='TP')
-    price_ax.axhline(sl, color=sl_color, linestyle='--', linewidth=1.0, alpha=0.9, label='SL')
-
-    # shading (risk area)
-    try:
-        if action == "LONG":
-            ymin = min(entry, sl)
-            ymax = max(entry, tp)
-            price_ax.axhspan(ymin, entry, color='red', alpha=0.07)   # risk zone
-            price_ax.axhspan(entry, ymax, color='green', alpha=0.05)  # reward zone
-        elif action == "SHORT":
-            ymin = min(tp, entry)
-            ymax = max(entry, sl)
-            price_ax.axhspan(ymin, entry, color='green', alpha=0.05)  # reward
-            price_ax.axhspan(entry, ymax, color='red', alpha=0.07)    # risk
-    except Exception as e:
-        logger.debug("Shading error: %s", e)
-
-    # draw triangle/channel approx (using polyfit on tail)
-    try:
-        if len(df_plot) >= 20:
-            sub = df_plot.tail(PLOT_CANDLES)
-            x = np.arange(len(sub))
-            highs = np.polyfit(x, sub["high"].values, 1)
-            lows = np.polyfit(x, sub["low"].values, 1)
-            top_vals = np.poly1d(highs)(x)
-            bottom_vals = np.poly1d(lows)(x)
-            price_ax.plot(sub.index, top_vals, linestyle='--', linewidth=1.0, alpha=0.7, label='Top pattern')
-            price_ax.plot(sub.index, bottom_vals, linestyle='--', linewidth=1.0, alpha=0.7, label='Bottom pattern')
-    except Exception as e:
-        logger.debug("Pattern drawing failed: %s", e)
-
-    # annotation: last price + time
-    last_time = df_plot.index[-1].strftime("%Y-%m-%d %H:%M")
-    last_price = df_plot["close"].iloc[-1]
-    price_ax.text(0.01, 0.98, f"{last_time}  Price: {last_price:.6f}", transform=price_ax.transAxes, fontsize=9,
-                  verticalalignment='top', bbox=dict(boxstyle="round", facecolor="white", alpha=0.6))
-
-    # tidy up legend
-    price_ax.legend(loc="upper right", fontsize=8)
-
-    buf = io.BytesIO()
-    fig.savefig(buf, format='png', bbox_inches="tight")
-    buf.seek(0)
-    plt.close(fig)
-    return buf.getvalue()
-
-# ---------------- VISUALIZATION ГЛОБАЛЬНИХ ПАТЕРНІВ (окрема функція) ----------------
-def plot_pattern_chart(df: pd.DataFrame, symbol: str, entry, sl, tp, action: str) -> bytes:
-    """
-    Малює глобальний патерн (останні PLOT_CANDLES) + лінії трикутника/каналу + entry/SL/TP.
-    Повертає байти PNG.
-    """
-    sub = df.tail(PLOT_CANDLES).copy()
-    plt.figure(figsize=(14, 8))
-    plt.plot(sub.index, sub["close"], label="Close", linewidth=1.0)
-
-    # Range lines (якщо боковик)
-    try:
-        if sub["high"].max() - sub["low"].min() < sub["atr"].mean() * 4:
-            h = sub["high"].max()
-            l = sub["low"].min()
-            plt.axhline(h, color="orange", linestyle="--", label="Range High")
-            plt.axhline(l, color="blue", linestyle="--", label="Range Low")
-
-        # Triangle regression lines
-        x = np.arange(len(sub))
-        highs = np.polyfit(x, sub["high"].values, 1)
-        lows = np.polyfit(x, sub["low"].values, 1)
-        top_line = np.poly1d(highs)(x)
-        bot_line = np.poly1d(lows)(x)
-        plt.plot(sub.index, top_line, "r--", label="Triangle Top")
-        plt.plot(sub.index, bot_line, "g--", label="Triangle Bottom")
-    except Exception as e:
-        logger.debug("plot_pattern_chart polyfit error: %s", e)
-
-    # Entry/SL/TP
-    plt.axhline(entry, color="gold", linestyle="--", label="Entry")
-    plt.axhline(sl, color="red", linestyle="--", label="SL")
-    plt.axhline(tp, color="green", linestyle="--", label="TP")
-
-    # annotate last candle
-    last_idx = sub.index[-1]
-    last_price = sub["close"].iloc[-1]
-    plt.scatter([last_idx], [last_price], color="black", s=20)
-    plt.text(last_idx, last_price, f"  {last_price:.6f}", va="bottom", fontsize=9)
-
-    plt.title(f"{symbol} | {action} | Global pattern ({PLOT_CANDLES} bars)")
-    plt.legend()
-    plt.tight_layout()
+    # масштаб ±10% від останньої ціни
+    last_price = df["close"].iloc[-1]
+    ax.set_ylim(last_price * 0.9, last_price * 1.1)
 
     buf = io.BytesIO()
     plt.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
     buf.seek(0)
-    plt.close()
-    return buf.getvalue()
+    return buf
+
+
+def plot_pattern_chart(df, symbol, entry, sl, tp, action):
+    """
+    Малює розширений графік із TP/SL та історією ціни.
+    """
+    df = df.tail(300)
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    ax.plot(df.index, df["close"], label="Close", color="black", linewidth=1)
+
+    ax.axhline(entry, color="orange", linestyle="--", label=f"Entry {entry:.5f}")
+    ax.axhline(sl, color="red", linestyle="--", label=f"SL {sl:.5f}")
+    ax.axhline(tp, color="green", linestyle="--", label=f"TP {tp:.5f}")
+
+    last_price = df["close"].iloc[-1]
+    ax.set_ylim(last_price * 0.8, last_price * 1.2)  # масштаб ±20%
+
+    ax.set_title(f"{symbol} {action} Signal", fontsize=14)
+    ax.legend()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
 
 # ---------------- BACKTEST (pattern stats + binomial test + ML prep) ----------------
 def backtest_patterns(limit_symbols=30):
@@ -754,15 +689,18 @@ def analyze_and_alert(symbol: str):
     df = fetch_klines_rest(symbol, interval="3m", limit=1000)
     if df is None or len(df) < 120:
         return
+
     df = apply_pro_features(df, symbol_for_multitf=symbol)
     action, votes, last, confidence = detect_signal_pro(df)
     if action == "WATCH":
         return
 
     score = calculate_quality_score_pro(df, votes, confidence)
-    entry, sl, tp = calculate_levels(last, action)
 
-    # risk/reward
+    # === Виклик нової calculate_levels ===
+    entry, sl, tp = calculate_levels(df, action)
+
+    # Risk/Reward
     rr = None
     try:
         if action == "LONG":
@@ -772,26 +710,26 @@ def analyze_and_alert(symbol: str):
     except Exception:
         rr = None
 
-    # Filters to avoid spam: confidence threshold & score threshold, and RR >= 3.0
+    # === Фільтри (Confidence, Score, RR ≥ 3) ===
     if not (confidence >= CONF_THRESHOLD_MEDIUM and score >= MIN_SCORE_TO_ALERT and (rr is None or rr >= 3.0)):
         logger.debug("Filtered out signal %s (conf=%.3f score=%.3f rr=%s)", symbol, confidence, score, rr)
         return
 
-    # ML filter (if model exists)
+    # === ML filter (якщо хочеш, можеш зменшити поріг тут) ===
     try:
         import joblib
         model = joblib.load("pattern_model.pkl")
         votes_set = set(votes)
         feat = [1 if name in votes_set else 0 for name in SIGNAL_NAMES_ORDER]
         prob = model.predict_proba([feat])[0][1]
-        # soft threshold: require model probability reasonably > 0.5
-        if prob < 0.03:
+
+        if prob < 0.3:  # було 0.55 → тепер м’якший поріг
             logger.info("ML filter blocked signal for %s (p=%.2f)", symbol, prob)
             return
     except Exception:
-        # no model or failed load -> continue
         pass
 
+    # === Повідомлення у Telegram ===
     emoji = "🟢" if action == "LONG" else "🔴"
     msg = (
         f"⚡ TRADE SIGNAL {emoji}\n"
@@ -805,8 +743,9 @@ def analyze_and_alert(symbol: str):
         f"Quality Score: {score:.2f}\n"
         f"Patterns: {', '.join(votes)}"
     )
+
+    # === Побудова графіка ===
     try:
-        # choose pattern chart (global) for visualization
         chart = plot_pattern_chart(df, symbol, entry, sl, tp, action)
     except Exception as e:
         logger.exception("plotting failed for %s: %s", symbol, e)
@@ -818,7 +757,7 @@ def analyze_and_alert(symbol: str):
 
     send_telegram(msg, photo=chart)
 
-    # save to state
+    # === Збереження стану ===
     state.setdefault("signals", {})[symbol] = {
         "action": action,
         "entry": entry,
