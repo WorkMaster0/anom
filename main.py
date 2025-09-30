@@ -1,5 +1,6 @@
 import os
 import time
+import threading
 import numpy as np
 import pandas as pd
 import requests
@@ -7,9 +8,10 @@ from binance.client import Client
 from ta.trend import EMAIndicator, MACD, ADXIndicator
 from ta.momentum import RSIIndicator
 from dotenv import load_dotenv
+from flask import Flask, jsonify
 
 # ==========================
-#   ENV (Render / локально)
+#   ENV
 # ==========================
 load_dotenv()
 
@@ -21,7 +23,12 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 client = Client(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
 
 # ==========================
-#   Telegram відправка
+#   Flask app
+# ==========================
+app = Flask(__name__)
+
+# ==========================
+#   Telegram
 # ==========================
 
 def send_telegram_message(text: str):
@@ -33,11 +40,10 @@ def send_telegram_message(text: str):
         print("❌ Помилка Telegram:", e)
 
 # ==========================
-#   Завантаження даних
+#   Binance дані
 # ==========================
 
 def fetch_klines(symbol="BTCUSDT", interval="1h", limit=200):
-    """Отримуємо свічки з Binance"""
     klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
     df = pd.DataFrame(klines, columns=[
         "timestamp", "open", "high", "low", "close", "volume", "c1", "c2", "c3", "c4", "c5", "c6"
@@ -48,6 +54,14 @@ def fetch_klines(symbol="BTCUSDT", interval="1h", limit=200):
     df["close"] = df["close"].astype(float)
     df["volume"] = df["volume"].astype(float)
     return df
+
+def get_top_symbols(limit=10):
+    tickers = client.get_ticker()
+    df = pd.DataFrame(tickers)
+    df["quoteVolume"] = df["quoteVolume"].astype(float)
+    df = df[df["symbol"].str.endswith("USDT")]
+    df = df.sort_values("quoteVolume", ascending=False).head(limit)
+    return df["symbol"].tolist()
 
 # ==========================
 #   Індикатори
@@ -70,10 +84,10 @@ def add_indicators(df):
     adx = ADXIndicator(df["high"], df["low"], df["close"], window=14).adx()
     df["adx"] = adx
 
-    # Risk/Reward заглушка (тут можна реалізувати через ATR)
+    # Risk/Reward заглушка
     df["risk_reward"] = np.random.uniform(2, 5, len(df))
 
-    # Fake breakout та orderflow (заглушки)
+    # Orderflow заглушки
     df["fake_breakout_long"] = False
     df["fake_breakout_short"] = False
     df["funding_long"] = True
@@ -84,7 +98,7 @@ def add_indicators(df):
     return df
 
 # ==========================
-#   Команди-аналітики
+#   Команди
 # ==========================
 
 class StrategyTeam:
@@ -162,7 +176,7 @@ class Coordinator:
         return {"final_signal": "WATCH", "confidence": 0.0, "votes": results}
 
 # ==========================
-#   Аналіз і повідомлення
+#   Аналіз + Telegram
 # ==========================
 
 def analyze_and_alert(symbol="BTCUSDT", interval="1h"):
@@ -182,24 +196,42 @@ def analyze_and_alert(symbol="BTCUSDT", interval="1h"):
     print(text)
     send_telegram_message(text)
 
+    return decision
+
+def run_periodic_analysis():
+    while True:
+        symbols = get_top_symbols(10)
+        for sym in symbols:
+            analyze_and_alert(sym, "1h")
+            time.sleep(2)  # щоб не навантажувати API
+        time.sleep(300)  # повтор через 5 хвилин
+
+# ==========================
+#   Flask endpoints
+# ==========================
+
+@app.route("/")
+def home():
+    return "✅ Crypto Analyzer Bot працює!"
+
+@app.route("/analyze")
+def manual_analyze():
+    symbols = get_top_symbols(5)
+    results = {}
+    for sym in symbols:
+        decision = analyze_and_alert(sym, "1h")
+        results[sym] = decision
+    return jsonify(results)
+
 # ==========================
 #   Запуск
 # ==========================
 
 if __name__ == "__main__":
-    while True:
-        data = [{
-            "ema_cross_up": True,
-            "adx": 28,
-            "rsi_long": True,
-            "macd_long": True,
-            "fake_breakout_long": False,
-            "funding_long": True,
-            "oi_long": True,
-            "risk_reward": 3.5
-        }]
-        df = pd.DataFrame(data)
+    # Фоновий потік для періодичного аналізу
+    t = threading.Thread(target=run_periodic_analysis, daemon=True)
+    t.start()
 
-        analyze_and_alert(df, symbol="BTCUSDT", timeframe="1h")
-
-        time.sleep(300)
+    # Flask сервер
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
