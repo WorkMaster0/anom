@@ -85,6 +85,20 @@ def fetch_klines_rest(symbol, interval=INTERVAL, limit=FETCH_LIMIT):
         logger.debug("fetch_klines_rest error %s %s", symbol, e)
         return None
 
+def fetch_top_symbols(limit=30):
+    try:
+        r = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=10)
+        r.raise_for_status()
+        tickers = r.json()
+        usdt = [t for t in tickers if t["symbol"].endswith("USDT")]
+        sorted_pairs = sorted(usdt, key=lambda x: abs(float(x.get("priceChangePercent", 0))), reverse=True)
+        symbols = [d["symbol"] for d in sorted_pairs[:limit]]
+        logger.info("Fetched %d symbols: %s", len(symbols), symbols[:10])
+        return symbols
+    except Exception as e:
+        logger.warning("fetch_top_symbols REST failed: %s", e)
+        return []
+
 # ---------------- INDICATORS & FEATURES ----------------
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Adds EMA50, ATR, ADX (simple), volume MA, support/resistance and candle geometry."""
