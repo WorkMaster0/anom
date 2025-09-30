@@ -1,4 +1,5 @@
 import os
+import time
 import numpy as np
 import pandas as pd
 import requests
@@ -186,4 +187,19 @@ def analyze_and_alert(symbol="BTCUSDT", interval="1h"):
 # ==========================
 
 if __name__ == "__main__":
-    analyze_and_alert("BTCUSDT", "1h")
+    while True:
+        data = [{
+            "ema_cross_up": True,
+            "adx": 28,
+            "rsi_long": True,
+            "macd_long": True,
+            "fake_breakout_long": False,
+            "funding_long": True,
+            "oi_long": True,
+            "risk_reward": 3.5
+        }]
+        df = pd.DataFrame(data)
+
+        analyze_and_alert(df, symbol="BTCUSDT", timeframe="1h")
+
+        time.sleep(300)
