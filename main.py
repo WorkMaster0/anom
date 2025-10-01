@@ -1,213 +1,276 @@
 #!/usr/bin/env python3
+# crypto_profi_bot.py -- Profi signals bot 3.0
 import os
 import time
 import threading
 import logging
-from io import BytesIO
-import pandas as pd
+from typing import List, Dict, Any
 import numpy as np
-import matplotlib.pyplot as plt
+import pandas as pd
 import requests
-from flask import Flask, jsonify
+import matplotlib.pyplot as plt
+import io
+from flask import Flask, jsonify, send_file
 from dotenv import load_dotenv
 
 try:
     from binance.client import Client
-except ImportError:
+except:
     Client = None
 
 try:
-    from ta.trend import EMAIndicator, MACD, ADXIndicator
-    from ta.momentum import RSIIndicator
-except ImportError:
-    EMAIndicator = MACD = ADXIndicator = RSIIndicator = None
+    from ta.trend import EMAIndicator, MACD, ADXIndicator, SMAIndicator
+    from ta.momentum import RSIIndicator, StochasticOscillator, ROCIndicator
+    from ta.volatility import BollingerBands
+    from ta.volume import OnBalanceVolumeIndicator
+except:
+    EMAIndicator = MACD = ADXIndicator = RSIIndicator = StochasticOscillator = ROCIndicator = BollingerBands = OnBalanceVolumeIndicator = None
 
-# ----------------------
+# --------------------------
 # Load env
-# ----------------------
+# --------------------------
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
 
-CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "300"))
+CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "300"))  # 5 min
 TOP_N = 50
 KL_INTERVAL = "1h"
-KLINES_LIMIT = 200  # для графіків
+KLINES_LIMIT = 500
 
-# ----------------------
+# --------------------------
 # Logging
-# ----------------------
+# --------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("crypto-coordinator")
+logger = logging.getLogger("crypto-profi-bot")
 
-# ----------------------
+# --------------------------
 # Binance client
-# ----------------------
+# --------------------------
 binance_client = None
 if Client:
     try:
-        binance_client = Client(BINANCE_API_KEY or None, BINANCE_API_SECRET or None)
+        binance_client = Client(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
     except Exception as e:
-        logger.exception("Binance Client init failed: %s", e)
+        logger.exception("Binance client init failed: %s", e)
 
-# ----------------------
+# --------------------------
 # Flask app
-# ----------------------
+# --------------------------
 app = Flask(__name__)
 
-# ----------------------
-# Telegram helpers
-# ----------------------
-def send_telegram_message(text: str, img_bytes: BytesIO = None):
+# --------------------------
+# Telegram helper
+# --------------------------
+def send_telegram_message(text: str, chart_bytes: bytes = None):
     if not BOT_TOKEN or not CHAT_ID:
         logger.warning("Telegram not configured")
-        return None
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    photo_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-    if img_bytes:
-        files = {"photo": ("chart.png", img_bytes.getvalue())}
-        data = {"chat_id": CHAT_ID, "caption": text}
-        requests.post(photo_url, files=files, data=data)
         return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
-    requests.post(url, json=payload)
-
-# ----------------------
-# Binance helpers
-# ----------------------
-def get_top_symbols(limit: int = TOP_N):
     try:
-        tickers = binance_client.get_ticker()
-        df = pd.DataFrame(tickers)
-        df["quoteVolume"] = pd.to_numeric(df["quoteVolume"], errors="coerce").fillna(0.0)
-        df = df[df["symbol"].str.endswith("USDT")].sort_values("quoteVolume", ascending=False)
-        return df["symbol"].tolist()[:limit]
+        requests.post(url, json=payload, timeout=10)
+        if chart_bytes:
+            url2 = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+            files = {"photo": ("chart.png", chart_bytes)}
+            data = {"chat_id": CHAT_ID}
+            requests.post(url2, files=files, data=data, timeout=10)
+        logger.info("Telegram message sent")
     except Exception as e:
-        logger.exception("get_top_symbols failed: %s", e)
-        return ["BTCUSDT"]
+        logger.exception("Telegram send error: %s", e)
 
-def fetch_klines(symbol: str, interval: str = KL_INTERVAL, limit: int = KLINES_LIMIT):
+# --------------------------
+# Binance helpers
+# --------------------------
+def get_top_symbols(limit=TOP_N):
+    if not binance_client:
+        return ["BTCUSDT"]
+    tickers = binance_client.get_ticker()
+    df = pd.DataFrame(tickers)
+    if "quoteVolume" in df.columns:
+        df["quoteVolume"] = pd.to_numeric(df["quoteVolume"], errors="coerce").fillna(0)
+        df = df[df["symbol"].str.endswith("USDT")]
+        df = df.sort_values("quoteVolume", ascending=False).head(limit)
+        return df["symbol"].tolist()
+    return ["BTCUSDT"]
+
+def fetch_klines(symbol: str, interval=KL_INTERVAL, limit=KLINES_LIMIT):
+    if not binance_client:
+        raise RuntimeError("Binance client not initialized")
     raw = binance_client.get_klines(symbol=symbol, interval=interval, limit=limit)
     df = pd.DataFrame(raw, columns=[
-        "open_time","open","high","low","close","volume",
-        "close_time","quote_asset_volume","trades","tb_base","tb_quote","ignore"
+        "open_time","open","high","low","close","volume","close_time",
+        "quote_asset_volume","trades","tb_base","tb_quote","ignore"
     ])
-    for c in ["open","high","low","close","volume"]:
+    for c in ["open","high","low","close","volume","quote_asset_volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
     df.set_index("open_time", inplace=True)
     return df
 
-# ----------------------
-# Indicators
-# ----------------------
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+# --------------------------
+# Indicators & features
+# --------------------------
+def add_indicators(df: pd.DataFrame):
     df = df.copy()
-    n = len(df)
-    if EMAIndicator and n >= 26:
-        df["ema_fast"] = EMAIndicator(df["close"], 12).ema_indicator()
-        df["ema_slow"] = EMAIndicator(df["close"], 26).ema_indicator()
-        df["ema_cross_up"] = (df["ema_fast"] > df["ema_slow"]) & (df["ema_fast"].shift(1) <= df["ema_slow"].shift(1))
-        df["ema_cross_down"] = (df["ema_fast"] < df["ema_slow"]) & (df["ema_fast"].shift(1) >= df["ema_slow"].shift(1))
-    else:
-        df["ema_cross_up"] = df["ema_cross_down"] = False
-    if RSIIndicator and n >= 14:
-        df["rsi"] = RSIIndicator(df["close"], 14).rsi()
-        df["rsi_long"] = df["rsi"] < 30
-        df["rsi_short"] = df["rsi"] > 70
-    else:
-        df["rsi_long"] = df["rsi_short"] = False
-    if MACD and n >= 26:
-        macd = MACD(df["close"])
-        df["macd_long"] = macd.macd_diff() > 0
-        df["macd_short"] = macd.macd_diff() < 0
-    else:
-        df["macd_long"] = df["macd_short"] = False
-    if ADXIndicator and n >= 14:
-        df["adx"] = ADXIndicator(df["high"], df["low"], df["close"], 14).adx()
-    else:
-        df["adx"] = 0
+    try:
+        df["ema12"] = EMAIndicator(df["close"], window=12).ema_indicator()
+        df["ema26"] = EMAIndicator(df["close"], window=26).ema_indicator()
+        df["macd_diff"] = MACD(df["close"]).macd_diff()
+        df["rsi14"] = RSIIndicator(df["close"], window=14).rsi()
+        df["stoch"] = StochasticOscillator(df["high"], df["low"], df["close"]).stoch()
+        df["roc"] = ROCIndicator(df["close"]).roc()
+        df["adx"] = ADXIndicator(df["high"], df["low"], df["close"]).adx()
+        df["sma50"] = SMAIndicator(df["close"], window=50).sma_indicator()
+        df["boll_up"] = BollingerBands(df["close"]).bollinger_hband()
+        df["boll_dn"] = BollingerBands(df["close"]).bollinger_lband()
+        df["obv"] = OnBalanceVolumeIndicator(df["close"], df["volume"]).on_balance_volume()
+        df["atr14"] = df["high"].combine(df["low"], max) - df["low"].combine(df["close"].shift(1).abs(), max)
+        df["atr14"] = df["atr14"].rolling(14).mean().bfill()
+    except Exception as e:
+        logger.exception("Indicator calc failed: %s", e)
     return df
 
-# ----------------------
-# Strategy
-# ----------------------
-def analyze_df(df: pd.DataFrame):
-    last = df.iloc[-1]
-    patterns = []
-    signal = "WATCH"
-    if bool(last.get("ema_cross_up")) and last.get("adx",0)>25:
-        signal = "LONG"
-        patterns.append("ema_cross_up,adx>25")
-    elif bool(last.get("ema_cross_down")) and last.get("adx",0)>25:
-        signal = "SHORT"
-        patterns.append("ema_cross_down,adx>25")
-    elif bool(last.get("rsi_long")) and bool(last.get("macd_long")):
-        signal = "LONG"
-        patterns.append("rsi<30,macd_pos")
-    elif bool(last.get("rsi_short")) and bool(last.get("macd_short")):
-        signal = "SHORT"
-        patterns.append("rsi>70,macd_neg")
-    return signal, patterns
+# --------------------------
+# Strategy Teams
+# --------------------------
+class StrategyTeam:
+    def analyze(self, df: pd.DataFrame) -> Dict[str, Any]:
+        raise NotImplementedError
 
-# ----------------------
-# Plot
-# ----------------------
-def plot_chart(df: pd.DataFrame, symbol: str, signal: str):
-    plt.figure(figsize=(8,4))
-    plt.plot(df["close"], label="Close")
-    if signal=="LONG":
-        plt.scatter(df.index[-1:], df["close"].iloc[-1:], color="green", s=80, label="LONG")
-    elif signal=="SHORT":
-        plt.scatter(df.index[-1:], df["close"].iloc[-1:], color="red", s=80, label="SHORT")
-    plt.title(symbol)
-    plt.legend()
-    buf = BytesIO()
-    plt.savefig(buf, format="png")
-    plt.close()
-    buf.seek(0)
-    return buf
+class TrendTeam(StrategyTeam):
+    def analyze(self, df):
+        last = df.iloc[-1]
+        if last["ema12"] > last["ema26"] and last["adx"] > 25:
+            return {"signal": "LONG", "confidence": 0.75}
+        if last["ema12"] < last["ema26"] and last["adx"] > 25:
+            return {"signal": "SHORT", "confidence": 0.75}
+        return {"signal": "WATCH", "confidence": 0.25}
 
-# ----------------------
-# Analyze symbol and send Telegram
-# ----------------------
-def analyze_symbol(symbol: str):
+class MomentumTeam(StrategyTeam):
+    def analyze(self, df):
+        last = df.iloc[-1]
+        if last["rsi14"] < 30 and last["macd_diff"] > 0:
+            return {"signal": "LONG", "confidence": 0.6}
+        if last["rsi14"] > 70 and last["macd_diff"] < 0:
+            return {"signal": "SHORT", "confidence": 0.6}
+        return {"signal": "WATCH", "confidence": 0.25}
+
+class VolumeSpikeTeam(StrategyTeam):
+    def analyze(self, df):
+        last = df.iloc[-1]
+        vol_mean = df["volume"].rolling(20).mean().iloc[-1]
+        if last["volume"] > 2 * vol_mean:
+            return {"signal": "PUMP_ALERT", "confidence": 0.9}
+        return {"signal": "WATCH", "confidence": 0.25}
+
+# --------------------------
+# Coordinator
+# --------------------------
+class Coordinator:
+    def __init__(self, teams: List[StrategyTeam]):
+        self.teams = teams
+
+    def decide(self, df):
+        votes = []
+        for t in self.teams:
+            try:
+                r = t.analyze(df)
+            except:
+                r = {"signal": "WATCH", "confidence": 0}
+            votes.append(r)
+        final = {"LONG":0, "SHORT":0, "WATCH":0, "PUMP_ALERT":0}
+        for v in votes:
+            final[v["signal"]] += 1
+        # pick majority
+        if final["LONG"] >= 2:
+            return {"final_signal":"LONG", "votes":votes}
+        if final["SHORT"] >= 2:
+            return {"final_signal":"SHORT", "votes":votes}
+        if final["PUMP_ALERT"] >= 1:
+            return {"final_signal":"PUMP_ALERT", "votes":votes}
+        return {"final_signal":"WATCH", "votes":votes}
+
+# --------------------------
+# Analyze per-symbol
+# --------------------------
+def analyze_symbol(symbol):
     try:
         df = fetch_klines(symbol)
         df = add_indicators(df)
-        signal, patterns = analyze_df(df)
-        if signal in ["LONG","SHORT"]:
-            text = f"🚀 {symbol} -> {signal}\nКомбінації: {', '.join(patterns)}"
-            img = plot_chart(df, symbol, signal)
-            send_telegram_message(text, img_bytes=img)
-        logger.info("%s -> %s", symbol, signal)
     except Exception as e:
-        logger.exception("Error analyzing %s: %s", symbol, e)
+        logger.exception("Failed fetch/add_indicators %s: %s", symbol, e)
+        return {"symbol": symbol, "error": str(e)}
+    coord = Coordinator([TrendTeam(), MomentumTeam(), VolumeSpikeTeam()])
+    decision = coord.decide(df)
+    decision["symbol"] = symbol
+    decision["last_price"] = df["close"].iloc[-1]
+    return decision
 
-# ----------------------
-# Background thread
-# ----------------------
-def periodic_analysis():
+# --------------------------
+# Background analysis
+# --------------------------
+def run_periodic():
     while True:
         symbols = get_top_symbols()
-        for sym in symbols:
-            analyze_symbol(sym)
+        signals = []
+        for s in symbols:
+            d = analyze_symbol(s)
+            if d["final_signal"] != "WATCH":
+                signals.append(d)
+            time.sleep(0.2)
+        # send telegram
+        if signals:
+            msg = "⚡ Crypto Signals:\n"
+            for s in signals:
+                msg += f"{s['symbol']}: {s['final_signal']} price={s['last_price']:.4f}\n"
+            # make chart for first symbol
+            chart_bytes = make_chart(signals[0]["symbol"])
+            send_telegram_message(msg, chart_bytes)
         time.sleep(CYCLE_SECONDS)
 
-threading.Thread(target=periodic_analysis, daemon=True).start()
+# --------------------------
+# Chart helper
+# --------------------------
+def make_chart(symbol):
+    df = fetch_klines(symbol)
+    plt.figure(figsize=(8,4))
+    plt.plot(df["close"], label="Close")
+    plt.plot(EMAIndicator(df["close"], 12).ema_indicator(), label="EMA12")
+    plt.plot(EMAIndicator(df["close"], 26).ema_indicator(), label="EMA26")
+    plt.title(symbol)
+    plt.legend()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png")
+    buf.seek(0)
+    plt.close()
+    return buf.read()
 
-# ----------------------
-# Flask routes
-# ----------------------
+# --------------------------
+# Start background
+# --------------------------
+t = threading.Thread(target=run_periodic, daemon=True)
+t.start()
+
+# --------------------------
+# Flask endpoints
+# --------------------------
 @app.route("/")
-def index():
-    return jsonify({"status":"ok","message":"Crypto analyzer running"})
+def home():
+    return "✅ Crypto Profi Bot running"
 
-# ----------------------
-# Run app
-# ----------------------
-if __name__=="__main__":
-    port = int(os.getenv("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+@app.route("/analyze")
+def manual():
+    results = {}
+    symbols = get_top_symbols(limit=10)
+    for s in symbols:
+        results[s] = analyze_symbol(s)
+    return jsonify(results)
+
+# --------------------------
+# Run Flask if script
+# --------------------------
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
