@@ -1,320 +1,193 @@
 #!/usr/bin/env python3
-# main.py -- Web service + background periodic analyzer (Binance + Telegram)
+# insane_trade_bot_full.py
 
-import os
-import time
-import threading
-import logging
-from typing import List, Dict, Any
-import numpy as np
+import os, time, io, logging, threading, requests, json
+from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+
 import pandas as pd
-import requests
-from flask import Flask, jsonify
-from dotenv import load_dotenv
+import numpy as np
+import matplotlib.pyplot as plt
+import ta
+from binance.client import Client
+from PIL import Image
+from telegram import Bot
 
-# optional libs
-try:
-    from binance.client import Client
-except Exception:
-    Client = None
+# ---------------- LOGGING ----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("insane-bot")
 
-try:
-    from ta.trend import EMAIndicator, MACD, ADXIndicator
-    from ta.momentum import RSIIndicator
-except Exception:
-    EMAIndicator = MACD = ADXIndicator = RSIIndicator = None
+# ---------------- CONFIG ----------------
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+PARALLEL_WORKERS = int(os.getenv("PARALLEL_WORKERS", "6"))
+PLOT_CANDLES = int(os.getenv("PLOT_CANDLES", "300"))
+CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", "0.5"))
 
-# --------------------------
-# Load env
-# --------------------------
-load_dotenv()
+binance_client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+telegram_bot = Bot(token=TELEGRAM_TOKEN)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "").strip()
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
-
-CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "300"))   # default 5min
-TOP_N = int(os.getenv("TOP_N", "10"))
-KL_INTERVAL = os.getenv("KL_INTERVAL", "1h")
-KLINES_LIMIT = int(os.getenv("KLINES_LIMIT", "300"))
-
-# --------------------------
-# Logging
-# --------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
-logger = logging.getLogger("crypto-coordinator")
-
-# --------------------------
-# Binance client
-# --------------------------
-if Client is None:
-    logger.error("python-binance not installed")
-    binance_client = None
-else:
-    try:
-        binance_client = Client(api_key=BINANCE_API_KEY or None,
-                                api_secret=BINANCE_API_SECRET or None)
-    except Exception as e:
-        logger.exception("Binance init failed: %s", e)
-        binance_client = None
-
-# --------------------------
-# Flask
-# --------------------------
-app = Flask(__name__)
-
-# --------------------------
-# Telegram
-# --------------------------
-def send_telegram_message(text: str):
-    if not BOT_TOKEN or not CHAT_ID:
-        logger.warning("Telegram not configured")
-        return None
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text,
-               "parse_mode": "HTML", "disable_web_page_preview": True}
-    try:
-        resp = requests.post(url, json=payload, timeout=10)
-        j = resp.json()
-        if not resp.ok or not j.get("ok", False):
-            logger.warning("Telegram error: %s", j)
-        else:
-            logger.info("Telegram message sent")
-        return j
-    except Exception as e:
-        logger.exception("send_telegram_message: %s", e)
-        return None
-
-# --------------------------
-# Binance helpers
-# --------------------------
-def get_top_symbols(limit: int = TOP_N) -> List[str]:
-    if not binance_client:
-        return ["BTCUSDT"]
-    try:
-        tickers = binance_client.get_ticker()
-        df = pd.DataFrame(tickers)
-        if "quoteVolume" in df.columns:
-            df["quoteVolume"] = pd.to_numeric(df["quoteVolume"], errors="coerce").fillna(0.0)
-            df = df[df["symbol"].str.endswith("USDT")]
-            df = df.sort_values("quoteVolume", ascending=False).head(limit)
-            syms = df["symbol"].tolist()
-            logger.info("Top %d symbols: %s", len(syms), syms)
-            return syms
-        return [t["symbol"] for t in tickers if t.get("symbol", "").endswith("USDT")][:limit]
-    except Exception as e:
-        logger.exception("get_top_symbols error: %s", e)
-        return ["BTCUSDT"]
-
-def fetch_klines(symbol: str, interval: str = KL_INTERVAL, limit: int = KLINES_LIMIT) -> pd.DataFrame:
-    if not binance_client:
-        raise RuntimeError("Binance client not initialized")
-    raw = binance_client.get_klines(symbol=symbol, interval=interval, limit=limit)
-    df = pd.DataFrame(raw, columns=[
-        "open_time","open","high","low","close","volume",
-        "close_time","quote_asset_volume","trades","tb_base","tb_quote","ignore"
-    ])
-    for c in ["open","high","low","close","volume","quote_asset_volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-    df.set_index("open_time", inplace=True)
-    return df
-
-# --------------------------
-# Indicators
-# --------------------------
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    if EMAIndicator is None:
-        return df
-
-    n = len(df)
-    if n < 10:
-        return df  # too few candles
-
-    # EMA cross
-    df["ema_fast"] = EMAIndicator(df["close"], window=12).ema_indicator()
-    df["ema_slow"] = EMAIndicator(df["close"], window=26).ema_indicator()
-    df["ema_cross_up"] = (df["ema_fast"] > df["ema_slow"]) & (df["ema_fast"].shift(1) <= df["ema_slow"].shift(1))
-    df["ema_cross_down"] = (df["ema_fast"] < df["ema_slow"]) & (df["ema_fast"].shift(1) >= df["ema_slow"].shift(1))
-
-    # RSI
-    if n >= 14:
-        df["rsi"] = RSIIndicator(df["close"], window=14).rsi()
-        df["rsi_long"] = df["rsi"] < 35
-        df["rsi_short"] = df["rsi"] > 65
-    else:
-        df["rsi"] = np.nan
-        df["rsi_long"] = df["rsi_short"] = False
-
-    # MACD
-    if n >= 26:
-        macd = MACD(df["close"])
-        df["macd_diff"] = macd.macd_diff()
-        df["macd_long"] = df["macd_diff"] > 0
-        df["macd_short"] = df["macd_diff"] < 0
-    else:
-        df["macd_diff"] = np.nan
-        df["macd_long"] = df["macd_short"] = False
-
-    # ADX
-    if n >= 14:
+# ---------------- UTILS ----------------
+def send_telegram(msg: str, photo_bytes=None):
+    if photo_bytes:
         try:
-            df["adx"] = ADXIndicator(df["high"], df["low"], df["close"], window=14).adx()
-        except Exception:
-            df["adx"] = np.nan
-    else:
-        df["adx"] = np.nan
-
-    # ATR
-    df["tr1"] = df["high"] - df["low"]
-    df["tr2"] = (df["high"] - df["close"].shift(1)).abs()
-    df["tr3"] = (df["low"] - df["close"].shift(1)).abs()
-    df["true_range"] = df[["tr1","tr2","tr3"]].max(axis=1)
-    df["atr14"] = df["true_range"].rolling(14).mean().bfill()
-
-    return df
-
-# --------------------------
-# Teams
-# --------------------------
-class StrategyTeam:
-    def analyze(self, df: pd.DataFrame) -> Dict[str, Any]:
-        raise NotImplementedError
-
-class TrendTeam(StrategyTeam):
-    def analyze(self, df: pd.DataFrame):
-        last = df.iloc[-1]
-        if bool(last.get("ema_cross_up")):
-            return {"signal": "LONG", "patterns": ["ema_cross_up"]}
-        if bool(last.get("ema_cross_down")):
-            return {"signal": "SHORT", "patterns": ["ema_cross_down"]}
-        return {"signal": "WATCH", "patterns": []}
-
-class MomentumTeam(StrategyTeam):
-    def analyze(self, df: pd.DataFrame):
-        last = df.iloc[-1]
-        if bool(last.get("rsi_long")) and bool(last.get("macd_long")):
-            return {"signal": "LONG", "patterns": ["rsi<35","macd_pos"]}
-        if bool(last.get("rsi_short")) and bool(last.get("macd_short")):
-            return {"signal": "SHORT", "patterns": ["rsi>65","macd_neg"]}
-        return {"signal": "WATCH", "patterns": []}
-
-class RiskTeam(StrategyTeam):
-    def analyze(self, df: pd.DataFrame):
-        last = df.iloc[-1]
-        atr = float(last.get("atr14", np.nan))
-        if np.isnan(atr) or atr <= 0:
-            return {"signal": "PASS", "patterns": ["no_atr"]}
-        entry = float(last["close"])
-        sl = entry - 1.5 * atr
-        tp = entry + 3.0 * atr
-        rr = (tp - entry) / (entry - sl) if (entry - sl) != 0 else 0.0
-        return {"signal": "PASS", "patterns": [f"rr={rr:.2f}"], "rr": rr}
-
-# --------------------------
-# Coordinator
-# --------------------------
-class Coordinator:
-    def __init__(self, teams: List[StrategyTeam]):
-        self.teams = teams
-
-    def decide(self, df: pd.DataFrame) -> Dict[str, Any]:
-        results = []
-        for t in self.teams:
-            try:
-                results.append(t.analyze(df))
-            except Exception as e:
-                results.append({"signal": "WATCH", "patterns": ["error"]})
-        votes = [r for r in results if r["signal"] not in ("WATCH","PASS")]
-        if not votes:
-            return {"final_signal": "WATCH", "votes": results}
-        long_votes = [v for v in votes if v["signal"] == "LONG"]
-        short_votes = [v for v in votes if v["signal"] == "SHORT"]
-        if len(long_votes) >= 1 and len(long_votes) > len(short_votes):
-            return {"final_signal": "LONG", "votes": results}
-        if len(short_votes) >= 1 and len(short_votes) > len(long_votes):
-            return {"final_signal": "SHORT", "votes": results}
-        return {"final_signal": "WATCH", "votes": results}
-
-# --------------------------
-# Analyze symbol
-# --------------------------
-def analyze_symbol(symbol: str, interval: str = KL_INTERVAL) -> Dict[str, Any]:
-    try:
-        df = fetch_klines(symbol, interval=interval, limit=KLINES_LIMIT)
-        df = add_indicators(df)
-    except Exception as e:
-        logger.exception("analyze_symbol error for %s", symbol)
-        return {"symbol": symbol, "error": str(e)}
-    teams = [TrendTeam(), MomentumTeam(), RiskTeam()]
-    coord = Coordinator(teams)
-    decision = coord.decide(df)
-    decision["symbol"] = symbol
-    decision["last_price"] = float(df["close"].iloc[-1])
-    return decision
-
-# --------------------------
-# Periodic analyzer
-# --------------------------
-def run_periodic_analysis():
-    logger.info("Background analyzer started (cycle=%ds, top=%d)", CYCLE_SECONDS, TOP_N)
-    while True:
-        try:
-            symbols = get_top_symbols(TOP_N)
-            signals = []
-            for sym in symbols:
-                d = analyze_symbol(sym, KL_INTERVAL)
-                if d.get("final_signal") in ("LONG","SHORT"):
-                    signals.append(d)
-                logger.info("Analyzed %s -> %s", sym, d.get("final_signal"))
-                time.sleep(1)
-            if signals:
-                txt = f"⚡ Signals summary — {len(signals)} alerts\n"
-                for s in signals:
-                    txt += f"{s['symbol']}: {s['final_signal']} price={s['last_price']}\n"
-                send_telegram_message(txt)
-            else:
-                logger.info("No alerts this cycle")
+            telegram_bot.send_photo(chat_id=CHAT_ID, photo=photo_bytes, caption=msg)
         except Exception as e:
-            logger.exception("run_periodic_analysis loop error: %s", e)
-        time.sleep(CYCLE_SECONDS)
+            logger.exception("Telegram photo send failed: %s", e)
+    else:
+        try:
+            telegram_bot.send_message(chat_id=CHAT_ID, text=msg)
+        except Exception as e:
+            logger.exception("Telegram text send failed: %s", e)
 
-# --------------------------
-# Background thread
-# --------------------------
-def _start_bg_once():
-    if getattr(_start_bg_once, "started", False):
-        return
-    t = threading.Thread(target=run_periodic_analysis, daemon=True)
-    t.start()
-    _start_bg_once.started = True
-
-_start_bg_once()
-
-# --------------------------
-# Flask endpoints
-# --------------------------
-@app.route("/")
-def home():
-    return "✅ Crypto Coordinator running"
-
-@app.route("/analyze")
-def manual_analyze():
+def fetch_klines(symbol, interval="3m", limit=1000):
     try:
-        symbols = get_top_symbols(min(5, TOP_N))
-        results = {s: analyze_symbol(s, KL_INTERVAL) for s in symbols}
-        positive = [v for v in results.values() if v.get("final_signal") in ("LONG","SHORT")]
-        if positive:
-            txt = f"🔔 Manual run alerts ({len(positive)})\n"
-            for p in positive:
-                txt += f"{p['symbol']}: {p['final_signal']} price={p.get('last_price')}\n"
-            send_telegram_message(txt)
-        return jsonify(results)
+        data = binance_client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+        df = pd.DataFrame(data, columns=[
+            "open_time","open","high","low","close","volume",
+            "close_time","quote_asset_volume","trades",
+            "taker_buy_base","taker_buy_quote","ignore"
+        ])
+        df["open"] = df["open"].astype(float)
+        df["high"] = df["high"].astype(float)
+        df["low"] = df["low"].astype(float)
+        df["close"] = df["close"].astype(float)
+        df["volume"] = df["volume"].astype(float)
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+        df.set_index("open_time", inplace=True)
+        return df
     except Exception as e:
-        logger.exception("manual_analyze error")
-        return jsonify({"error": str(e)}), 500
+        logger.exception("fetch_klines failed for %s: %s", symbol, e)
+        return None
+
+# ---------------- ANALYST CLASSES ----------------
+class AnalystBase:
+    """Базовий аналітик"""
+    def analyze(self, df: pd.DataFrame):
+        return {"bias":"NEUTRAL","confidence":0.0,"reason":"Base"}
+
+class TrendAnalyst(AnalystBase):
+    """EMA + ADX"""
+    def analyze(self, df):
+        last = df.iloc[-1]
+        if last["ema20"] > last["ema50"] and last["adx"] > 25:
+            return {"bias":"LONG","confidence":0.8,"reason":"EMA20>EMA50 + ADX strong"}
+        elif last["ema20"] < last["ema50"] and last["adx"] > 25:
+            return {"bias":"SHORT","confidence":0.8,"reason":"EMA20<EMA50 + ADX strong"}
+        return {"bias":"NEUTRAL","confidence":0.0,"reason":"Trend flat"}
+
+class MomentumAnalyst(AnalystBase):
+    """RSI"""
+    def analyze(self, df):
+        last = df.iloc[-1]
+        if last["rsi"] < 30:
+            return {"bias":"LONG","confidence":0.7,"reason":"RSI oversold"}
+        elif last["rsi"] > 70:
+            return {"bias":"SHORT","confidence":0.7,"reason":"RSI overbought"}
+        return {"bias":"NEUTRAL","confidence":0.0,"reason":"Momentum neutral"}
+
+class VolumeAnalyst(AnalystBase):
+    """Volume spike"""
+    def analyze(self, df):
+        last = df.iloc[-1]
+        vol_avg = df["volume"].rolling(5).mean().iloc[-1]
+        if last["volume"] > 1.5*vol_avg:
+            return {"bias":"LONG","confidence":0.6,"reason":"Volume spike"}
+        return {"bias":"NEUTRAL","confidence":0.0,"reason":"Volume normal"}
+
+class FundingAnalyst(AnalystBase):
+    """Funding rate bias"""
+    def analyze(self, df, funding_rate=0.0):
+        if funding_rate > 0.01:
+            return {"bias":"LONG","confidence":0.5,"reason":"Positive funding bias"}
+        elif funding_rate < -0.01:
+            return {"bias":"SHORT","confidence":0.5,"reason":"Negative funding bias"}
+        return {"bias":"NEUTRAL","confidence":0.0,"reason":"Funding neutral"}
+
+# ---------------- FEATURE ENGINEERING ----------------
+def compute_features(df):
+    df["ema20"] = ta.trend.ema_indicator(df["close"], 20)
+    df["ema50"] = ta.trend.ema_indicator(df["close"], 50)
+    df["adx"] = ta.trend.adx(df["high"], df["low"], df["close"], 14)
+    df["rsi"] = ta.momentum.rsi(df["close"], 14)
+    df["atr"] = ta.volatility.average_true_range(df["high"], df["low"], df["close"], 14)
+    return df
+
+# ---------------- ENSEMBLE ----------------
+def ensemble(analyses):
+    long_conf = sum(a["confidence"] for a in analyses if a["bias"]=="LONG")
+    short_conf = sum(a["confidence"] for a in analyses if a["bias"]=="SHORT")
+    if long_conf>short_conf and long_conf>CONF_THRESHOLD:
+        return "LONG", long_conf, analyses
+    elif short_conf>long_conf and short_conf>CONF_THRESHOLD:
+        return "SHORT", short_conf, analyses
+    return "WATCH", 0.0, analyses
+
+# ---------------- PLOT ----------------
+def plot_chart(df, action):
+    last = df.iloc[-1]
+    entry = last["close"]
+    atr = last["atr"] if "atr" in df else 1
+    if action=="LONG":
+        sl = entry-1.5*atr; tp = entry+3*atr
+    elif action=="SHORT":
+        sl = entry+1.5*atr; tp = entry-3*atr
+    else:
+        sl=tp=entry
+
+    fig, ax = plt.subplots(figsize=(12,6))
+    ax.plot(df.index, df["close"], color="black", lw=1.2)
+    ax.axhline(entry,color="gold",ls="--",lw=1.2,label="Entry")
+    ax.axhline(sl,color="red",ls="--",lw=1,label="SL")
+    ax.axhline(tp,color="blue",ls="--",lw=1,label="TP")
+    ax.set_title(f"Action: {action} | Entry: {entry:.2f}")
+    ax.legend()
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png")
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+# ---------------- ANALYZE & SEND ----------------
+def analyze_symbol(symbol):
+    df = fetch_klines(symbol)
+    if df is None or len(df)<50:
+        return
+    df = compute_features(df)
+    try:
+        fr = float(binance_client.futures_funding_rate(symbol=symbol, limit=1)[0]["fundingRate"])
+    except: fr=0.0
+
+    analysts = [TrendAnalyst(), MomentumAnalyst(), VolumeAnalyst(), FundingAnalyst()]
+    analyses=[]
+    for a in analysts:
+        if isinstance(a, FundingAnalyst):
+            analyses.append(a.analyze(df, funding_rate=fr))
+        else:
+            analyses.append(a.analyze(df))
+    decision, conf, details = ensemble(analyses)
+    chart = plot_chart(df, decision)
+    msg = f"💥 Symbol: {symbol}\nDecision: {decision}\nConfidence: {conf:.2f}\nAnalyses:\n"
+    for d in details: msg+=f"- {d['bias']} ({d['confidence']:.2f}): {d['reason']}\n"
+    send_telegram(msg, chart)
+    logger.info(f"{symbol} analyzed: {decision}")
+
+# ---------------- SCAN ----------------
+def scan_symbols():
+    try:
+        tickers = [t["symbol"] for t in binance_client.futures_ticker() if t["symbol"].endswith("USDT")]
+        top_symbols = sorted(tickers, key=lambda s: abs(float(binance_client.futures_ticker(symbol=s)[0]["priceChangePercent"])), reverse=True)[:30]
+        with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as exe:
+            list(exe.map(analyze_symbol, top_symbols))
+    except Exception as e:
+        logger.exception("scan_symbols failed: %s", e)
+
+# ---------------- MAIN ----------------
+if __name__=="__main__":
+    while True:
+        scan_symbols()
+        time.sleep(3*60)
