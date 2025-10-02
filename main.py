@@ -1,235 +1,252 @@
-#!/usr/bin/env python3
-# mega_trade_bot.py
-
-import os
-import time
-import json
-import logging
-import re
-import threading
-import io
-from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor
-import pandas as pd
-import matplotlib.pyplot as plt
 import requests
-import ta
-import mplfinance as mpf
-import numpy as np
-from binance.client import Client
-from PIL import Image
+import telebot
+from flask import Flask, request
+from datetime import datetime
+import threading
+import time
 
-# ---------------- LOGGING ----------------
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s %(levelname)s %(message)s",
-                    handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()])
-logger = logging.getLogger("mega-trade-bot")
+# -------------------------
+# Налаштування
+# -------------------------
+API_KEY_TELEGRAM = "8051222216:AAFORHEn1IjWllQyPp8W_1OY3gVxcBNVvZI"
+CHAT_ID = "6053907025"
+TIMEFRAMES = ["5m", "15m", "1h", "4h"]
+N_CANDLES = 30
+FAST_EMA = 10
+SLOW_EMA = 30
 
-# ---------------- CONFIG (from ENV) ----------------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-CHAT_ID = os.getenv("CHAT_ID", "")
-PORT = int(os.getenv("PORT", "5000"))
-PARALLEL_WORKERS = int(os.getenv("PARALLEL_WORKERS", "6"))
-STATE_FILE = "state.json"
-CONF_THRESHOLD_MEDIUM = 0.01
-MIN_SCORE_TO_ALERT = 0.01
-PLOT_CANDLES = 300
+WEBHOOK_HOST = "https://troovy-detective-bot-1-4on4.onrender.com"
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = WEBHOOK_HOST + WEBHOOK_PATH
 
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+bot = telebot.TeleBot(API_KEY_TELEGRAM)
+app = Flask(__name__)
 
-binance_client = Client(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
+last_signals = {}   # останні сигнали по монетах
+last_status = {}    # останній стан по монетах
 
-# ---------------- STATE ----------------
-def load_json_safe(path, default):
-    try:
-        if os.path.exists(path):
-            with open(path, "r") as f:
-                return json.load(f)
-    except Exception as e:
-        logger.exception("load_json_safe error %s: %s", path, e)
-    return default
+# -------------------------
+# Топ монет по волатильності (% за 24h), мінімальний обсяг 1 млн USDT
+# -------------------------
+def get_top_symbols(min_volume=1_000_000):
+    url = "https://api.binance.com/api/v3/ticker/24hr"
+    data = requests.get(url, timeout=10).json()
+    usdt_pairs = [x for x in data if x["symbol"].endswith("USDT")]
+    filtered_pairs = [x for x in usdt_pairs if float(x["quoteVolume"]) >= min_volume]
+    sorted_pairs = sorted(filtered_pairs, key=lambda x: abs(float(x["priceChangePercent"])), reverse=True)
+    return [x["symbol"] for x in sorted_pairs]
 
-def save_json_safe(path, data):
-    try:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f, indent=2, default=str)
-        os.replace(tmp, path)
-    except Exception as e:
-        logger.exception("save_json_safe error %s: %s", path, e)
+# -------------------------
+# Історичні дані
+# -------------------------
+def get_historical_data(symbol, interval, limit=100):
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    response = requests.get(url, timeout=10)
+    response.raise_for_status()
+    data = response.json()
+    ohlc = []
+    for d in data:
+        timestamp = datetime.fromtimestamp(d[0] / 1000)
+        ohlc.append({
+            "time": timestamp,
+            "open": float(d[1]),
+            "high": float(d[2]),
+            "low": float(d[3]),
+            "close": float(d[4]),
+            "volume": float(d[5])
+        })
+    return ohlc
 
-state = load_json_safe(STATE_FILE, {"signals": {}, "last_scan": None})
+# -------------------------
+# EMA
+# -------------------------
+def calculate_ema(closes, period):
+    ema = closes[0]
+    k = 2 / (period + 1)
+    for price in closes[1:]:
+        ema = price * k + ema * (1 - k)
+    return ema
 
-# ---------------- TELEGRAM ----------------
-MARKDOWNV2_ESCAPE = r"_*[]()~`>#+-=|{}.!"
+# -------------------------
+# Аналіз сигналів (EMA + тренд + волатильність)
+# -------------------------
+def analyze_phase(ohlc):
+    closes = [c["close"] for c in ohlc][-N_CANDLES:]
+    highs = [c["high"] for c in ohlc][-N_CANDLES:]
+    lows = [c["low"] for c in ohlc][-N_CANDLES:]
+    volumes = [c["volume"] for c in ohlc][-N_CANDLES:]
 
-def escape_md_v2(text: str) -> str:
-    return re.sub(f"([{re.escape(MARKDOWNV2_ESCAPE)}])", r"\\\1", str(text))
+    last_close = closes[-1]
+    volatility = max(highs) - min(lows)
 
-def send_telegram(text: str, photo=None, tries=1):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        logger.debug("Telegram token / chat_id not set, skipping send.")
+    trend_up = closes[-2] < closes[-1]
+    trend_down = closes[-2] > closes[-1]
+
+    fast_ema = calculate_ema(closes[-FAST_EMA:], FAST_EMA)
+    slow_ema = calculate_ema(closes[-SLOW_EMA:], SLOW_EMA)
+
+    ema_confirm = None
+    if fast_ema > slow_ema:
+        ema_confirm = "BUY"
+    elif fast_ema < slow_ema:
+        ema_confirm = "SELL"
+
+    if trend_up and ema_confirm == "BUY":
+        return "BUY", volatility, True, ema_confirm, trend_up
+    elif trend_down and ema_confirm == "SELL":
+        return "SELL", volatility, True, ema_confirm, trend_down
+    else:
+        return "HOLD", volatility, False, ema_confirm, None
+
+# -------------------------
+# Відправка сигналу
+# -------------------------
+def send_signal(symbol, signal, price, max_volatility, confidence):
+    global last_signals
+    if signal == "HOLD":
         return
-    try:
-        if photo:
-            try:
-                img = Image.open(io.BytesIO(photo))
-                buf = io.BytesIO()
-                img.save(buf, format='PNG')
-                buf.seek(0)
-                files = {'photo': ('signal.png', buf, 'image/png')}
-            except Exception as e:
-                logger.warning("PIL failed, sending raw: %s", e)
-                files = {'photo': ('signal.png', photo, 'image/png')}
-            data = {'chat_id': CHAT_ID, 'caption': escape_md_v2(text), 'parse_mode': 'MarkdownV2'}
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto", data=data, files=files, timeout=15)
-        else:
-            payload = {"chat_id": CHAT_ID, "text": escape_md_v2(text), "parse_mode": "MarkdownV2"}
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=15)
-    except Exception as e:
-        logger.exception("send_telegram error: %s", e)
-        if tries > 0:
-            time.sleep(2)
-            send_telegram(text, photo=photo, tries=tries-1)
 
-# ---------------- FETCH / KLINES ----------------
-BINANCE_REST_URL = "https://fapi.binance.com/fapi/v1/klines"
+    total_tfs = len(TIMEFRAMES)
+    last_signals[symbol] = {
+        "signal": signal,
+        "price": price,
+        "tp": round(price + max_volatility * 0.5 if signal == "BUY" else price - max_volatility * 0.5, 4),
+        "sl": round(price - max_volatility * 0.3 if signal == "BUY" else price + max_volatility * 0.3, 4),
+        "confidence": confidence,
+        "time": datetime.now()
+    }
 
-def fetch_klines_rest(symbol, interval="3m", limit=1000):
-    try:
-        params = {"symbol": symbol, "interval": interval, "limit": limit}
-        resp = requests.get(BINANCE_REST_URL, params=params, timeout=12)
-        resp.raise_for_status()
-        data = resp.json()
-        df = pd.DataFrame(data, columns=[
-            "open_time","open","high","low","close","volume",
-            "close_time","quote_asset_volume","trades",
-            "taker_buy_base","taker_buy_quote","ignore"
-        ])
-        for col in ["open","high","low","close","volume"]:
-            df[col] = df[col].astype(float)
-        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-        df.set_index("open_time", inplace=True)
-        return df
-    except Exception as e:
-        logger.exception("REST fetch error for %s: %s", symbol, e)
-        return None
+    note = "✅ Підтверджено всіма ТФ" if confidence == total_tfs else f"⚠️ Лише {confidence}/{total_tfs} ТФ співпали"
+    msg = (
+        f"📢 {symbol}\nСигнал: {signal}\n💰 Ціна: {price}\n"
+        f"🎯 TP: {last_signals[symbol]['tp']}\n🛑 SL: {last_signals[symbol]['sl']}\n{note}"
+    )
+    bot.send_message(CHAT_ID, msg)
 
-def fetch_top_symbols(limit=30):
-    try:
-        tickers = binance_client.futures_ticker()
-        usdt_pairs = [t for t in tickers if t['symbol'].endswith("USDT")]
-        sorted_pairs = sorted(usdt_pairs, key=lambda x: abs(float(x.get("priceChangePercent",0))), reverse=True)
-        top_symbols = [d["symbol"] for d in sorted_pairs[:limit]]
-        return top_symbols
-    except Exception as e:
-        logger.exception("Error fetching top symbols: %s", e)
-        return []
+    with open("signals.log", "a") as f:
+        f.write(
+            f"{datetime.now()} | {symbol} | {signal} | {price} "
+            f"| TP: {last_signals[symbol]['tp']} | SL: {last_signals[symbol]['sl']} | {note}\n"
+        )
 
-# ---------------- FUNDING & OI ----------------
-def fetch_funding_rate(symbol):
-    try:
-        fr = binance_client.futures_funding_rate(symbol=symbol, limit=1)
-        return float(fr[0].get("fundingRate",0.0)) if fr else 0.0
-    except: return 0.0
-
-def fetch_open_interest(symbol):
-    try:
-        oi = binance_client.futures_open_interest(symbol=symbol)
-        return float(oi.get("openInterest",0.0))
-    except: return 0.0
-
-# ---------------- SIGNALS & FEATURES ----------------
-SIGNALS_WITH_WEIGHTS = [
-    ("pre_top_wick",0.08),("pre_bottom_wick",0.08),
-    ("pump_alert",0.1),("dump_alert",0.1),
-    ("pv_div_long",0.05),("pv_div_short",0.05),
-    ("funding_bias_long",0.06),("funding_bias_short",0.06),
-    ("oi_spike_long",0.06),("oi_spike_short",0.06),
-    ("ema_squeeze",0.04),("ema_breakout_long",0.08),("ema_breakout_short",0.08),
-    ("pre_pump_cluster",0.05),("pre_dump_cluster",0.05)
-]
-SIGNAL_NAMES_ORDER = [s for s,w in SIGNALS_WITH_WEIGHTS]
-
-# ---------------- APPLY ADVANCED FEATURES ----------------
-def apply_advanced_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["vol_ma20"] = df["volume"].rolling(20).mean()
-    df["body"] = df["close"] - df["open"]
-    df["range"] = df["high"] - df["low"]
-    df["upper_shadow"] = df["high"] - df[["close","open"]].max(axis=1)
-    df["lower_shadow"] = df[["close","open"]].min(axis=1) - df["low"]
-    df["trend_ma"] = df["close"].rolling(20).mean()
-    df["atr"] = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"], window=14).average_true_range()
-    # FUNDING / OI snapshots
-    df["funding_rate"] = fetch_funding_rate("BTCUSDT")
-    df["open_interest"] = fetch_open_interest("BTCUSDT")
-    # 15 new features
-    df["pre_top_wick"] = (df["upper_shadow"] > df["range"]*0.7) & (df["volume"] > 1.8*df["vol_ma20"])
-    df["pre_bottom_wick"] = (df["lower_shadow"] > df["range"]*0.7) & (df["volume"] < 0.8*df["vol_ma20"])
-    df["pump_alert"] = (df["volume"] > 2.5*df["vol_ma20"]) & (df["body"] > 0)
-    df["dump_alert"] = (df["volume"] > 2.5*df["vol_ma20"]) & (df["body"] < 0)
-    df["pv_div_long"] = (df["close"].diff() < 0) & (df["volume"].diff() > 0)
-    df["pv_div_short"] = (df["close"].diff() > 0) & (df["volume"].diff() > 0)
-    df["funding_bias_long"] = (df["funding_rate"] > 0.01) & (df["close"] > df["trend_ma"])
-    df["funding_bias_short"] = (df["funding_rate"] < -0.01) & (df["close"] < df["trend_ma"])
-    df["oi_spike_long"] = (df["open_interest"].diff() > df["open_interest"].rolling(20).mean()*0.5) & (df["body"] > 0)
-    df["oi_spike_short"] = (df["open_interest"].diff() > df["open_interest"].rolling(20).mean()*0.5) & (df["body"] < 0)
-    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
-    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
-    df["ema_squeeze"] = (df["ema20"].rolling(10).max() - df["ema20"].rolling(10).min()) < df["atr"].rolling(10).mean()*0.3
-    df["ema_breakout_long"] = (df["ema20"] > df["ema50"]) & df["ema_squeeze"]
-    df["ema_breakout_short"] = (df["ema20"] < df["ema50"]) & df["ema_squeeze"]
-    df["pre_pump_cluster"] = (df["close"].diff() > 0) & (df["close"].diff().shift(1) > 0) & (df["volume"] > df["vol_ma20"])
-    df["pre_dump_cluster"] = (df["close"].diff() < 0) & (df["close"].diff().shift(1) < 0) & (df["volume"] > df["vol_ma20"])
-    return df
-
-# ---------------- SIGNAL SCORE ----------------
-def compute_signal_score(df):
-    df = df.copy()
-    score = 0.0
-    for name, weight in SIGNALS_WITH_WEIGHTS:
-        if df[name].iloc[-1]:
-            score += weight
-    return score
-
-# ---------------- PLOT ----------------
-def plot_signal(df, symbol):
-    df_plot = df.tail(PLOT_CANDLES)
-    buf = io.BytesIO()
-    mpf.plot(df_plot, type="candle", style="charles", volume=True, mav=(20,50),
-             title=f"{symbol} Signal", savefig=dict(fname=buf, dpi=100))
-    buf.seek(0)
-    return buf.read()
-
-# ---------------- PROCESS SYMBOL ----------------
-def process_symbol(symbol):
-    df = fetch_klines_rest(symbol)
-    if df is None or df.empty:
-        return
-    df = apply_advanced_features(df)
-    score = compute_signal_score(df)
-    last_score = state["signals"].get(symbol, {}).get("score",0)
-    if score >= MIN_SCORE_TO_ALERT and score != last_score:
-        buf = plot_signal(df, symbol)
-        text = f"*{symbol}*\\nScore: {score:.2f}\\nSignals: " + ", ".join([n for n in SIGNAL_NAMES_ORDER if df[n].iloc[-1]])
-        send_telegram(text, photo=buf)
-        state["signals"][symbol] = {"score": score, "time": str(datetime.now(timezone.utc))}
-        save_json_safe(STATE_FILE, state)
-
-# ---------------- MAIN LOOP ----------------
-def main_loop():
+# -------------------------
+# Перевірка ринку
+# -------------------------
+def check_market():
+    global last_status
     while True:
-        top_symbols = fetch_top_symbols(limit=30)
-        logger.info("Scanning top symbols: %s", top_symbols)
-        with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as exe:
-            exe.map(process_symbol, top_symbols)
-        state["last_scan"] = str(datetime.now(timezone.utc))
-        save_json_safe(STATE_FILE, state)
-        time.sleep(180)  # scan every 3 minutes
+        try:
+            symbols = get_top_symbols()
+            for symbol in symbols:
+                signals, volatilities, last_prices, ema_confirms, trends = [], [], [], [], []
+                for tf in TIMEFRAMES:
+                    ohlc = get_historical_data(symbol, tf)
+                    signal, volatility, ema_ok, ema_signal, trend = analyze_phase(ohlc)
+                    signals.append(signal)
+                    volatilities.append(volatility)
+                    last_prices.append(ohlc[-1]["close"])
+                    ema_confirms.append(ema_ok)
+                    trends.append((ema_signal, trend))
 
+                buy_count = signals.count("BUY")
+                sell_count = signals.count("SELL")
+                total_tfs = len(TIMEFRAMES)
+
+                if len(set(signals)) == 1 and signals[0] != "HOLD":
+                    send_signal(symbol, signals[0], last_prices[-1], max(volatilities), total_tfs)
+                elif buy_count >= total_tfs - 1:
+                    send_signal(symbol, "BUY", last_prices[-1], max(volatilities), buy_count)
+                elif sell_count >= total_tfs - 1:
+                    send_signal(symbol, "SELL", last_prices[-1], max(volatilities), sell_count)
+
+                last_status[symbol] = {
+                    "signals": signals,
+                    "ema_confirms": ema_confirms,
+                    "trends": trends,
+                    "timeframes": TIMEFRAMES,
+                    "last_prices": last_prices,
+                    "volatilities": volatilities
+                }
+
+                time.sleep(0.5)
+
+        except Exception as e:
+            print(f"{datetime.now()} - Помилка: {e}")
+            with open("errors.log", "a") as f:
+                f.write(f"{datetime.now()} - {e}\n")
+        time.sleep(10)
+
+# -------------------------
+# Вебхук Telegram
+# -------------------------
+@app.route(WEBHOOK_PATH, methods=["POST"])
+def webhook():
+    global last_status
+    json_str = request.get_data().decode("utf-8")
+    update = telebot.types.Update.de_json(json_str)
+    bot.process_new_updates([update])
+
+    message_obj = update.message or update.edited_message
+    if not message_obj:
+        return "!", 200
+
+    text = message_obj.text.strip()
+
+    if text.startswith("/status"):
+        args = text.split()
+        if len(args) == 2:
+            symbol = args[1].upper()
+            if symbol in last_status:
+                s = last_status[symbol]
+                out = f"📊 {symbol}:\n"
+                buy_count = sell_count = 0
+                for i, tf in enumerate(s["timeframes"]):
+                    sig = s["signals"][i]
+                    ema_signal = s["trends"][i][0]
+                    trend = s["trends"][i][1]
+                    price = s["last_prices"][i]
+                    vol = s["volatilities"][i]
+                    out += f"{tf}: {sig}, EMA {ema_signal}, Тренд {'UP' if trend else 'DOWN' if trend == False else '—'}, Ціна {price}, Волатильність {vol:.2f}\n"
+                    if sig == "BUY": buy_count += 1
+                    elif sig == "SELL": sell_count += 1
+                total = len(s["timeframes"])
+                out += f"\n✅ BUY: {buy_count}/{total}\n❌ SELL: {sell_count}/{total}"
+                bot.send_message(message_obj.chat.id, out)
+            else:
+                bot.send_message(message_obj.chat.id, f"❌ Немає даних для {symbol}")
+        else:
+            bot.send_message(message_obj.chat.id, "Використання: /status SYMBOL")
+
+    elif text.startswith("/top"):
+        symbols = get_top_symbols()[:10]
+        msg = "🔥 Топ-10 монет за добовим рухом %:\n" + "\n".join(symbols)
+        bot.send_message(message_obj.chat.id, msg)
+
+    elif text.startswith("/last"):
+        if not last_signals:
+            bot.send_message(message_obj.chat.id, "❌ Немає надісланих сигналів")
+        else:
+            msg = "📝 Останні сигнали:\n"
+            total_tfs = len(TIMEFRAMES)
+            for sym, info in last_signals.items():
+                note = "✅ Підтверджено всіма ТФ" if info["confidence"] == total_tfs else f"⚠️ Лише {info['confidence']}/{total_tfs} ТФ"
+                msg += f"{sym}: {info['signal']} | Ціна {info['price']} | TP {info['tp']} | SL {info['sl']} | {note}\n"
+            bot.send_message(message_obj.chat.id, msg)
+
+    return "!", 200
+
+# -------------------------
+# Встановлення Webhook
+# -------------------------
+def setup_webhook():
+    url = f"https://api.telegram.org/bot{API_KEY_TELEGRAM}/setWebhook"
+    response = requests.post(url, data={"url": WEBHOOK_URL})
+    print("Webhook setup:", response.json())
+
+# -------------------------
+# Запуск
+# -------------------------
 if __name__ == "__main__":
-    logger.info("Mega Trade Bot Started")
-    main_loop()
+    setup_webhook()
+    threading.Thread(target=check_market, daemon=True).start()
+    app.run(host="0.0.0.0", port=5000)
