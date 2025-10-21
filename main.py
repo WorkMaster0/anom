@@ -33,6 +33,7 @@ PARALLEL_WORKERS = int(os.getenv("PARALLEL_WORKERS", "6"))
 EMA_SCAN_LIMIT = 500
 STATE_FILE = "state.json"
 CONF_THRESHOLD_MEDIUM = 0.3
+SCAN_INTERVALS = ["5m", "15m", "1h", "4h"]
 
 # new: control sending behavior
 ALWAYS_SEND = True           # True = надсилати кожного разу, коли умови виконуються
@@ -333,7 +334,7 @@ def analyze_and_alert(symbol: str):
         f"Symbol: {symbol}\n"
         f"Action: {action}\n"
         f"Entry: {entry:.6f}\n"
-        f"Stop-Loss: {stop_loss:.6f}\n"
+        f"Limit: {stop_loss:.6f}\n"
         f"Take-Profit 1: {tp1:.6f} (RR {rr1:.2f})\n"
         f"Take-Profit 2: {tp2:.6f} (RR {rr2:.2f})\n"
         f"Take-Profit 3: {tp3:.6f} (RR {rr3:.2f})\n"
@@ -433,6 +434,52 @@ def telegram_webhook(token):
 
 # ---------------- MAIN ----------------
 if __name__ == "__main__":
-    logger.info("Starting pre-top detector bot")
-    Thread(target=scan_all_symbols, daemon=True).start()
+    logger.info("Starting multi-timeframe pre-top detector bot")
+
+    # --- Керування WebSocket інтервалом ---
+    SCAN_INTERVALS = ["5m", "15m", "1h"]
+
+    def wait_for_next_candle(interval: str):
+        """
+        Чекає закриття наступної свічки для заданого інтервалу (5m, 15m, 1h)
+        """
+        now = datetime.now(timezone.utc)
+
+        # Перетворюємо Binance формат у хвилини
+        interval_to_minutes = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60}
+        minutes = interval_to_minutes.get(interval, 15)
+
+        # Рахуємо, коли закінчиться поточна свічка
+        next_candle_minute = (now.minute // minutes + 1) * minutes
+        next_candle = now.replace(minute=0, second=0, microsecond=0) + pd.Timedelta(minutes=next_candle_minute)
+        wait_seconds = (next_candle - now).total_seconds()
+        if wait_seconds < 0:
+            wait_seconds += minutes * 60
+
+        logger.info(f"[{interval}] Waiting {int(wait_seconds)}s for next candle close...")
+        time.sleep(wait_seconds + 5)  # +5 секунд на закриття Binance свічки
+
+    def candle_loop(interval: str):
+        """
+        Основний цикл сканування для одного інтервалу
+        """
+        while True:
+            try:
+                wait_for_next_candle(interval)
+                logger.info(f"⏰ [{interval}] Candle closed — starting scan_all_symbols()")
+
+                # тимчасово підміняємо інтервал WebSocket менеджера
+                ws_manager.interval = interval
+                scan_all_symbols()
+
+            except Exception as e:
+                logger.exception(f"[{interval}] Error in candle loop: %s", e)
+                time.sleep(60)
+
+    # --- Запуск циклів для всіх таймфреймів ---
+    for tf in SCAN_INTERVALS:
+        Thread(target=candle_loop, args=(tf,), daemon=True).start()
+        time.sleep(2)  # невелика пауза між потоками
+
+    # Flask сервер для ручного управління
     app.run(host="0.0.0.0", port=PORT)
