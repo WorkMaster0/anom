@@ -34,6 +34,10 @@ EMA_SCAN_LIMIT = 500
 STATE_FILE = "state.json"
 CONF_THRESHOLD_MEDIUM = 0.3
 
+# new: control sending behavior
+ALWAYS_SEND = True           # True = надсилати кожного разу, коли умови виконуються
+COOLDOWN_SECONDS = 0         # якщо ALWAYS_SEND=False, мінімум секунд між повторними сигналами по одному символу
+
 # ---------------- BINANCE CLIENT ----------------
 binance_client = Client(api_key="", api_secret="")
 
@@ -293,37 +297,61 @@ def analyze_and_alert(symbol: str):
     )
 
     # --- Фільтр: мінімум RR >= 2 ---
-    if confidence >= CONF_THRESHOLD_MEDIUM and rr1 >= 2.0:
-        reasons = []
-        if "pretop" in votes: reasons.append("Pre-Top")
-        if "fake_breakout_long" in votes or "fake_breakout_short" in votes: reasons.append("Fake Breakout")
-        if "resistance_flip_support" in votes or "support_flip_resistance" in votes: reasons.append("S/R Flip")
-        if "volume_spike" in votes: reasons.append("Volume Spike")
-        if not reasons: reasons = ["Candle/Pattern Mix"]
+    if not (confidence >= CONF_THRESHOLD_MEDIUM and rr1 >= 2.0):
+        return
 
-        msg = (
-            f"⚡ TRADE SIGNAL\n"
-            f"Symbol: {symbol}\n"
-            f"Action: {action}\n"
-            f"Entry: {entry:.6f}\n"
-            f"Stop-Loss: {stop_loss:.6f}\n"
-            f"Take-Profit 1: {tp1:.6f} (RR {rr1:.2f})\n"
-            f"Take-Profit 2: {tp2:.6f} (RR {rr2:.2f})\n"
-            f"Take-Profit 3: {tp3:.6f} (RR {rr3:.2f})\n"
-            f"Confidence: {confidence:.2f}\n"
-            f"Reasons: {', '.join(reasons)}\n"
-            f"Patterns: {', '.join(votes)}\n"
-        )
+    # ---- resend logic: ALWAYS_SEND or cooldown ----
+    last_state = state.get("signals", {}).get(symbol)
+    now = datetime.now(timezone.utc)
+    can_send = True
+    if not ALWAYS_SEND and last_state:
+        try:
+            last_sent_time = pd.to_datetime(last_state.get("time"))
+            diff = (now - last_sent_time.to_pydatetime()).total_seconds()
+            if diff < COOLDOWN_SECONDS:
+                can_send = False
+        except Exception:
+            # якщо парсинг часу не вдався — дозволяємо відправити
+            can_send = True
 
-        photo_buf = plot_signal_candles(df, symbol, action, tp1=tp1, tp2=tp2, tp3=tp3, sl=stop_loss, entry=entry)
-        send_telegram(msg, photo=photo_buf)
-
-        state.setdefault("signals", {})[symbol] = {
-            "action": action, "entry": entry, "sl": stop_loss, "tp1": tp1, "tp2": tp2, "tp3": tp3,
-            "rr1": rr1, "rr2": rr2, "rr3": rr3, "confidence": confidence,
-            "time": str(last.name), "last_price": float(last["close"]), "votes": votes
-        }
+    if not can_send:
+        logger.info("Skipping send for %s due cooldown (last sent %s)", symbol, last_state.get("time"))
+        # Але все одно оновлюємо state["signals"][symbol]["last_price"] щоб зберегти актуальну ціну (опціонально)
+        state.setdefault("signals", {}).setdefault(symbol, {})["last_price"] = float(last["close"])
         save_json_safe(STATE_FILE, state)
+        return
+
+    reasons = []
+    if "pretop" in votes: reasons.append("Pre-Top")
+    if "fake_breakout_long" in votes or "fake_breakout_short" in votes: reasons.append("Fake Breakout")
+    if "resistance_flip_support" in votes or "support_flip_resistance" in votes: reasons.append("S/R Flip")
+    if "volume_spike" in votes: reasons.append("Volume Spike")
+    if not reasons: reasons = ["Candle/Pattern Mix"]
+
+    msg = (
+        f"⚡ TRADE SIGNAL\n"
+        f"Symbol: {symbol}\n"
+        f"Action: {action}\n"
+        f"Entry: {entry:.6f}\n"
+        f"Stop-Loss: {stop_loss:.6f}\n"
+        f"Take-Profit 1: {tp1:.6f} (RR {rr1:.2f})\n"
+        f"Take-Profit 2: {tp2:.6f} (RR {rr2:.2f})\n"
+        f"Take-Profit 3: {tp3:.6f} (RR {rr3:.2f})\n"
+        f"Confidence: {confidence:.2f}\n"
+        f"Reasons: {', '.join(reasons)}\n"
+        f"Patterns: {', '.join(votes)}\n"
+    )
+
+    photo_buf = plot_signal_candles(df, symbol, action, tp1=tp1, tp2=tp2, tp3=tp3, sl=stop_loss, entry=entry)
+    send_telegram(msg, photo=photo_buf)
+
+    # зберігаємо поточний сигнал у state з часом UTC (isoformat)
+    state.setdefault("signals", {})[symbol] = {
+        "action": action, "entry": entry, "sl": stop_loss, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+        "rr1": rr1, "rr2": rr2, "rr3": rr3, "confidence": confidence,
+        "time": now.isoformat(), "last_price": float(last["close"]), "votes": votes
+    }
+    save_json_safe(STATE_FILE, state)
 
 # ---------------- PLOT UTILITY ----------------
 def plot_signal_candles(df, symbol, action, tp1=None, tp2=None, tp3=None, sl=None, entry=None):
