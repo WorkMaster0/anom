@@ -6,6 +6,7 @@ import re
 from datetime import datetime, timezone
 from threading import Thread
 from concurrent.futures import ThreadPoolExecutor
+from collections import defaultdict
 
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -35,7 +36,7 @@ STATE_FILE = "state.json"
 CONF_THRESHOLD_MEDIUM = 0.3
 
 # таймфрейми, які відстежуємо
-SCAN_INTERVALS = ["5m", "15m", "1h"]  # модифікуйте за потреби, наприклад ["5m","15m","1h","4h"]
+SCAN_INTERVALS = ["5m", "15m", "1h"]  # модифікуйте за потреби
 
 # new: control sending behavior
 ALWAYS_SEND = True           # True = надсилати кожного разу, коли умови виконуються
@@ -88,6 +89,7 @@ def send_telegram(text: str, photo=None):
         logger.exception("send_telegram error: %s", e)
 
 # ---------------- WEBSOCKET / REST MANAGER ----------------
+# Requires websocket_manager.WebSocketKlineManager to be available in your project
 from websocket_manager import WebSocketKlineManager
 
 ALL_USDT = [
@@ -132,7 +134,7 @@ def fetch_klines_rest(symbol, interval="15m", limit=500):
         logger.exception("REST fetch error for %s: %s", symbol, e)
         return None
 
-# NOTE: We initialize ws_managers later (per-interval). For compatibility, create a default 15m ws_manager here
+# default ws manager for compatibility; will create per-interval managers later
 _default_ws_manager = WebSocketKlineManager(symbols=ALL_USDT, interval="15m")
 Thread(target=_default_ws_manager.start, daemon=True).start()
 
@@ -142,7 +144,7 @@ def fetch_klines_default(symbol, limit=500):
         df = fetch_klines_rest(symbol, limit=limit)
     return df
 
-# default name used by existing code; will be temporarily overridden per-interval in loops
+# default fetch used throughout; swapped in loops
 fetch_klines = fetch_klines_default
 
 # ---------------- PATTERN-BASED FEATURE ENGINEERING ----------------
@@ -264,10 +266,44 @@ def detect_signal_v2(df: pd.DataFrame):
     confidence = max(0.0, min(1.0, confidence))
     return action, votes, pretop, last, confidence
 
+# ---------------- ANTI-DUPLICATE BETWEEN TIMEFRAMES ----------------
+tf_signal_memory = defaultdict(lambda: None)
+TF_PRIORITY = {"1h": 1, "15m": 2, "5m": 3}
+SIGNAL_COOLDOWN_MINUTES = 5  # не надсилати дубль протягом 5 хв
+
+def should_send_signal(symbol: str, interval: str):
+    """
+    Перевіряє, чи можна надсилати сигнал для цього символу/таймфрейму.
+    Якщо сигнал уже був нещодавно з іншого інтервалу — блокує.
+    Якщо цей інтервал нижчого пріоритету — теж блокує.
+    """
+    now = datetime.now(timezone.utc)
+    last_info = tf_signal_memory.get(symbol)
+
+    if not last_info:
+        tf_signal_memory[symbol] = {"interval": interval, "time": now}
+        return True
+
+    last_tf = last_info["interval"]
+    last_time = last_info["time"]
+    diff = (now - last_time).total_seconds() / 60
+
+    if diff < SIGNAL_COOLDOWN_MINUTES:
+        if TF_PRIORITY.get(interval, 0) <= TF_PRIORITY.get(last_tf, 0):
+            logger.info(f"Duplicate signal for {symbol} ({interval}) ignored — recent {last_tf}")
+            return False
+
+    tf_signal_memory[symbol] = {"interval": interval, "time": now}
+    return True
+
 # ---------------- MAIN ANALYZE FUNCTION ----------------
-def analyze_and_alert(symbol: str, interval: str = None):
+def analyze_and_alert(symbol: str, interval: str = "15m"):
     df = fetch_klines(symbol, limit=200)
     if df is None or len(df) < 40:
+        return
+
+    # --- анти-дубль між таймфреймами ---
+    if not should_send_signal(symbol, interval):
         return
 
     df = apply_all_features(df)
@@ -341,10 +377,10 @@ def analyze_and_alert(symbol: str, interval: str = None):
         f"Symbol: {symbol}\n"
         f"Action: {action}\n"
         f"Entry: {entry:.6f}\n"
-        f"Stop-Loss: {stop_loss:.6f}\n"
-        f"Take-Profit 1: {tp1:.6f} (RR {rr1:.2f})\n"
-        f"Take-Profit 2: {tp2:.6f} (RR {rr2:.2f})\n"
-        f"Take-Profit 3: {tp3:.6f} (RR {rr3:.2f})\n"
+        f"Limit: {stop_loss:.6f}\n"
+        f"Take 1: {tp1:.6f} (RR {rr1:.2f})\n"
+        f"Take 2: {tp2:.6f} (RR {rr2:.2f})\n"
+        f"Take 3: {tp3:.6f} (RR {rr3:.2f})\n"
         f"Confidence: {confidence:.2f}\n"
         f"Reasons: {', '.join(reasons)}\n"
         f"Patterns: {', '.join(votes)}\n"
@@ -371,8 +407,15 @@ def plot_signal_candles(df, symbol, action, tp1=None, tp2=None, tp3=None, sl=Non
     if entry is not None: addplots.append(mpf.make_addplot([entry]*len(df), linestyle="--"))
 
     title_tf = f" [{interval}]" if interval else ""
+    try:
+        plot_df = fetch_klines_rest(symbol, interval=interval or "15m", limit=200)
+        if plot_df is None or len(plot_df) < 10:
+            plot_df = df.tail(200)
+    except Exception:
+        plot_df = df.tail(200)
+
     fig, ax = mpf.plot(
-        df.tail(200), type='candle', style='yahoo',
+        plot_df, type='candle', style='yahoo',
         title=f"{symbol} - {action}{title_tf}", addplot=addplots, returnfig=True
     )
     buf = io.BytesIO()
