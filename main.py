@@ -33,7 +33,9 @@ PARALLEL_WORKERS = int(os.getenv("PARALLEL_WORKERS", "6"))
 EMA_SCAN_LIMIT = 500
 STATE_FILE = "state.json"
 CONF_THRESHOLD_MEDIUM = 0.3
-SCAN_INTERVALS = ["5m", "15m", "1h", "4h"]
+
+# таймфрейми, які відстежуємо
+SCAN_INTERVALS = ["5m", "15m", "1h"]  # модифікуйте за потреби, наприклад ["5m","15m","1h","4h"]
 
 # new: control sending behavior
 ALWAYS_SEND = True           # True = надсилати кожного разу, коли умови виконуються
@@ -65,13 +67,14 @@ def save_json_safe(path, data):
 state = load_json_safe(STATE_FILE, {"signals": {}, "last_scan": None})
 
 # ---------------- TELEGRAM ----------------
-MARKDOWNV2_ESCAPE = r"_*[]()~`>#+-=|{}.!"
+MARKDOWNV2_ESCAPE = r"_*[]()~`>#+-=|{}.!/"
 
 def escape_md_v2(text: str) -> str:
     return re.sub(f"([{re.escape(MARKDOWNV2_ESCAPE)}])", r"\\\1", str(text))
 
 def send_telegram(text: str, photo=None):
     if not TELEGRAM_TOKEN or not CHAT_ID:
+        logger.debug("Telegram token or chat id not set, skipping send.")
         return
     try:
         if photo:
@@ -113,7 +116,7 @@ BINANCE_REST_URL = "https://fapi.binance.com/fapi/v1/klines"
 
 def fetch_klines_rest(symbol, interval="15m", limit=500):
     try:
-        resp = requests.get(BINANCE_REST_URL, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=5)
+        resp = requests.get(BINANCE_REST_URL, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=10)
         data = resp.json()
         df = pd.DataFrame(data, columns=[
             "open_time","open","high","low","close","volume",
@@ -129,14 +132,18 @@ def fetch_klines_rest(symbol, interval="15m", limit=500):
         logger.exception("REST fetch error for %s: %s", symbol, e)
         return None
 
-ws_manager = WebSocketKlineManager(symbols=ALL_USDT, interval="15m")
-Thread(target=ws_manager.start, daemon=True).start()
+# NOTE: We initialize ws_managers later (per-interval). For compatibility, create a default 15m ws_manager here
+_default_ws_manager = WebSocketKlineManager(symbols=ALL_USDT, interval="15m")
+Thread(target=_default_ws_manager.start, daemon=True).start()
 
-def fetch_klines(symbol, limit=500):
-    df = ws_manager.get_klines(symbol, limit)
+def fetch_klines_default(symbol, limit=500):
+    df = _default_ws_manager.get_klines(symbol, limit)
     if df is None or len(df) < 10:
         df = fetch_klines_rest(symbol, limit=limit)
     return df
+
+# default name used by existing code; will be temporarily overridden per-interval in loops
+fetch_klines = fetch_klines_default
 
 # ---------------- PATTERN-BASED FEATURE ENGINEERING ----------------
 def apply_all_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -159,7 +166,6 @@ def apply_all_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ---------------- PATTERN-BASED SIGNAL DETECTION ----------------
-# ---------------- ADVANCED SIGNAL DETECTION (V2) ----------------
 def detect_signal_v2(df: pd.DataFrame):
     last = df.iloc[-1]
     prev = df.iloc[-2]
@@ -221,9 +227,9 @@ def detect_signal_v2(df: pd.DataFrame):
         votes.append("support_flip_resistance"); confidence += 0.05
 
     # Retest
-    if abs(last["close"] - last["support"]) / last["support"] < 0.003 and last["body"] > 0:
+    if last["support"] and abs(last["close"] - last["support"]) / last["support"] < 0.003 and last["body"] > 0:
         votes.append("support_retest"); confidence += 0.05
-    if abs(last["close"] - last["resistance"]) / last["resistance"] < 0.003 and last["body"] < 0:
+    if last["resistance"] and abs(last["close"] - last["resistance"]) / last["resistance"] < 0.003 and last["body"] < 0:
         votes.append("resistance_retest"); confidence += 0.05
 
     # Liquidity grab (свічка проколола рівень, але закрилась всередині)
@@ -247,8 +253,8 @@ def detect_signal_v2(df: pd.DataFrame):
 
     # --- Action ---
     action = "WATCH"
-    near_resistance = last["close"] >= last["resistance"] * 0.98
-    near_support = last["close"] <= last["support"] * 1.02
+    near_resistance = last["close"] >= last["resistance"] * 0.98 if not pd.isna(last["resistance"]) else False
+    near_support = last["close"] <= last["support"] * 1.02 if not pd.isna(last["support"]) else False
     if near_resistance:
         action = "SHORT"
     elif near_support:
@@ -258,9 +264,8 @@ def detect_signal_v2(df: pd.DataFrame):
     confidence = max(0.0, min(1.0, confidence))
     return action, votes, pretop, last, confidence
 
-
 # ---------------- MAIN ANALYZE FUNCTION ----------------
-def analyze_and_alert(symbol: str):
+def analyze_and_alert(symbol: str, interval: str = None):
     df = fetch_klines(symbol, limit=200)
     if df is None or len(df) < 40:
         return
@@ -287,14 +292,17 @@ def analyze_and_alert(symbol: str):
     if action == "WATCH":
         return
 
-    # R/R
-    rr1 = (tp1 - entry)/(entry - stop_loss) if action=="LONG" else (entry - tp1)/(stop_loss - entry)
-    rr2 = (tp2 - entry)/(entry - stop_loss) if action=="LONG" else (entry - tp2)/(stop_loss - entry)
-    rr3 = (tp3 - entry)/(entry - stop_loss) if action=="LONG" else (entry - tp3)/(stop_loss - entry)
+    # R/R (guard for zero div)
+    try:
+        rr1 = (tp1 - entry)/(entry - stop_loss) if action=="LONG" else (entry - tp1)/(stop_loss - entry)
+        rr2 = (tp2 - entry)/(entry - stop_loss) if action=="LONG" else (entry - tp2)/(stop_loss - entry)
+        rr3 = (tp3 - entry)/(entry - stop_loss) if action=="LONG" else (entry - tp3)/(stop_loss - entry)
+    except Exception:
+        rr1 = rr2 = rr3 = 0.0
 
     logger.info(
-        "Symbol=%s action=%s confidence=%.2f votes=%s pretop=%s RR1=%.2f RR2=%.2f RR3=%.2f",
-        symbol, action, confidence, votes, pretop, rr1, rr2, rr3
+        "Symbol=%s action=%s interval=%s confidence=%.2f votes=%s pretop=%s RR1=%.2f RR2=%.2f RR3=%.2f",
+        symbol, action, interval, confidence, votes, pretop, rr1, rr2, rr3
     )
 
     # --- Фільтр: мінімум RR >= 2 ---
@@ -312,12 +320,10 @@ def analyze_and_alert(symbol: str):
             if diff < COOLDOWN_SECONDS:
                 can_send = False
         except Exception:
-            # якщо парсинг часу не вдався — дозволяємо відправити
             can_send = True
 
     if not can_send:
         logger.info("Skipping send for %s due cooldown (last sent %s)", symbol, last_state.get("time"))
-        # Але все одно оновлюємо state["signals"][symbol]["last_price"] щоб зберегти актуальну ціну (опціонально)
         state.setdefault("signals", {}).setdefault(symbol, {})["last_price"] = float(last["close"])
         save_json_safe(STATE_FILE, state)
         return
@@ -329,12 +335,13 @@ def analyze_and_alert(symbol: str):
     if "volume_spike" in votes: reasons.append("Volume Spike")
     if not reasons: reasons = ["Candle/Pattern Mix"]
 
+    tf_label = f"[{interval}]" if interval else ""
     msg = (
-        f"⚡ TRADE SIGNAL\n"
+        f"⚡ TRADE SIGNAL {tf_label}\n"
         f"Symbol: {symbol}\n"
         f"Action: {action}\n"
         f"Entry: {entry:.6f}\n"
-        f"Limit: {stop_loss:.6f}\n"
+        f"Stop-Loss: {stop_loss:.6f}\n"
         f"Take-Profit 1: {tp1:.6f} (RR {rr1:.2f})\n"
         f"Take-Profit 2: {tp2:.6f} (RR {rr2:.2f})\n"
         f"Take-Profit 3: {tp3:.6f} (RR {rr3:.2f})\n"
@@ -343,29 +350,30 @@ def analyze_and_alert(symbol: str):
         f"Patterns: {', '.join(votes)}\n"
     )
 
-    photo_buf = plot_signal_candles(df, symbol, action, tp1=tp1, tp2=tp2, tp3=tp3, sl=stop_loss, entry=entry)
+    photo_buf = plot_signal_candles(df, symbol, action, tp1=tp1, tp2=tp2, tp3=tp3, sl=stop_loss, entry=entry, interval=interval)
     send_telegram(msg, photo=photo_buf)
 
-    # зберігаємо поточний сигнал у state з часом UTC (isoformat)
+    # зберігаємо поточний сигнал у state з часом UTC (isoformat) і interval
     state.setdefault("signals", {})[symbol] = {
         "action": action, "entry": entry, "sl": stop_loss, "tp1": tp1, "tp2": tp2, "tp3": tp3,
         "rr1": rr1, "rr2": rr2, "rr3": rr3, "confidence": confidence,
-        "time": now.isoformat(), "last_price": float(last["close"]), "votes": votes
+        "time": now.isoformat(), "last_price": float(last["close"]), "votes": votes, "interval": interval
     }
     save_json_safe(STATE_FILE, state)
 
 # ---------------- PLOT UTILITY ----------------
-def plot_signal_candles(df, symbol, action, tp1=None, tp2=None, tp3=None, sl=None, entry=None):
+def plot_signal_candles(df, symbol, action, tp1=None, tp2=None, tp3=None, sl=None, entry=None, interval=None):
     addplots = []
-    if tp1: addplots.append(mpf.make_addplot([tp1]*len(df), color='green', linestyle="--"))
-    if tp2: addplots.append(mpf.make_addplot([tp2]*len(df), color='lime', linestyle="--"))
-    if tp3: addplots.append(mpf.make_addplot([tp3]*len(df), color='darkgreen', linestyle="--"))
-    if sl: addplots.append(mpf.make_addplot([sl]*len(df), color='red', linestyle="--"))
-    if entry: addplots.append(mpf.make_addplot([entry]*len(df), color='blue', linestyle="--"))
+    if tp1 is not None: addplots.append(mpf.make_addplot([tp1]*len(df), linestyle="--"))
+    if tp2 is not None: addplots.append(mpf.make_addplot([tp2]*len(df), linestyle="--"))
+    if tp3 is not None: addplots.append(mpf.make_addplot([tp3]*len(df), linestyle="--"))
+    if sl is not None: addplots.append(mpf.make_addplot([sl]*len(df), linestyle="--"))
+    if entry is not None: addplots.append(mpf.make_addplot([entry]*len(df), linestyle="--"))
 
+    title_tf = f" [{interval}]" if interval else ""
     fig, ax = mpf.plot(
         df.tail(200), type='candle', style='yahoo',
-        title=f"{symbol} - {action}", addplot=addplots, returnfig=True
+        title=f"{symbol} - {action}{title_tf}", addplot=addplots, returnfig=True
     )
     buf = io.BytesIO()
     fig.savefig(buf, format='png', bbox_inches='tight')
@@ -376,8 +384,7 @@ def plot_signal_candles(df, symbol, action, tp1=None, tp2=None, tp3=None, sl=Non
 # ---------------- FETCH TOP SYMBOLS ----------------
 def fetch_top_symbols(limit=300):
     try:
-        # Беремо всі USDT-пари ф'ючерсів
-        tickers = binance_client.futures_ticker()  # Для USDT-M ф'ючерсів
+        tickers = binance_client.futures_ticker()
         usdt_pairs = [t for t in tickers if t['symbol'].endswith("USDT")]
         sorted_pairs = sorted(
             usdt_pairs,
@@ -392,22 +399,25 @@ def fetch_top_symbols(limit=300):
         return []
 
 # ---------------- MASTER SCAN ----------------
-def scan_all_symbols():
+def scan_all_symbols(interval: str = None):
+    """
+    Сканує топ-символи або ALL_USDT (fallback). interval передається для логів/повідомлень.
+    """
     symbols = fetch_top_symbols(limit=300)
     if not symbols:
         logger.warning("No symbols fetched, falling back to ALL_USDT list")
         symbols = ALL_USDT
-    logger.info("Starting scan for %d symbols", len(symbols))
+    logger.info("Starting scan for %d symbols (interval=%s)", len(symbols), interval)
     def safe_analyze(sym):
         try:
-            analyze_and_alert(sym)
+            analyze_and_alert(sym, interval=interval)
         except Exception as e:
             logger.exception("Error analyzing symbol %s: %s", sym, e)
     with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as exe:
         list(exe.map(safe_analyze, symbols))
     state["last_scan"] = str(datetime.now(timezone.utc))
     save_json_safe(STATE_FILE, state)
-    logger.info("Scan finished at %s", state["last_scan"])
+    logger.info("Scan finished at %s (interval=%s)", state["last_scan"], interval)
 
 # ---------------- FLASK ----------------
 from flask import Flask, request, jsonify
@@ -434,22 +444,30 @@ def telegram_webhook(token):
 
 # ---------------- MAIN ----------------
 if __name__ == "__main__":
-    logger.info("Starting multi-timeframe pre-top detector bot")
+    logger.info("Starting multi-timeframe pre-top detector bot (with separate WebSocket managers)")
 
-    # --- Керування WebSocket інтервалом ---
-    SCAN_INTERVALS = ["5m", "15m", "1h"]
+    # --- Створюємо окремі WebSocket менеджери для кожного інтервалу ---
+    ws_managers = {}
+    for tf in SCAN_INTERVALS:
+        try:
+            logger.info(f"Starting WebSocket manager for interval {tf}")
+            manager = WebSocketKlineManager(symbols=ALL_USDT, interval=tf)
+            Thread(target=manager.start, daemon=True).start()
+            ws_managers[tf] = manager
+            time.sleep(1)  # невелика пауза
+        except Exception as e:
+            logger.exception(f"Failed to start WebSocket manager for {tf}: {e}")
 
+    # --- Допоміжна функція очікування закриття свічки ---
     def wait_for_next_candle(interval: str):
         """
-        Чекає закриття наступної свічки для заданого інтервалу (5m, 15m, 1h)
+        Чекає закриття наступної свічки для заданого інтервалу (UTC).
         """
         now = datetime.now(timezone.utc)
-
-        # Перетворюємо Binance формат у хвилини
-        interval_to_minutes = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60}
+        interval_to_minutes = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240}
         minutes = interval_to_minutes.get(interval, 15)
 
-        # Рахуємо, коли закінчиться поточна свічка
+        # наступний кратний момент
         next_candle_minute = (now.minute // minutes + 1) * minutes
         next_candle = now.replace(minute=0, second=0, microsecond=0) + pd.Timedelta(minutes=next_candle_minute)
         wait_seconds = (next_candle - now).total_seconds()
@@ -457,29 +475,50 @@ if __name__ == "__main__":
             wait_seconds += minutes * 60
 
         logger.info(f"[{interval}] Waiting {int(wait_seconds)}s for next candle close...")
-        time.sleep(wait_seconds + 5)  # +5 секунд на закриття Binance свічки
+        # +5 секунд щоб Binance точно закрив свічку
+        time.sleep(max(0, wait_seconds + 5))
 
-    def candle_loop(interval: str):
+    # --- Основний цикл для кожного таймфрейму ---
+    def candle_loop(interval: str, ws_manager):
         """
-        Основний цикл сканування для одного інтервалу
+        Нескінченний цикл: чекаємо закриття свічки, підміняємо fetch_klines на той, що читає з ws_manager, запускаємо scan_all_symbols(interval).
         """
+        global fetch_klines
         while True:
             try:
                 wait_for_next_candle(interval)
                 logger.info(f"⏰ [{interval}] Candle closed — starting scan_all_symbols()")
 
-                # тимчасово підміняємо інтервал WebSocket менеджера
-                ws_manager.interval = interval
-                scan_all_symbols()
+                # local fetch function that uses this interval's ws manager
+                def fetch_klines_interval(symbol, limit=500):
+                    df = ws_manager.get_klines(symbol, limit)
+                    if df is None or len(df) < 10:
+                        # fallback to REST with correct interval
+                        df = fetch_klines_rest(symbol, interval=interval, limit=limit)
+                    return df
+
+                # swap fetch_klines temporarily
+                original_fetch_klines = fetch_klines
+                fetch_klines = fetch_klines_interval
+
+                # scan using this interval label
+                scan_all_symbols(interval=interval)
+
+                # restore original
+                fetch_klines = original_fetch_klines
 
             except Exception as e:
                 logger.exception(f"[{interval}] Error in candle loop: %s", e)
                 time.sleep(60)
 
-    # --- Запуск циклів для всіх таймфреймів ---
+    # --- Запускаємо окремий потік для кожного інтервалу ---
     for tf in SCAN_INTERVALS:
-        Thread(target=candle_loop, args=(tf,), daemon=True).start()
-        time.sleep(2)  # невелика пауза між потоками
+        manager = ws_managers.get(tf)
+        if manager:
+            Thread(target=candle_loop, args=(tf, manager), daemon=True).start()
+            time.sleep(1)
+        else:
+            logger.warning("No ws manager for %s — skipping loop", tf)
 
-    # Flask сервер для ручного управління
+    # --- Запускаємо Flask ---
     app.run(host="0.0.0.0", port=PORT)
