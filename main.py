@@ -317,7 +317,13 @@ def status(): return jsonify({"zones":state.get("zones",{}),"watchlist":state.ge
 
 # ---------------- START ----------------
 if __name__=="__main__":
+    import multiprocessing
     logger.info("Starting SMC bot v3 (TF=%s)",TF)
+
+    # запустимо моніторинг тільки у режимі локального запуску
+    if os.environ.get("RUN_MONITOR", "1")=="1":
+        p = multiprocessing.Process(target=monitor_zone_hits, daemon=True)
+        p.start()
+
     set_webhook_if_render()
-    threading.Thread(target=monitor_zone_hits,daemon=True).start()
     app.run(host="0.0.0.0",port=PORT)
