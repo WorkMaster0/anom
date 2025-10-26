@@ -44,9 +44,9 @@ SCAN_WORKERS = int(os.getenv("SCAN_WORKERS", "8"))
 
 # heuristic params
 ORDER_BLOCK_LOOKBACK = int(os.getenv("ORDER_BLOCK_LOOKBACK", "24"))
-MIN_BODY_THRESHOLD = float(os.getenv("MIN_BODY_THRESHOLD", "0.002"))
-FVG_MIN_GAP_PCT = float(os.getenv("FVG_MIN_GAP_PCT", "0.001"))
-ZONE_PADDING_PCT = float(os.getenv("ZONE_PADDING_PCT", "0.002"))
+MIN_BODY_THRESHOLD = float(os.getenv("MIN_BODY_THRESHOLD", "0.2"))
+FVG_MIN_GAP_PCT = float(os.getenv("FVG_MIN_GAP_PCT", "0.1"))
+ZONE_PADDING_PCT = float(os.getenv("ZONE_PADDING_PCT", "0.2"))
 
 # prebreak/approach logic
 PREBREAK_ENABLED = True
