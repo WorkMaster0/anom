@@ -54,7 +54,7 @@ ZONE_PADDING_PCT = float(os.getenv("ZONE_PADDING_PCT", "0.002"))
 HIT_COOLDOWN_MINUTES = int(os.getenv("HIT_COOLDOWN_MINUTES", "10"))
 
 # State file path in /data for Render persistence
-DATA_DIR = os.getenv("DATA_DIR", "/data")
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 STATE_FILE = os.path.join(DATA_DIR, "smc_webhook_state.json")
 
