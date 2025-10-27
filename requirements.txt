@@ -35,3 +35,5 @@ websocket-client
 rel
 fpdf
 pandas_ta
+socketio
+eventlet
