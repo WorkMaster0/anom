@@ -37,3 +37,4 @@ fpdf2==2.8.1
 pandas_ta
 socketio
 eventlet
+charset-normalizer==3.3.2
