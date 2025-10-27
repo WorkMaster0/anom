@@ -37,3 +37,4 @@ fpdf
 pandas_ta
 socketio
 eventlet
+fpdf_py3k
