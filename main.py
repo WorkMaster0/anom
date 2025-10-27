@@ -251,50 +251,50 @@ def scan_all_pairs_and_store():
 
 # ---------------- MONITOR ----------------
 def monitor_zone_hits():
+    logger.info("Zone monitor thread started.")
     while True:
         try:
-            now=datetime.now(timezone.utc)
-            prebreak_cfg=state.get("prebreak",{"enabled":PREBREAK_ENABLED,"pct":PREBREAK_PCT})
-            for symbol,zones in list(state.get("zones",{}).items()):
-                df_latest=fetch_klines(symbol,"1m",limit=2)
-                if df_latest is None or df_latest.empty: continue
-                last_price=float(df_latest['close'].iloc[-1])
+            if not state["watchlist"]:
+                logger.info("No pairs in watchlist yet.")
+                time.sleep(30)
+                continue
+
+            for symbol in state["watchlist"]:
+                zones = state["zones"].get(symbol, [])
+                if not zones:
+                    logger.info("%s has no zones stored. Try running /scan first.", symbol)
+                    continue
+
+                df = get_klines(symbol, limit=3)
+                if df is None or df.empty:
+                    logger.info("%s returned no klines.", symbol)
+                    continue
+
+                last_price = df["c"].iloc[-1]
+                logger.info("Checking %s price: %.4f (%d zones)", symbol, last_price, len(zones))
+
+                hit_any = False
                 for z in zones:
-                    if z.get("hit_at"): continue
-                    low,high=z['zone']
+                    zlow, zhigh = z["low"], z["high"]
+                    logger.info("Zone: %s %.4f–%.4f | price %.4f", z["type"], zlow, zhigh, last_price)
+
                     # HIT
-                    if low<=last_price<=high:
-                        txt=f"✅ Zone HIT\nSymbol:{symbol}\nTF:{z['tf']}\nType:{z['type']}\nPrice:{last_price:.6f}"
-                        df_chart=fetch_klines(symbol,z['tf'],limit=200)
-                        img=build_chart_bytes(df_chart,symbol,z['tf'],z['zone']) if df_chart is not None else None
-                        send_telegram(txt,photo_bytes=img)
-                        z['hit_at']=now.isoformat()
-                        state.setdefault("events",[]).append({"symbol":symbol,"zone_id":z['id'],"hit_at":now.isoformat(),"price":last_price})
-                        save_state(state)
-                    # PREBREAK
-                    elif prebreak_cfg.get("enabled",False):
-                        pct=prebreak_cfg.get("pct",PREBREAK_PCT)
-                        if last_price>high and (last_price-high)/high<=pct:
-                            key=f"prebreak:{z['id']}"
-                            if not state.get("events_marker",{}).get(key):
-                                txt=f"⚠️ Approaching zone (from above)\nSymbol:{symbol}\nPrice:{last_price:.6f}\nZone top:{high:.6f}"
-                                df_chart=fetch_klines(symbol,z['tf'],limit=200)
-                                img=build_chart_bytes(df_chart,symbol,z['tf'],z['zone']) if df_chart is not None else None
-                                send_telegram(txt,photo_bytes=img)
-                                state.setdefault("events_marker",{})[key]=now.isoformat()
-                                save_state(state)
-                        elif last_price<low and (low-last_price)/low<=pct:
-                            key=f"prebreak:{z['id']}"
-                            if not state.get("events_marker",{}).get(key):
-                                txt=f"⚠️ Approaching zone (from below)\nSymbol:{symbol}\nPrice:{last_price:.6f}\nZone bottom:{low:.6f}"
-                                df_chart=fetch_klines(symbol,z['tf'],limit=200)
-                                img=build_chart_bytes(df_chart,symbol,z['tf'],z['zone']) if df_chart is not None else None
-                                send_telegram(txt,photo_bytes=img)
-                                state.setdefault("events_marker",{})[key]=now.isoformat()
-                                save_state(state)
+                    if zlow <= last_price <= zhigh:
+                        send_telegram(f"✅ Zone HIT on {symbol} ({z['type']}) "
+                                      f"at {last_price:.4f}\nZone {zlow:.4f}-{zhigh:.4f}")
+                        hit_any = True
+
+                # 🧪 тест — якщо не знайдено, пробуємо штучний сигнал
+                if not hit_any:
+                    logger.info("No zone hit for %s. Sending test alert.", symbol)
+                    send_telegram(f"🔍 Checked {symbol} — no zone hit (price={last_price:.4f})")
+
+                time.sleep(2)
+
+            time.sleep(15)
         except Exception as e:
-            logger.exception("monitor_zone_hits error: %s", e)
-        time.sleep(20)
+            logger.exception("Monitor error: %s", e)
+            time.sleep(10)
 
 # ---------------- FLASK ----------------
 app=Flask(__name__)
