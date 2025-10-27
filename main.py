@@ -107,38 +107,54 @@ def tg_edit(message_id: int, text: str):
 
 # ---------------- DEX SOURCES ----------------
 DEXSCREENER_SEARCH = "https://api.dexscreener.com/latest/dex/search/?q={q}"
-DECTOOLS_PLACEHOLDER = None  # implement if API available
-GMGN_PLACEHOLDER = None      # implement if API available
+DECTOOLS_API = "https://www.dextools.io/shared/analytics/pair-search?query={q}"
+GMGN_API = "https://gmgn.ai/defi/quotation/v1/tokens/search?keyword={q}"
 
-def fetch_price_from_dexscreener(symbol: str) -> Optional[float]:
-    """Search Dexscreener for token symbol and return first pair priceUsd"""
+def fetch_price_from_dex(symbol: str) -> Optional[float]:
+    """Пробує отримати ціну токена з GMGN, Dextools або Dexscreener"""
+    q = symbol.upper().strip()
+    # 1️⃣ GMGN
     try:
-        url = DEXSCREENER_SEARCH.format(q=symbol)
+        url = GMGN_API.format(q=q)
         r = requests.get(url, timeout=8)
         r.raise_for_status()
         data = r.json()
-        pairs = data.get("pairs") or data.get("pairsFound") or []
-        if isinstance(pairs, list) and pairs:
-            # choose first pair with priceUsd
+        tokens = data.get("data", [])
+        if tokens:
+            # вибираємо найпопулярніший токен з полем price_usd
+            for t in tokens:
+                price = t.get("price_usd") or t.get("priceUsd") or t.get("price")
+                if price:
+                    return float(price)
+    except Exception:
+        pass
+    # 2️⃣ DEXTOOLS
+    try:
+        url = DECTOOLS_API.format(q=q)
+        r = requests.get(url, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+        pairs = data.get("pairs") or []
+        for p in pairs:
+            price = p.get("priceUsd") or p.get("price")
+            if price:
+                return float(price)
+    except Exception:
+        pass
+    # 3️⃣ DEXSCREENER
+    try:
+        url = DEXSCREENER_SEARCH.format(q=q)
+        r = requests.get(url, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+        pairs = data.get("pairs") or []
+        if pairs:
             for p in pairs:
                 price = p.get("priceUsd") or p.get("price")
                 if price:
-                    try:
-                        return float(price)
-                    except Exception:
-                        continue
-        # fallback tokens list
-        tokens = data.get("tokens") or []
-        for t in tokens:
-            for p in t.get("pairs", []):
-                try:
-                    price = p.get("priceUsd")
-                    if price:
-                        return float(price)
-                except Exception:
-                    continue
-    except Exception as e:
-        logger.debug("dexscreener error for %s: %s", symbol, e)
+                    return float(price)
+    except Exception:
+        pass
     return None
 
 # ---------------- Contract mapping utility ----------------
@@ -273,7 +289,7 @@ class DexPoller:
                 await asyncio.sleep(1.0)
                 continue
             # run fetches in threadpool
-            coros = [loop.run_in_executor(None, fetch_price_from_dexscreener, s) for s in syms]
+            coros = [loop.run_in_executor(None, fetch_price_from_dex, s) for s in syms]
             try:
                 results = await asyncio.gather(*coros, return_exceptions=True)
                 for s, res in zip(syms, results):
