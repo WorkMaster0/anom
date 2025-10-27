@@ -33,7 +33,7 @@ lightgbm
 mplfinance
 websocket-client
 rel
-fpdf
+fpdf2==2.8.1
 pandas_ta
 socketio
 eventlet
