@@ -1,618 +1,410 @@
-#!/usr/bin/env python3
-# main.py - Live DEX <-> MEXC monitor with Flask + WebSocket + Telegram webhook
 import os
 import time
 import json
 import logging
-import asyncio
-import requests
+import re
 from datetime import datetime, timezone
 from threading import Thread
-from typing import Dict, Optional, Set, List
-from flask import Flask, request, render_template_string, jsonify
-from flask_socketio import SocketIO, emit
+from concurrent.futures import ThreadPoolExecutor
 
-# Try import ccxt.pro (optional)
-try:
-    import ccxt.pro as ccxtpro
-except Exception:
-    ccxtpro = None
+import pandas as pd
+import matplotlib.pyplot as plt
+import requests
+import ta
+import mplfinance as mpf
+import numpy as np
+import io
 
-import ccxt  # sync for discovery/fallback
+from binance.client import Client
+
+# ---------------- LOGGING ----------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()]
+)
+logger = logging.getLogger("pretop-bot")
 
 # ---------------- CONFIG ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-# For webhook: set your public URL like https://yourapp.onrender.com
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
-PORT = int(os.getenv("PORT", "10000"))
-
+CHAT_ID = os.getenv("CHAT_ID", "")
+PORT = int(os.getenv("PORT", "5000"))
+PARALLEL_WORKERS = int(os.getenv("PARALLEL_WORKERS", "6"))
+EMA_SCAN_LIMIT = 500
 STATE_FILE = "state.json"
-POLL_INTERVAL_DEX = float(os.getenv("POLL_INTERVAL_DEX", "3.0"))
-LIVE_BROADCAST_INTERVAL = float(os.getenv("LIVE_BROADCAST_INTERVAL", "2.0"))
-SPREAD_MIN_PCT_ALERT = float(os.getenv("SPREAD_MIN_PCT_ALERT", "2.0"))
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "60"))
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+CONF_THRESHOLD_MEDIUM = 0.3
 
-# Exchanges to use (ccxt ids). Adjust as needed.
-EXCHANGES_FOR_FUTURES = ["mexc", "bybit", "lbank"]  # mexc is primary for CEX websocket
-
-# ---------------- LOGGING ----------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("live-monitor")
+# ---------------- BINANCE CLIENT ----------------
+binance_client = Client(api_key="", api_secret="")
 
 # ---------------- STATE ----------------
-state = {
-    "symbols": [],          # list of token symbols like ["PEPE","DOGE"]
-    "chat_id": None,        # telegram chat id to send messages
-    "msg_id": None,         # live panel message id
-    "monitoring": True,     # whether background tasks run
-}
-# runtime caches
-dex_prices: Dict[str, float] = {}
-cex_prices: Dict[str, float] = {}
-last_alert_time: Dict[str, float] = {}
-
-# ---------------- SAVE / LOAD ----------------
-def load_state():
-    global state
+def load_json_safe(path, default):
     try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "r") as f:
-                s = json.load(f)
-                state.update(s)
-                logger.info("Loaded state: %d symbols", len(state.get("symbols", [])))
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                return json.load(f)
     except Exception as e:
-        logger.exception("load_state error: %s", e)
+        logger.exception("load_json_safe error %s: %s", path, e)
+    return default
 
-def save_state():
+def save_json_safe(path, data):
     try:
-        tmp = STATE_FILE + ".tmp"
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = path + ".tmp"
         with open(tmp, "w") as f:
-            json.dump(state, f, indent=2)
-        os.replace(tmp, STATE_FILE)
+            json.dump(data, f, indent=2, default=str)
+        os.replace(tmp, path)
     except Exception as e:
-        logger.exception("save_state error: %s", e)
+        logger.exception("save_json_safe error %s: %s", path, e)
 
-# ---------------- TELEGRAM HELPERS ----------------
-def tg_send(text: str) -> Optional[dict]:
-    if not TELEGRAM_TOKEN or not state.get("chat_id"):
-        logger.debug("Telegram not configured or chat_id missing")
-        return None
-    try:
-        payload = {
-            "chat_id": state["chat_id"],
-            "text": text,
-            "parse_mode": "Markdown",
-            "disable_web_page_preview": True
-        }
-        r = requests.post(TELEGRAM_API + "/sendMessage", json=payload, timeout=10)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        logger.exception("tg_send error: %s", e)
-        return None
+state = load_json_safe(STATE_FILE, {"signals": {}, "last_scan": None})
 
-def tg_edit(message_id: int, text: str):
-    if not TELEGRAM_TOKEN or not state.get("chat_id"):
-        return None
-    try:
-        payload = {"chat_id": state["chat_id"], "message_id": message_id, "text": text, "parse_mode": "Markdown"}
-        r = requests.post(TELEGRAM_API + "/editMessageText", json=payload, timeout=10)
-        if r.status_code != 200:
-            logger.warning("tg_edit failed: %s %s", r.status_code, r.text)
-        return r.json()
-    except Exception as e:
-        logger.exception("tg_edit error: %s", e)
-        return None
+# ---------------- TELEGRAM ----------------
+MARKDOWNV2_ESCAPE = r"_*[]()~`>#+-=|{}.!"
 
-# ---------------- DEX SOURCES ----------------
-DEXSCREENER_SEARCH = "https://api.dexscreener.com/latest/dex/search/?q={q}"
-DECTOOLS_API = "https://www.dextools.io/shared/analytics/pair-search?query={q}"
-GMGN_API = "https://gmgn.ai/defi/quotation/v1/tokens/search?keyword={q}"
+def escape_md_v2(text: str) -> str:
+    return re.sub(f"([{re.escape(MARKDOWNV2_ESCAPE)}])", r"\\\1", str(text))
 
-def fetch_price_from_dex(symbol: str) -> Optional[float]:
-    """Пробує отримати ціну токена з GMGN, Dextools або Dexscreener"""
-    q = symbol.upper().strip()
-    # 1️⃣ GMGN
-    try:
-        url = GMGN_API.format(q=q)
-        r = requests.get(url, timeout=8)
-        r.raise_for_status()
-        data = r.json()
-        tokens = data.get("data", [])
-        if tokens:
-            # вибираємо найпопулярніший токен з полем price_usd
-            for t in tokens:
-                price = t.get("price_usd") or t.get("priceUsd") or t.get("price")
-                if price:
-                    return float(price)
-    except Exception:
-        pass
-    # 2️⃣ DEXTOOLS
-    try:
-        url = DECTOOLS_API.format(q=q)
-        r = requests.get(url, timeout=8)
-        r.raise_for_status()
-        data = r.json()
-        pairs = data.get("pairs") or []
-        for p in pairs:
-            price = p.get("priceUsd") or p.get("price")
-            if price:
-                return float(price)
-    except Exception:
-        pass
-    # 3️⃣ DEXSCREENER
-    try:
-        url = DEXSCREENER_SEARCH.format(q=q)
-        r = requests.get(url, timeout=8)
-        r.raise_for_status()
-        data = r.json()
-        pairs = data.get("pairs") or []
-        if pairs:
-            for p in pairs:
-                price = p.get("priceUsd") or p.get("price")
-                if price:
-                    return float(price)
-    except Exception:
-        pass
-    return None
-
-# ---------------- Contract mapping utility ----------------
-def generate_candidate_pairs(symbol: str) -> List[str]:
-    """
-    Heuristic mappings for symbol -> exchange pairs.
-    Examples: "PEPE" -> ["PEPE/USDT", "PEPEUSDT", "PEPE/USDT:USDT"]
-    We'll use common format SYMBOL/USDT.
-    """
-    s = symbol.upper()
-    return [f"{s}/USDT", f"{s}USDT", f"{s}/USDT:USDT", f"{s}/USD"]
-
-# ---------------- CEX (MEXC) watcher using ccxt.pro ----------------
-class CEXWatcher:
-    def __init__(self, exchange_id="mexc"):
-        self.exchange_id = exchange_id
-        self.client = None
-        self.task = None
-        self.running = False
-
-    async def start(self):
-        if ccxtpro is None:
-            logger.warning("ccxt.pro not installed — CEX watcher disabled")
-            return
-        if self.running:
-            return
-        kwargs = {"enableRateLimit": True}
-        # allow optional API keys from env
-        api_key = os.getenv(f"{self.exchange_id.upper()}_API_KEY")
-        api_secret = os.getenv(f"{self.exchange_id.upper()}_API_SECRET")
-        if api_key and api_secret:
-            kwargs["apiKey"] = api_key
-            kwargs["secret"] = api_secret
-        try:
-            self.client = getattr(ccxtpro, self.exchange_id)(kwargs)
-            # prefer futures/swap
-            try:
-                opts = self.client.options or {}
-                if "defaultType" in opts:
-                    self.client.options["defaultType"] = "future"
-            except Exception:
-                pass
-        except Exception as e:
-            logger.exception("Failed to init %s: %s", self.exchange_id, e)
-            self.client = None
-            return
-        self.running = True
-        self.task = asyncio.create_task(self._run())
-
-    async def stop(self):
-        self.running = False
-        if self.task:
-            self.task.cancel()
-            try:
-                await self.task
-            except Exception:
-                pass
-        if self.client:
-            try:
-                await self.client.close()
-            except Exception:
-                pass
-        self.client = None
-        self.task = None
-
-    async def _run(self):
-        logger.info("%s watcher running", self.exchange_id)
-        # loop watching tickers for monitored symbols (limit concurrency)
-        while self.running:
-            syms = list(state.get("symbols", []))[:MAX_SYMBOLS]
-            if not syms:
-                await asyncio.sleep(1.0)
-                continue
-            # create small tasks for each symbol
-            tasks = []
-            semaphore = asyncio.Semaphore(12)
-            async def watch_one(sym):
-                pair_candidates = generate_candidate_pairs(sym)
-                # try each mapping until success
-                for pair in pair_candidates:
-                    try:
-                        async with semaphore:
-                            ticker = await self.client.watch_ticker(pair)
-                        last = ticker.get("last") or ticker.get("close") or ticker.get("price")
-                        if last is not None:
-                            cex_prices[sym] = float(last)
-                            return
-                    except Exception:
-                        # try next mapping
-                        await asyncio.sleep(0.0)
-                        continue
-                # if all candidates fail, set None (or keep old)
-                return
-            for s in syms:
-                tasks.append(asyncio.create_task(watch_one(s)))
-            # wait for a short window and then iterate (keeps WS subscriptions alive)
-            try:
-                await asyncio.wait(tasks, timeout=2.0)
-            except Exception:
-                pass
-            # small sleep
-            await asyncio.sleep(0.5)
-
-# ---------------- DEX poller (Dexscreener + optional GMGN) ----------------
-class DexPoller:
-    def __init__(self):
-        self.task = None
-        self.running = False
-
-    async def start(self):
-        if self.running:
-            return
-        self.running = True
-        self.task = asyncio.create_task(self._run())
-
-    async def stop(self):
-        self.running = False
-        if self.task:
-            self.task.cancel()
-            try:
-                await self.task
-            except Exception:
-                pass
-        self.task = None
-
-    async def _run(self):
-        logger.info("DEX Poller started (Dexscreener)")
-        loop = asyncio.get_event_loop()
-        while self.running:
-            syms = list(state.get("symbols", []))[:MAX_SYMBOLS]
-            if not syms:
-                await asyncio.sleep(1.0)
-                continue
-            # run fetches in threadpool
-            coros = [loop.run_in_executor(None, fetch_price_from_dex, s) for s in syms]
-            try:
-                results = await asyncio.gather(*coros, return_exceptions=True)
-                for s, res in zip(syms, results):
-                    if isinstance(res, Exception) or res is None:
-                        # skip / keep previous
-                        continue
-                    try:
-                        dex_prices[s] = float(res)
-                    except Exception:
-                        continue
-            except Exception as e:
-                logger.debug("dex poller gather error: %s", e)
-            await asyncio.sleep(POLL_INTERVAL_DEX)
-
-# ---------------- SPREAD CHECK / ALERT ----------------
-def check_and_alert(sym: str):
-    dex = dex_prices.get(sym)
-    cex = cex_prices.get(sym)
-    if dex is None or cex is None:
+def send_telegram(text: str, photo=None):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
         return
-    if dex == 0:
-        return
-    pct = (cex - dex) / dex * 100.0
-    if pct >= SPREAD_MIN_PCT_ALERT:
-        now = time.time()
-        last = last_alert_time.get(sym, 0)
-        if now - last < 300:
-            return
-        last_alert_time[sym] = now
-        msg = (
-            "🔔 *Spread Opportunity Detected*\n"
-            f"Symbol: `{sym}`\n"
-            f"DEX price: `{dex:.8f}`\n"
-            f"CEX price: `{cex:.8f}`\n"
-            f"Spread: *{pct:.2f}%*\n"
-            f"Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
-        )
-        logger.info("ALERT %s (%.2f%%)", sym, pct)
-        tg_send(msg)
+    try:
+        if photo:
+            files = {'photo': ('signal.png', photo, 'image/png')}
+            data = {'chat_id': CHAT_ID, 'caption': escape_md_v2(text), 'parse_mode': 'MarkdownV2'}
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto", data=data, files=files, timeout=10)
+        else:
+            payload = {"chat_id": CHAT_ID, "text": escape_md_v2(text), "parse_mode": "MarkdownV2"}
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=10)
+    except Exception as e:
+        logger.exception("send_telegram error: %s", e)
 
-# ---------------- FLASK + SOCKET.IO ----------------
-app = Flask(__name__)
-# use eventlet for concurrency (recommended with flask-socketio and ccxt.pro)
-# ensure eventlet is installed in your env; flask-socketio will auto-detect available async workers.
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
+# ---------------- WEBSOCKET / REST MANAGER ----------------
+from websocket_manager import WebSocketKlineManager
 
-# minimal web UI (Bootstrap + SocketIO)
-INDEX_HTML = """
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <title>Live DEX ↔ CEX Monitor</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
-    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
-  </head>
-  <body class="bg-light">
-    <div class="container py-4">
-      <h3>Live DEX ↔ CEX Monitor</h3>
-      <div class="mb-2">
-        <form id="addForm" class="row g-2">
-          <div class="col-auto"><input id="symbol" class="form-control" placeholder="SYMBOL (e.g. PEPE)" autocomplete="off"></div>
-          <div class="col-auto"><button class="btn btn-primary">Add</button></div>
-          <div class="col-auto"><button id="clearBtn" class="btn btn-danger" type="button">Clear All</button></div>
-        </form>
-      </div>
-      <div id="statusBadge" class="mb-2"></div>
-      <div class="table-responsive">
-        <table class="table table-sm table-bordered" id="liveTable">
-          <thead class="table-light"><tr><th>Symbol</th><th>DEX (USD)</th><th>CEX (USD)</th><th>Δ%</th></tr></thead>
-          <tbody id="tbody"></tbody>
-        </table>
-      </div>
-      <div class="small text-muted">Connected clients: <span id="clients">0</span></div>
-    </div>
-    <script>
-      const socket = io();
-      const tbody = document.getElementById("tbody");
-      const clientsEl = document.getElementById("clients");
-      const statusBadge = document.getElementById("statusBadge");
+ALL_USDT = [
+    "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","ADAUSDT","DOGEUSDT",
+    "DOTUSDT","TRXUSDT","LTCUSDT","AVAXUSDT","SHIBUSDT","LINKUSDT","ATOMUSDT","XMRUSDT",
+    "ETCUSDT","XLMUSDT","APTUSDT","NEARUSDT","FILUSDT","ICPUSDT","GRTUSDT","AAVEUSDT",
+    "SANDUSDT","AXSUSDT","FTMUSDT","THETAUSDT","EGLDUSDT","MANAUSDT","FLOWUSDT","HBARUSDT",
+    "ALGOUSDT","ZECUSDT","EOSUSDT","KSMUSDT","CELOUSDT","SUSHIUSDT","CHZUSDT","KAVAUSDT",
+    "ZILUSDT","ANKRUSDT","RAYUSDT","GMTUSDT","UNIUSDT","APEUSDT","PEPEUSDT","OPUSDT",
+    "XTZUSDT","ALPHAUSDT","BALUSDT","COMPUSDT","CRVUSDT","SNXUSDT","RSRUSDT",
+    "LOKUSDT","GALUSDT","WLDUSDT","JASMYUSDT","ONEUSDT","ARBUSDT","ALICEUSDT","XECUSDT",
+    "FLMUSDT","CAKEUSDT","IMXUSDT","HOOKUSDT","MAGICUSDT","STGUSDT","FETUSDT",
+    "PEOPLEUSDT","ASTRUSDT","ENSUSDT","CTSIUSDT","GALAUSDT","RADUSDT","IOSTUSDT","QTUMUSDT",
+    "NPXSUSDT","DASHUSDT","ZRXUSDT","HNTUSDT","ENJUSDT","TFUELUSDT","TWTUSDT",
+    "NKNUSDT","GLMRUSDT","ZENUSDT","STORJUSDT","ICXUSDT","XVGUSDT","FLOKIUSDT","BONEUSDT",
+    "TRBUSDT","C98USDT","MASKUSDT","1000SHIBUSDT","1000PEPEUSDT","AMBUSDT","VEGUSDT","QNTUSDT",
+    "RNDRUSDT","CHRUSDT","API3USDT","MTLUSDT","ALPUSDT","LDOUSDT","AXLUSDT","FUNUSDT",
+    "OGUSDT","ORCUSDT","XAUTUSDT","ARUSDT","DYDXUSDT","RUNEUSDT","FLUXUSDT",
+    "AGLDUSDT","PERPUSDT","MLNUSDT","NMRUSDT","LRCUSDT","COTIUSDT","ACHUSDT",
+    "CKBUSDT","ACEUSDT","TRUUSDT","IPSUSDT","QIUSDT","GLMUSDT","ARNXUSDT",
+    "MIRUSDT","ROSEUSDT","OXTUSDT","SPELLUSDT","SUNUSDT","SYSUSDT","TAOUSDT",
+    "TLMUSDT","VLXUSDT","WAXPUSDT","XNOUSDT"
+]
 
-      socket.on("connect", () => {
-        console.log("connected");
-      });
-      socket.on("live.update", (data) => {
-        // data: {symbols: [...], dex_prices: {...}, cex_prices: {...}, time: ...}
-        const symbols = data.symbols || [];
-        tbody.innerHTML = "";
-        symbols.forEach(s => {
-          const dex = data.dex_prices[s];
-          const cex = data.cex_prices[s];
-          let dexStr = dex == null ? "—" : dex.toFixed(8);
-          let cexStr = cex == null ? "—" : cex.toFixed(8);
-          let pct = "—";
-          if (dex != null && cex != null && dex !== 0) {
-            pct = ((cex - dex)/dex*100).toFixed(2) + "%";
-          }
-          const tr = document.createElement("tr");
-          tr.innerHTML = `<td><strong>${s}</strong></td><td>${dexStr}</td><td>${cexStr}</td><td>${pct}</td>`;
-          tbody.appendChild(tr);
-        });
-      });
-      socket.on("clients", (n) => { clientsEl.innerText = n; });
-      socket.on("status", (txt) => { statusBadge.innerHTML = '<span class="badge bg-info">'+txt+'</span>'; setTimeout(()=>statusBadge.innerHTML="",3000); });
+BINANCE_REST_URL = "https://fapi.binance.com/fapi/v1/klines"
 
-      // add form
-      document.getElementById("addForm").addEventListener("submit", (e) => {
-        e.preventDefault();
-        const sym = document.getElementById("symbol").value.trim().toUpperCase();
-        if (!sym) return;
-        socket.emit("add_symbol", sym);
-        document.getElementById("symbol").value = "";
-      });
-      document.getElementById("clearBtn").addEventListener("click", () => {
-        if (!confirm("Clear all symbols?")) return;
-        socket.emit("clear_symbols");
-      });
-    </script>
-  </body>
-</html>
-"""
+def fetch_klines_rest(symbol, interval="15m", limit=500):
+    try:
+        resp = requests.get(BINANCE_REST_URL, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=5)
+        data = resp.json()
+        df = pd.DataFrame(data, columns=[
+            "open_time","open","high","low","close","volume",
+            "close_time","quote_asset_volume","trades",
+            "taker_buy_base","taker_buy_quote","ignore"
+        ])
+        for col in ["open","high","low","close","volume"]:
+            df[col] = df[col].astype(float)
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+        df.set_index("open_time", inplace=True)
+        return df
+    except Exception as e:
+        logger.exception("REST fetch error for %s: %s", symbol, e)
+        return None
 
-@app.route("/", methods=["GET"])
-def index():
-    return render_template_string(INDEX_HTML)
+ws_manager = WebSocketKlineManager(symbols=ALL_USDT, interval="15m")
+Thread(target=ws_manager.start, daemon=True).start()
 
-# Telegram webhook endpoint for commands (webhook mode)
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.get_json(force=True)
-    # Telegram sends updates here; we support message commands only
-    if not data:
-        return jsonify({"ok": False}), 400
-    # get message
-    msg = data.get("message") or data.get("edited_message")
-    if not msg:
-        return jsonify({"ok": True})
-    chat = msg.get("chat", {})
-    cid = chat.get("id")
-    if not state.get("chat_id"):
-        state["chat_id"] = cid
-        save_state()
-    text = (msg.get("text") or "").strip()
-    if not text:
-        return jsonify({"ok": True})
-    logger.info("Webhook cmd from %s: %s", cid, text[:120])
-    # simple command parsing
-    cmd = text.split()[0].lower()
-    if cmd == "/start":
-        tg_send("🤖 Live monitor is online. Use /add SYMBOL")
-    elif cmd == "/help":
-        tg_send("Commands:\n/add SYMBOL\n/remove SYMBOL\n/list\n/start_monitor\n/stop_monitor\n/help")
-    elif cmd == "/add":
-        parts = text.split(maxsplit=1)
-        if len(parts) == 2:
-            sym = parts[1].strip().upper()
-            if sym not in state["symbols"]:
-                state["symbols"].append(sym)
-                save_state()
-                socketio.emit("status", f"Added {sym}")
-                tg_send(f"✅ Added {sym}")
-            else:
-                tg_send(f"⚠️ {sym} already exists")
-    elif cmd == "/remove":
-        parts = text.split(maxsplit=1)
-        if len(parts) == 2:
-            sym = parts[1].strip().upper()
-            if sym in state["symbols"]:
-                state["symbols"].remove(sym)
-                save_state()
-                socketio.emit("status", f"Removed {sym}")
-                tg_send(f"🗑 Removed {sym}")
-            else:
-                tg_send(f"⚠️ {sym} not monitored")
-    elif cmd == "/list":
-        tg_send("Monitored: " + (", ".join(state["symbols"]) if state["symbols"] else "—"))
-    elif cmd == "/start_monitor":
-        state["monitoring"] = True
-        save_state()
-        tg_send("✅ Monitoring resumed")
-    elif cmd == "/stop_monitor":
-        state["monitoring"] = False
-        save_state()
-        tg_send("🛑 Monitoring paused")
+def fetch_klines(symbol, limit=500):
+    df = ws_manager.get_klines(symbol, limit)
+    if df is None or len(df) < 10:
+        df = fetch_klines_rest(symbol, limit=limit)
+    return df
+
+# ---------------- PATTERN-BASED FEATURE ENGINEERING ----------------
+def apply_all_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    # Support/Resistance (динамічні рівні за останні 20 свічок)
+    df["support"] = df["low"].rolling(20).min()
+    df["resistance"] = df["high"].rolling(20).max()
+
+    # Volume analysis
+    df["vol_ma20"] = df["volume"].rolling(20).mean()
+    df["vol_spike"] = df["volume"] > 1.5 * df["vol_ma20"]
+
+    # Candle structure
+    df["body"] = df["close"] - df["open"]
+    df["range"] = df["high"] - df["low"]
+    df["upper_shadow"] = df["high"] - df[["close", "open"]].max(axis=1)
+    df["lower_shadow"] = df[["close", "open"]].min(axis=1) - df["low"]
+
+    return df
+
+# ---------------- PATTERN-BASED SIGNAL DETECTION ----------------
+# ---------------- ADVANCED SIGNAL DETECTION (V2) ----------------
+def detect_signal_v2(df: pd.DataFrame):
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    votes = []
+    confidence = 0.5  # базова впевненість
+
+    # --- 1. Price Action (свічкові патерни) ---
+    # Hammer / Shooting Star
+    if last["lower_shadow"] > 2 * abs(last["body"]) and last["body"] > 0:
+        votes.append("hammer_bull"); confidence += 0.1
+    if last["upper_shadow"] > 2 * abs(last["body"]) and last["body"] < 0:
+        votes.append("shooting_star"); confidence += 0.1
+
+    # Engulfing
+    if last["body"] > 0 and prev["body"] < 0 and last["close"] > prev["open"] and last["open"] < prev["close"]:
+        votes.append("bullish_engulfing"); confidence += 0.1
+    if last["body"] < 0 and prev["body"] > 0 and last["close"] < prev["open"] and last["open"] > prev["close"]:
+        votes.append("bearish_engulfing"); confidence += 0.1
+
+    # Doji
+    if abs(last["body"]) < 0.1 * last["range"]:
+        votes.append("doji"); confidence += 0.05
+
+    # Tweezer Top/Bottom
+    if abs(last["high"] - prev["high"]) < 0.001 * last["high"] and last["close"] < last["open"]:
+        votes.append("tweezer_top"); confidence += 0.05
+    if abs(last["low"] - prev["low"]) < 0.001 * last["low"] and last["close"] > last["open"]:
+        votes.append("tweezer_bottom"); confidence += 0.05
+
+    # Inside / Outside bar
+    if last["high"] < prev["high"] and last["low"] > prev["low"]:
+        votes.append("inside_bar"); confidence += 0.05
+    if last["high"] > prev["high"] and last["low"] < prev["low"]:
+        votes.append("outside_bar"); confidence += 0.05
+
+    # Momentum exhaustion (3+ свічки в один бік)
+    if all(df["close"].iloc[-i] > df["open"].iloc[-i] for i in range(1, 4)):
+        votes.append("3_green"); confidence += 0.05
+    if all(df["close"].iloc[-i] < df["open"].iloc[-i] for i in range(1, 4)):
+        votes.append("3_red"); confidence += 0.05
+
+    # --- 2. Volume & Liquidity ---
+    if last["vol_spike"]:
+        votes.append("volume_spike"); confidence += 0.05
+    if last["volume"] > 2 * df["vol_ma20"].iloc[-1]:
+        votes.append("climax_volume"); confidence += 0.05
+    if last["volume"] < 0.5 * df["vol_ma20"].iloc[-1] and (
+        last["close"] > last["resistance"] or last["close"] < last["support"]):
+        votes.append("low_volume_breakout"); confidence -= 0.05
+
+    # --- 3. Structure & Levels ---
+    if prev["close"] > prev["resistance"] and last["close"] < last["resistance"]:
+        votes.append("fake_breakout_short"); confidence += 0.05
+    if prev["close"] < prev["support"] and last["close"] > last["support"]:
+        votes.append("fake_breakout_long"); confidence += 0.05
+    if prev["close"] < prev["resistance"] and last["close"] > last["resistance"]:
+        votes.append("resistance_flip_support"); confidence += 0.05
+    if prev["close"] > prev["support"] and last["close"] < last["support"]:
+        votes.append("support_flip_resistance"); confidence += 0.05
+
+    # Retest
+    if abs(last["close"] - last["support"]) / last["support"] < 0.003 and last["body"] > 0:
+        votes.append("support_retest"); confidence += 0.05
+    if abs(last["close"] - last["resistance"]) / last["resistance"] < 0.003 and last["body"] < 0:
+        votes.append("resistance_retest"); confidence += 0.05
+
+    # Liquidity grab (свічка проколола рівень, але закрилась всередині)
+    if last["low"] < last["support"] and last["close"] > last["support"]:
+        votes.append("liquidity_grab_long"); confidence += 0.05
+    if last["high"] > last["resistance"] and last["close"] < last["resistance"]:
+        votes.append("liquidity_grab_short"); confidence += 0.05
+
+    # --- 4. Trend & Context ---
+    df["trend"] = df["close"].rolling(20).mean()
+    if last["close"] > df["trend"].iloc[-1]:
+        votes.append("above_trend"); confidence += 0.05
     else:
-        tg_send("❓ Unknown command. /help")
+        votes.append("below_trend"); confidence += 0.05
+
+    # --- Pre-top (як було) ---
+    pretop = False
+    if len(df) >= 10 and (last["close"] - df["close"].iloc[-10]) / df["close"].iloc[-10] > 0.10:
+        pretop = True
+        votes.append("pretop"); confidence += 0.1
+
+    # --- Action ---
+    action = "WATCH"
+    near_resistance = last["close"] >= last["resistance"] * 0.98
+    near_support = last["close"] <= last["support"] * 1.02
+    if near_resistance:
+        action = "SHORT"
+    elif near_support:
+        action = "LONG"
+
+    # Clamp confidence
+    confidence = max(0.0, min(1.0, confidence))
+    return action, votes, pretop, last, confidence
+
+
+# ---------------- MAIN ANALYZE FUNCTION ----------------
+def analyze_and_alert(symbol: str):
+    df = fetch_klines(symbol, limit=200)
+    if df is None or len(df) < 40:
+        return
+
+    df = apply_all_features(df)
+
+    action, votes, pretop, last, confidence = detect_signal_v2(df)
+
+    # Entry / SL / TP
+    entry = stop_loss = tp1 = tp2 = tp3 = None
+    if action == "LONG":
+        entry = last["support"] * 1.001
+        stop_loss = last["support"] * 0.99
+        tp1 = entry + (last["resistance"] - entry) * 0.33
+        tp2 = entry + (last["resistance"] - entry) * 0.66
+        tp3 = last["resistance"]
+    elif action == "SHORT":
+        entry = last["resistance"] * 0.999
+        stop_loss = last["resistance"] * 1.01
+        tp1 = entry - (entry - last["support"]) * 0.33
+        tp2 = entry - (entry - last["support"]) * 0.66
+        tp3 = last["support"]
+
+    if action == "WATCH":
+        return
+
+    # R/R
+    rr1 = (tp1 - entry)/(entry - stop_loss) if action=="LONG" else (entry - tp1)/(stop_loss - entry)
+    rr2 = (tp2 - entry)/(entry - stop_loss) if action=="LONG" else (entry - tp2)/(stop_loss - entry)
+    rr3 = (tp3 - entry)/(entry - stop_loss) if action=="LONG" else (entry - tp3)/(stop_loss - entry)
+
+    logger.info(
+        "Symbol=%s action=%s confidence=%.2f votes=%s pretop=%s RR1=%.2f RR2=%.2f RR3=%.2f",
+        symbol, action, confidence, votes, pretop, rr1, rr2, rr3
+    )
+
+    # --- Фільтр: мінімум RR >= 2 ---
+    if confidence >= CONF_THRESHOLD_MEDIUM and rr1 >= 2.0:
+        reasons = []
+        if "pretop" in votes: reasons.append("Pre-Top")
+        if "fake_breakout_long" in votes or "fake_breakout_short" in votes: reasons.append("Fake Breakout")
+        if "resistance_flip_support" in votes or "support_flip_resistance" in votes: reasons.append("S/R Flip")
+        if "volume_spike" in votes: reasons.append("Volume Spike")
+        if not reasons: reasons = ["Candle/Pattern Mix"]
+
+        msg = (
+            f"⚡ TRADE SIGNAL\n"
+            f"Symbol: {symbol}\n"
+            f"Action: {action}\n"
+            f"Entry: {entry:.6f}\n"
+            f"Stop-Loss: {stop_loss:.6f}\n"
+            f"Take-Profit 1: {tp1:.6f} (RR {rr1:.2f})\n"
+            f"Take-Profit 2: {tp2:.6f} (RR {rr2:.2f})\n"
+            f"Take-Profit 3: {tp3:.6f} (RR {rr3:.2f})\n"
+            f"Confidence: {confidence:.2f}\n"
+            f"Reasons: {', '.join(reasons)}\n"
+            f"Patterns: {', '.join(votes)}\n"
+        )
+
+        photo_buf = plot_signal_candles(df, symbol, action, tp1=tp1, tp2=tp2, tp3=tp3, sl=stop_loss, entry=entry)
+        send_telegram(msg, photo=photo_buf)
+
+        state.setdefault("signals", {})[symbol] = {
+            "action": action, "entry": entry, "sl": stop_loss, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+            "rr1": rr1, "rr2": rr2, "rr3": rr3, "confidence": confidence,
+            "time": str(last.name), "last_price": float(last["close"]), "votes": votes
+        }
+        save_json_safe(STATE_FILE, state)
+
+# ---------------- PLOT UTILITY ----------------
+def plot_signal_candles(df, symbol, action, tp1=None, tp2=None, tp3=None, sl=None, entry=None):
+    addplots = []
+    if tp1: addplots.append(mpf.make_addplot([tp1]*len(df), color='green', linestyle="--"))
+    if tp2: addplots.append(mpf.make_addplot([tp2]*len(df), color='lime', linestyle="--"))
+    if tp3: addplots.append(mpf.make_addplot([tp3]*len(df), color='darkgreen', linestyle="--"))
+    if sl: addplots.append(mpf.make_addplot([sl]*len(df), color='red', linestyle="--"))
+    if entry: addplots.append(mpf.make_addplot([entry]*len(df), color='blue', linestyle="--"))
+
+    fig, ax = mpf.plot(
+        df.tail(200), type='candle', style='yahoo',
+        title=f"{symbol} - {action}", addplot=addplots, returnfig=True
+    )
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', bbox_inches='tight')
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+# ---------------- FETCH TOP SYMBOLS ----------------
+def fetch_top_symbols(limit=300):
+    try:
+        # Беремо всі USDT-пари ф'ючерсів
+        tickers = binance_client.futures_ticker()  # Для USDT-M ф'ючерсів
+        usdt_pairs = [t for t in tickers if t['symbol'].endswith("USDT")]
+        sorted_pairs = sorted(
+            usdt_pairs,
+            key=lambda x: abs(float(x.get("priceChangePercent", 0))),
+            reverse=True
+        )
+        top_symbols = [d["symbol"] for d in sorted_pairs[:limit]]
+        logger.info("Top %d symbols fetched: %s", limit, top_symbols[:10])
+        return top_symbols
+    except Exception as e:
+        logger.exception("Error fetching top symbols: %s", e)
+        return []
+
+# ---------------- MASTER SCAN ----------------
+def scan_all_symbols():
+    symbols = fetch_top_symbols(limit=300)
+    if not symbols:
+        logger.warning("No symbols fetched, falling back to ALL_USDT list")
+        symbols = ALL_USDT
+    logger.info("Starting scan for %d symbols", len(symbols))
+    def safe_analyze(sym):
+        try:
+            analyze_and_alert(sym)
+        except Exception as e:
+            logger.exception("Error analyzing symbol %s: %s", sym, e)
+    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as exe:
+        list(exe.map(safe_analyze, symbols))
+    state["last_scan"] = str(datetime.now(timezone.utc))
+    save_json_safe(STATE_FILE, state)
+    logger.info("Scan finished at %s", state["last_scan"])
+
+# ---------------- FLASK ----------------
+from flask import Flask, request, jsonify
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return jsonify({
+        "status": "ok",
+        "time": str(datetime.now(timezone.utc)),
+        "signals": len(state.get("signals", {}))
+    })
+
+@app.route("/telegram_webhook/<token>", methods=["POST"])
+def telegram_webhook(token):
+    if token != TELEGRAM_TOKEN:
+        return jsonify({"ok": False, "error": "invalid token"}), 403
+    update = request.get_json(force=True) or {}
+    text = update.get("message", {}).get("text", "").lower().strip()
+    if text.startswith("/scan"):
+        send_telegram("⚡ Manual scan started.")
+        Thread(target=scan_all_symbols, daemon=True).start()
     return jsonify({"ok": True})
 
-# SocketIO events
-@socketio.on("connect")
-def on_connect():
-    emit("clients", len(socketio.server.manager.get_participants('/', '/')) if hasattr(socketio, 'server') else 1)
-    # send initial live update
-    emit("live.update", {"symbols": state.get("symbols", []), "dex_prices": dex_prices, "cex_prices": cex_prices, "time": time.time()})
-
-@socketio.on("add_symbol")
-def on_add_symbol(sym):
-    s = sym.strip().upper()
-    if not s:
-        return
-    if s not in state["symbols"]:
-        state["symbols"].append(s)
-        save_state()
-        emit("status", f"Added {s}", broadcast=True)
-    else:
-        emit("status", f"{s} already monitored")
-
-@socketio.on("clear_symbols")
-def on_clear():
-    state["symbols"] = []
-    save_state()
-    emit("status", "Cleared symbols", broadcast=True)
-
-# ---------------- ORCHESTRATION: background async loop ----------------
-class Orchestrator:
-    def __init__(self):
-        self.loop = None
-        self.thread = None
-        self.cex = CEXWatcher("mexc")
-        self.dex = DexPoller()
-        self.tasks: List[asyncio.Task] = []
-        self.running = False
-
-    def start(self):
-        if self.running:
-            return
-        # start asyncio loop in separate thread
-        self.loop = asyncio.new_event_loop()
-        self.thread = Thread(target=self._run_loop, daemon=True)
-        self.thread.start()
-        self.running = True
-
-    def _run_loop(self):
-        asyncio.set_event_loop(self.loop)
-        self.loop.run_until_complete(self._main())
-
-    async def _main(self):
-        # load state
-        load_state()
-        # start components
-        logger.info("Starting background components")
-        # start cex watcher if available
-        if ccxtpro:
-            await self.cex.start()
-        else:
-            logger.warning("ccxt.pro not available; CEX websocket disabled")
-        await self.dex.start()
-        # live broadcaster task: emits live.update to socketio regularly
-        async def broadcaster():
-            while True:
-                if state.get("monitoring", True):
-                    # run spread checks
-                    for s in list(state.get("symbols", []))[:MAX_SYMBOLS]:
-                        try:
-                            check_and_alert(s)
-                        except Exception:
-                            pass
-                # emit live update
-                try:
-                    socketio.emit("live.update", {"symbols": state.get("symbols", []), "dex_prices": dex_prices, "cex_prices": cex_prices, "time": time.time()})
-                except Exception:
-                    pass
-                await asyncio.sleep(LIVE_BROADCAST_INTERVAL)
-        # periodic discovery (optional) - we skip heavy discovery here
-        # start broadcaster
-        broadcaster_task = asyncio.create_task(broadcaster())
-        self.tasks.append(broadcaster_task)
-        # also run a lightweight keepalive for cex if ccxt.pro used
-        try:
-            await asyncio.gather(*self.tasks)
-        except asyncio.CancelledError:
-            logger.info("Orchestrator tasks cancelled")
-        finally:
-            await self._shutdown()
-
-    async def _shutdown(self):
-        try:
-            await self.cex.stop()
-        except Exception:
-            pass
-        try:
-            await self.dex.stop()
-        except Exception:
-            pass
-
-    def stop(self):
-        if not self.running:
-            return
-        # cancel tasks and stop loop
-        async def _stop_all():
-            for t in list(asyncio.all_tasks(loop=self.loop)):
-                try:
-                    t.cancel()
-                except Exception:
-                    pass
-        fut = asyncio.run_coroutine_threadsafe(_stop_all(), self.loop)
-        try:
-            fut.result(timeout=5)
-        except Exception:
-            pass
-        self.loop.call_soon_threadsafe(self.loop.stop)
-        self.thread.join(timeout=2)
-        self.running = False
-
-# ---------------- BOOT ----------------
-orchestrator = Orchestrator()
-
+# ---------------- MAIN ----------------
 if __name__ == "__main__":
-    logger.info("🚀 Starting Live DEX<->CEX monitor")
-    # load config
-    load_state()
-    # set Telegram webhook if provided and token exists
-    if TELEGRAM_TOKEN and WEBHOOK_URL:
-        try:
-            url = WEBHOOK_URL.rstrip("/") + "/webhook"
-            r = requests.get(f"{TELEGRAM_API}/setWebhook?url={url}", timeout=10)
-            logger.info("Set webhook result: %s", r.text[:200])
-        except Exception as e:
-            logger.warning("Failed to set webhook: %s", e)
-
-    # start background orchestrator
-    orchestrator.start()
-    # run flask socketio (use eventlet for concurrency)
-    # NOTE: flask-socketio will use eventlet/gevent if available. eventlet recommended.
-    socketio.run(app, host="0.0.0.0", port=PORT)
+    logger.info("Starting pre-top detector bot")
+    Thread(target=scan_all_symbols, daemon=True).start()
+    app.run(host="0.0.0.0", port=PORT)
