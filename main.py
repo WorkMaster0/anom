@@ -106,7 +106,7 @@ ALL_USDT = [
 
 BINANCE_REST_URL = "https://fapi.binance.com/fapi/v1/klines"
 
-def fetch_klines_rest(symbol, interval="15m", limit=500):
+def fetch_klines_rest(symbol, interval="30m", limit=500):
     try:
         resp = requests.get(BINANCE_REST_URL, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=5)
         data = resp.json()
@@ -256,7 +256,7 @@ def detect_signal_v2(df: pd.DataFrame):
 
 # ---------------- MAIN ANALYZE FUNCTION ----------------
 def analyze_and_alert(symbol: str):
-    df = fetch_klines(symbol, limit=200)
+    df = fetch_klines(symbol, limit=500)
     if df is None or len(df) < 40:
         return
 
@@ -335,7 +335,7 @@ def plot_signal_candles(df, symbol, action, tp1=None, tp2=None, tp3=None, sl=Non
     if entry: addplots.append(mpf.make_addplot([entry]*len(df), color='blue', linestyle="--"))
 
     fig, ax = mpf.plot(
-        df.tail(200), type='candle', style='yahoo',
+        df.tail(500), type='candle', style='yahoo',
         title=f"{symbol} - {action}", addplot=addplots, returnfig=True
     )
     buf = io.BytesIO()
