@@ -32,7 +32,7 @@ PORT = int(os.getenv("PORT", "5000"))
 PARALLEL_WORKERS = int(os.getenv("PARALLEL_WORKERS", "6"))
 EMA_SCAN_LIMIT = 500
 STATE_FILE = "state.json"
-CONF_THRESHOLD_MEDIUM = 0.3
+CONF_THRESHOLD_MEDIUM = 0.01
 
 # ---------------- BINANCE CLIENT ----------------
 binance_client = Client(api_key="", api_secret="")
@@ -124,7 +124,7 @@ def fetch_klines_rest(symbol, interval="15m", limit=500):
         logger.exception("REST fetch error for %s: %s", symbol, e)
         return None
 
-ws_manager = WebSocketKlineManager(symbols=ALL_USDT, interval="15m")
+ws_manager = WebSocketKlineManager(symbols=ALL_USDT, interval="30m")
 Thread(target=ws_manager.start, daemon=True).start()
 
 def fetch_klines(symbol, limit=500):
@@ -293,7 +293,7 @@ def analyze_and_alert(symbol: str):
     )
 
     # --- Фільтр: мінімум RR >= 2 ---
-    if confidence >= CONF_THRESHOLD_MEDIUM and rr1 >= 2.0:
+    if confidence >= CONF_THRESHOLD_MEDIUM and rr1 >= 4.0:
         reasons = []
         if "pretop" in votes: reasons.append("Pre-Top")
         if "fake_breakout_long" in votes or "fake_breakout_short" in votes: reasons.append("Fake Breakout")
