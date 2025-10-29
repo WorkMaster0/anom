@@ -293,7 +293,7 @@ def analyze_and_alert(symbol: str):
     )
 
     # --- Фільтр: мінімум RR >= 2 ---
-    if confidence >= CONF_THRESHOLD_MEDIUM and rr1 >= 4.0:
+    if confidence >= CONF_THRESHOLD_MEDIUM and rr1 >= 3.0:
         reasons = []
         if "pretop" in votes: reasons.append("Pre-Top")
         if "fake_breakout_long" in votes or "fake_breakout_short" in votes: reasons.append("Fake Breakout")
