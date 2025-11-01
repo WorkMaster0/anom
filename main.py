@@ -21,7 +21,7 @@ from binance.exceptions import BinanceAPIException
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHAT_ID = os.getenv("CHAT_ID", "")
 PORT = int(os.getenv("PORT", "5000"))
 PARALLEL_WORKERS = int(os.getenv("PARALLEL_WORKERS", "6"))
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", str(5 * 60)))  # 5 minutes default
