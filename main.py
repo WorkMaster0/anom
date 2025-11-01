@@ -1,410 +1,433 @@
+#!/usr/bin/env python3
+# main.py - Smart Money Futures scanner + Telegram alerts
+# Requirements: python-binance, pandas, numpy, requests, flask
+# Install: pip install python-binance pandas numpy requests flask ta mplfinance
+
 import os
 import time
 import json
 import logging
-import re
+import math
 from datetime import datetime, timezone
 from threading import Thread
 from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
-import matplotlib.pyplot as plt
-import requests
-import ta
-import mplfinance as mpf
 import numpy as np
-import io
+import requests
+from flask import Flask, jsonify
 
 from binance.client import Client
+from binance.exceptions import BinanceAPIException
+
+# ---------------- CONFIG / ENV ----------------
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "300"))  # sec (default 5 minutes)
+PARALLEL_WORKERS = int(os.getenv("PARALLEL_WORKERS", "6"))
+SYMBOLS_ENV = os.getenv("SYMBOLS", "")  # optional CSV of symbols
+
+# safety defaults
+if not BINANCE_API_KEY or not BINANCE_API_SECRET:
+    logging.warning("BINANCE API KEY/SECRET not set - some endpoints will fail if used.")
+if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+    logging.warning("TELEGRAM token/chat not set - alerts will not be sent.")
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()]
+    handlers=[logging.StreamHandler()]
 )
-logger = logging.getLogger("pretop-bot")
-
-# ---------------- CONFIG ----------------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-CHAT_ID = os.getenv("CHAT_ID", "")
-PORT = int(os.getenv("PORT", "5000"))
-PARALLEL_WORKERS = int(os.getenv("PARALLEL_WORKERS", "6"))
-EMA_SCAN_LIMIT = 500
-STATE_FILE = "state.json"
-CONF_THRESHOLD_MEDIUM = 0.01
+logger = logging.getLogger("smc-futures-bot")
 
 # ---------------- BINANCE CLIENT ----------------
-binance_client = Client(api_key="", api_secret="")
+client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 
 # ---------------- STATE ----------------
-def load_json_safe(path, default):
+STATE_FILE = "state_signals.json"
+def load_state():
     try:
-        if os.path.exists(path):
-            with open(path, "r") as f:
-                return json.load(f)
-    except Exception as e:
-        logger.exception("load_json_safe error %s: %s", path, e)
-    return default
-
-def save_json_safe(path, data):
+        if os.path.exists(STATE_FILE):
+            return json.load(open(STATE_FILE, "r"))
+    except Exception:
+        logger.exception("load_state error")
+    return {"signals": {}, "last_scan": None}
+def save_state(state):
     try:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f, indent=2, default=str)
-        os.replace(tmp, path)
-    except Exception as e:
-        logger.exception("save_json_safe error %s: %s", path, e)
-
-state = load_json_safe(STATE_FILE, {"signals": {}, "last_scan": None})
+        json.dump(state, open(STATE_FILE + ".tmp", "w"), indent=2, default=str)
+        os.replace(STATE_FILE + ".tmp", STATE_FILE)
+    except Exception:
+        logger.exception("save_state error")
+state = load_state()
 
 # ---------------- TELEGRAM ----------------
-MARKDOWNV2_ESCAPE = r"_*[]()~`>#+-=|{}.!"
-
-def escape_md_v2(text: str) -> str:
-    return re.sub(f"([{re.escape(MARKDOWNV2_ESCAPE)}])", r"\\\1", str(text))
-
-def send_telegram(text: str, photo=None):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
+def send_telegram(text: str, parse_mode="Markdown"):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.info("Telegram disabled - would send:\n%s", text)
         return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": parse_mode}
     try:
-        if photo:
-            files = {'photo': ('signal.png', photo, 'image/png')}
-            data = {'chat_id': CHAT_ID, 'caption': escape_md_v2(text), 'parse_mode': 'MarkdownV2'}
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto", data=data, files=files, timeout=10)
-        else:
-            payload = {"chat_id": CHAT_ID, "text": escape_md_v2(text), "parse_mode": "MarkdownV2"}
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=10)
+        r = requests.post(url, json=payload, timeout=10)
+        if r.status_code != 200:
+            logger.warning("Telegram send failed: %s %s", r.status_code, r.text)
     except Exception as e:
         logger.exception("send_telegram error: %s", e)
 
-# ---------------- WEBSOCKET / REST MANAGER ----------------
-from websocket_manager import WebSocketKlineManager
-
-ALL_USDT = [
-    "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","ADAUSDT","DOGEUSDT",
-    "DOTUSDT","TRXUSDT","LTCUSDT","AVAXUSDT","SHIBUSDT","LINKUSDT","ATOMUSDT","XMRUSDT",
-    "ETCUSDT","XLMUSDT","APTUSDT","NEARUSDT","FILUSDT","ICPUSDT","GRTUSDT","AAVEUSDT",
-    "SANDUSDT","AXSUSDT","FTMUSDT","THETAUSDT","EGLDUSDT","MANAUSDT","FLOWUSDT","HBARUSDT",
-    "ALGOUSDT","ZECUSDT","EOSUSDT","KSMUSDT","CELOUSDT","SUSHIUSDT","CHZUSDT","KAVAUSDT",
-    "ZILUSDT","ANKRUSDT","RAYUSDT","GMTUSDT","UNIUSDT","APEUSDT","PEPEUSDT","OPUSDT",
-    "XTZUSDT","ALPHAUSDT","BALUSDT","COMPUSDT","CRVUSDT","SNXUSDT","RSRUSDT",
-    "LOKUSDT","GALUSDT","WLDUSDT","JASMYUSDT","ONEUSDT","ARBUSDT","ALICEUSDT","XECUSDT",
-    "FLMUSDT","CAKEUSDT","IMXUSDT","HOOKUSDT","MAGICUSDT","STGUSDT","FETUSDT",
-    "PEOPLEUSDT","ASTRUSDT","ENSUSDT","CTSIUSDT","GALAUSDT","RADUSDT","IOSTUSDT","QTUMUSDT",
-    "NPXSUSDT","DASHUSDT","ZRXUSDT","HNTUSDT","ENJUSDT","TFUELUSDT","TWTUSDT",
-    "NKNUSDT","GLMRUSDT","ZENUSDT","STORJUSDT","ICXUSDT","XVGUSDT","FLOKIUSDT","BONEUSDT",
-    "TRBUSDT","C98USDT","MASKUSDT","1000SHIBUSDT","1000PEPEUSDT","AMBUSDT","VEGUSDT","QNTUSDT",
-    "RNDRUSDT","CHRUSDT","API3USDT","MTLUSDT","ALPUSDT","LDOUSDT","AXLUSDT","FUNUSDT",
-    "OGUSDT","ORCUSDT","XAUTUSDT","ARUSDT","DYDXUSDT","RUNEUSDT","FLUXUSDT",
-    "AGLDUSDT","PERPUSDT","MLNUSDT","NMRUSDT","LRCUSDT","COTIUSDT","ACHUSDT",
-    "CKBUSDT","ACEUSDT","TRUUSDT","IPSUSDT","QIUSDT","GLMUSDT","ARNXUSDT",
-    "MIRUSDT","ROSEUSDT","OXTUSDT","SPELLUSDT","SUNUSDT","SYSUSDT","TAOUSDT",
-    "TLMUSDT","VLXUSDT","WAXPUSDT","XNOUSDT"
-]
-
-BINANCE_REST_URL = "https://fapi.binance.com/fapi/v1/klines"
-
-def fetch_klines_rest(symbol, interval="30m", limit=500):
+# ---------------- UTIL: fetch top symbols ----------------
+def fetch_top_movers(limit=100):
+    """Fetch top movers by 24h change from futures tickers."""
     try:
-        resp = requests.get(BINANCE_REST_URL, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=5)
-        data = resp.json()
-        df = pd.DataFrame(data, columns=[
+        tickers = client.futures_ticker()  # returns list of dicts
+        usdt = [t for t in tickers if t["symbol"].endswith("USDT")]
+        sorted_by_change = sorted(usdt, key=lambda x: abs(float(x.get("priceChangePercent", 0))), reverse=True)
+        symbols = [t["symbol"] for t in sorted_by_change[:limit]]
+        logger.info("Top movers: %s", symbols[:10])
+        return symbols
+    except Exception as e:
+        logger.exception("fetch_top_movers error: %s", e)
+        return []
+
+# ---------------- FETCH KLINES ----------------
+def fetch_klines(symbol: str, interval="5m", limit=200):
+    try:
+        kl = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+        df = pd.DataFrame(kl, columns=[
             "open_time","open","high","low","close","volume",
             "close_time","quote_asset_volume","trades",
             "taker_buy_base","taker_buy_quote","ignore"
         ])
-        for col in ["open","high","low","close","volume"]:
-            df[col] = df[col].astype(float)
+        for c in ["open","high","low","close","volume"]:
+            df[c] = df[c].astype(float)
         df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
         df.set_index("open_time", inplace=True)
         return df
+    except BinanceAPIException as e:
+        logger.error("Binance API error fetching klines %s: %s", symbol, e)
     except Exception as e:
-        logger.exception("REST fetch error for %s: %s", symbol, e)
-        return None
+        logger.exception("fetch_klines error %s: %s", symbol, e)
+    return None
 
-ws_manager = WebSocketKlineManager(symbols=ALL_USDT, interval="30m")
-Thread(target=ws_manager.start, daemon=True).start()
-
-def fetch_klines(symbol, limit=500):
-    df = ws_manager.get_klines(symbol, limit)
-    if df is None or len(df) < 10:
-        df = fetch_klines_rest(symbol, limit=limit)
-    return df
-
-# ---------------- PATTERN-BASED FEATURE ENGINEERING ----------------
-def apply_all_features(df: pd.DataFrame) -> pd.DataFrame:
+# ---------------- SMC / PATTERN FEATURE ENGINEERING ----------------
+def apply_smc_features(df: pd.DataFrame):
     df = df.copy()
+    # basic
+    df["body"] = df["close"] - df["open"]
+    df["range"] = df["high"] - df["low"]
+    df["upper_wick"] = df["high"] - df[["close","open"]].max(axis=1)
+    df["lower_wick"] = df[["close","open"]].min(axis=1) - df["low"]
+    df["vol_ma20"] = df["volume"].rolling(20).mean()
+    df["vol_spike"] = df["volume"] > 2.5 * df["vol_ma20"]
 
-    # Support/Resistance (динамічні рівні за останні 20 свічок)
+    # dynamic support/resistance - simple last 20
     df["support"] = df["low"].rolling(20).min()
     df["resistance"] = df["high"].rolling(20).max()
 
-    # Volume analysis
-    df["vol_ma20"] = df["volume"].rolling(20).mean()
-    df["vol_spike"] = df["volume"] > 1.5 * df["vol_ma20"]
+    # imbalances (FVG-like): look for consecutive candles with gap (simplified)
+    fvg = []
+    for i in range(len(df)):
+        if i >= 2:
+            prev1_high = df["high"].iat[i-2]
+            prev1_low = df["low"].iat[i-2]
+            # simple FVG: current low > previous high (gap up) OR current high < previous low (gap down)
+            cur_low = df["low"].iat[i]
+            cur_high = df["high"].iat[i]
+            fvg.append((cur_low > prev1_high) or (cur_high < prev1_low))
+        else:
+            fvg.append(False)
+    df["fvg"] = fvg
 
-    # Candle structure
-    df["body"] = df["close"] - df["open"]
-    df["range"] = df["high"] - df["low"]
-    df["upper_shadow"] = df["high"] - df[["close", "open"]].max(axis=1)
-    df["lower_shadow"] = df[["close", "open"]].min(axis=1) - df["low"]
+    # liquidity sweeps: wick beyond SR but closed back inside
+    df["liquidity_sweep_long"] = (df["low"] < df["support"]) & (df["close"] > df["support"])
+    df["liquidity_sweep_short"] = (df["high"] > df["resistance"]) & (df["close"] < df["resistance"])
+
+    # CHOCH detection (change of character) - simple heuristic:
+    # find short-term trend: last 10 closes slope sign, compare prev 10
+    df["ma10"] = df["close"].rolling(10).mean()
+    df["ma20"] = df["close"].rolling(20).mean()
+    choch = [False]*len(df)
+    for i in range(len(df)):
+        if i >= 25:
+            # previous structure
+            prev_high = df["high"].iloc[i-20:i-10].max()
+            prev_low = df["low"].iloc[i-20:i-10].min()
+            recent_high = df["high"].iloc[i-10:i].max()
+            recent_low = df["low"].iloc[i-10:i].min()
+            # CHOCH to bullish if recent_high > prev_high and close breaks above prev_high after being below earlier
+            if recent_high > prev_high and df["close"].iat[i] > prev_high:
+                choch[i] = "bullish"
+            elif recent_low < prev_low and df["close"].iat[i] < prev_low:
+                choch[i] = "bearish"
+    df["choch"] = choch
+
+    # accumulation zone: low-range + rising volume
+    df["range_ma20"] = df["range"].rolling(20).mean()
+    df["accumulation_zone"] = (df["range"] < 0.6 * df["range_ma20"]) & (df["volume"] > df["vol_ma20"])
+
+    # short-term imbalance (strong body)
+    df["imbalance_up"] = (df["body"] > 0) & (df["body"] > 0.6 * df["range"])
+    df["imbalance_down"] = (df["body"] < 0) & (abs(df["body"]) > 0.6 * df["range"])
 
     return df
 
-# ---------------- PATTERN-BASED SIGNAL DETECTION ----------------
-# ---------------- ADVANCED SIGNAL DETECTION (V2) ----------------
-def detect_signal_v2(df: pd.DataFrame):
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-    votes = []
-    confidence = 0.5  # базова впевненість
-
-    # --- 1. Price Action (свічкові патерни) ---
-    # Hammer / Shooting Star
-    if last["lower_shadow"] > 2 * abs(last["body"]) and last["body"] > 0:
-        votes.append("hammer_bull"); confidence += 0.1
-    if last["upper_shadow"] > 2 * abs(last["body"]) and last["body"] < 0:
-        votes.append("shooting_star"); confidence += 0.1
-
-    # Engulfing
-    if last["body"] > 0 and prev["body"] < 0 and last["close"] > prev["open"] and last["open"] < prev["close"]:
-        votes.append("bullish_engulfing"); confidence += 0.1
-    if last["body"] < 0 and prev["body"] > 0 and last["close"] < prev["open"] and last["open"] > prev["close"]:
-        votes.append("bearish_engulfing"); confidence += 0.1
-
-    # Doji
-    if abs(last["body"]) < 0.1 * last["range"]:
-        votes.append("doji"); confidence += 0.05
-
-    # Tweezer Top/Bottom
-    if abs(last["high"] - prev["high"]) < 0.001 * last["high"] and last["close"] < last["open"]:
-        votes.append("tweezer_top"); confidence += 0.05
-    if abs(last["low"] - prev["low"]) < 0.001 * last["low"] and last["close"] > last["open"]:
-        votes.append("tweezer_bottom"); confidence += 0.05
-
-    # Inside / Outside bar
-    if last["high"] < prev["high"] and last["low"] > prev["low"]:
-        votes.append("inside_bar"); confidence += 0.05
-    if last["high"] > prev["high"] and last["low"] < prev["low"]:
-        votes.append("outside_bar"); confidence += 0.05
-
-    # Momentum exhaustion (3+ свічки в один бік)
-    if all(df["close"].iloc[-i] > df["open"].iloc[-i] for i in range(1, 4)):
-        votes.append("3_green"); confidence += 0.05
-    if all(df["close"].iloc[-i] < df["open"].iloc[-i] for i in range(1, 4)):
-        votes.append("3_red"); confidence += 0.05
-
-    # --- 2. Volume & Liquidity ---
-    if last["vol_spike"]:
-        votes.append("volume_spike"); confidence += 0.05
-    if last["volume"] > 2 * df["vol_ma20"].iloc[-1]:
-        votes.append("climax_volume"); confidence += 0.05
-    if last["volume"] < 0.5 * df["vol_ma20"].iloc[-1] and (
-        last["close"] > last["resistance"] or last["close"] < last["support"]):
-        votes.append("low_volume_breakout"); confidence -= 0.05
-
-    # --- 3. Structure & Levels ---
-    if prev["close"] > prev["resistance"] and last["close"] < last["resistance"]:
-        votes.append("fake_breakout_short"); confidence += 0.05
-    if prev["close"] < prev["support"] and last["close"] > last["support"]:
-        votes.append("fake_breakout_long"); confidence += 0.05
-    if prev["close"] < prev["resistance"] and last["close"] > last["resistance"]:
-        votes.append("resistance_flip_support"); confidence += 0.05
-    if prev["close"] > prev["support"] and last["close"] < last["support"]:
-        votes.append("support_flip_resistance"); confidence += 0.05
-
-    # Retest
-    if abs(last["close"] - last["support"]) / last["support"] < 0.003 and last["body"] > 0:
-        votes.append("support_retest"); confidence += 0.05
-    if abs(last["close"] - last["resistance"]) / last["resistance"] < 0.003 and last["body"] < 0:
-        votes.append("resistance_retest"); confidence += 0.05
-
-    # Liquidity grab (свічка проколола рівень, але закрилась всередині)
-    if last["low"] < last["support"] and last["close"] > last["support"]:
-        votes.append("liquidity_grab_long"); confidence += 0.05
-    if last["high"] > last["resistance"] and last["close"] < last["resistance"]:
-        votes.append("liquidity_grab_short"); confidence += 0.05
-
-    # --- 4. Trend & Context ---
-    df["trend"] = df["close"].rolling(20).mean()
-    if last["close"] > df["trend"].iloc[-1]:
-        votes.append("above_trend"); confidence += 0.05
-    else:
-        votes.append("below_trend"); confidence += 0.05
-
-    # --- Pre-top (як було) ---
-    pretop = False
-    if len(df) >= 10 and (last["close"] - df["close"].iloc[-10]) / df["close"].iloc[-10] > 0.10:
-        pretop = True
-        votes.append("pretop"); confidence += 0.1
-
-    # --- Action ---
-    action = "WATCH"
-    near_resistance = last["close"] >= last["resistance"] * 0.98
-    near_support = last["close"] <= last["support"] * 1.02
-    if near_resistance:
-        action = "SHORT"
-    elif near_support:
-        action = "LONG"
-
-    # Clamp confidence
-    confidence = max(0.0, min(1.0, confidence))
-    return action, votes, pretop, last, confidence
-
-
-# ---------------- MAIN ANALYZE FUNCTION ----------------
-def analyze_and_alert(symbol: str):
-    df = fetch_klines(symbol, limit=500)
-    if df is None or len(df) < 40:
-        return
-
-    df = apply_all_features(df)
-
-    action, votes, pretop, last, confidence = detect_signal_v2(df)
-
-    # Entry / SL / TP
-    entry = stop_loss = tp1 = tp2 = tp3 = None
-    if action == "LONG":
-        entry = last["support"] * 1.001
-        stop_loss = last["support"] * 0.99
-        tp1 = entry + (last["resistance"] - entry) * 0.33
-        tp2 = entry + (last["resistance"] - entry) * 0.66
-        tp3 = last["resistance"]
-    elif action == "SHORT":
-        entry = last["resistance"] * 0.999
-        stop_loss = last["resistance"] * 1.01
-        tp1 = entry - (entry - last["support"]) * 0.33
-        tp2 = entry - (entry - last["support"]) * 0.66
-        tp3 = last["support"]
-
-    if action == "WATCH":
-        return
-
-    # R/R
-    rr1 = (tp1 - entry)/(entry - stop_loss) if action=="LONG" else (entry - tp1)/(stop_loss - entry)
-    rr2 = (tp2 - entry)/(entry - stop_loss) if action=="LONG" else (entry - tp2)/(stop_loss - entry)
-    rr3 = (tp3 - entry)/(entry - stop_loss) if action=="LONG" else (entry - tp3)/(stop_loss - entry)
-
-    logger.info(
-        "Symbol=%s action=%s confidence=%.2f votes=%s pretop=%s RR1=%.2f RR2=%.2f RR3=%.2f",
-        symbol, action, confidence, votes, pretop, rr1, rr2, rr3
-    )
-
-    # --- Фільтр: мінімум RR >= 2 ---
-    if confidence >= CONF_THRESHOLD_MEDIUM and rr1 >= 3.0:
-        reasons = []
-        if "pretop" in votes: reasons.append("Pre-Top")
-        if "fake_breakout_long" in votes or "fake_breakout_short" in votes: reasons.append("Fake Breakout")
-        if "resistance_flip_support" in votes or "support_flip_resistance" in votes: reasons.append("S/R Flip")
-        if "volume_spike" in votes: reasons.append("Volume Spike")
-        if not reasons: reasons = ["Candle/Pattern Mix"]
-
-        msg = (
-            f"⚡ TRADE SIGNAL\n"
-            f"Symbol: {symbol}\n"
-            f"Action: {action}\n"
-            f"Entry: {entry:.6f}\n"
-            f"Stop-Loss: {stop_loss:.6f}\n"
-            f"Take-Profit 1: {tp1:.6f} (RR {rr1:.2f})\n"
-            f"Take-Profit 2: {tp2:.6f} (RR {rr2:.2f})\n"
-            f"Take-Profit 3: {tp3:.6f} (RR {rr3:.2f})\n"
-            f"Confidence: {confidence:.2f}\n"
-            f"Reasons: {', '.join(reasons)}\n"
-            f"Patterns: {', '.join(votes)}\n"
-        )
-
-        photo_buf = plot_signal_candles(df, symbol, action, tp1=tp1, tp2=tp2, tp3=tp3, sl=stop_loss, entry=entry)
-        send_telegram(msg, photo=photo_buf)
-
-        state.setdefault("signals", {})[symbol] = {
-            "action": action, "entry": entry, "sl": stop_loss, "tp1": tp1, "tp2": tp2, "tp3": tp3,
-            "rr1": rr1, "rr2": rr2, "rr3": rr3, "confidence": confidence,
-            "time": str(last.name), "last_price": float(last["close"]), "votes": votes
-        }
-        save_json_safe(STATE_FILE, state)
-
-# ---------------- PLOT UTILITY ----------------
-def plot_signal_candles(df, symbol, action, tp1=None, tp2=None, tp3=None, sl=None, entry=None):
-    addplots = []
-    if tp1: addplots.append(mpf.make_addplot([tp1]*len(df), color='green', linestyle="--"))
-    if tp2: addplots.append(mpf.make_addplot([tp2]*len(df), color='lime', linestyle="--"))
-    if tp3: addplots.append(mpf.make_addplot([tp3]*len(df), color='darkgreen', linestyle="--"))
-    if sl: addplots.append(mpf.make_addplot([sl]*len(df), color='red', linestyle="--"))
-    if entry: addplots.append(mpf.make_addplot([entry]*len(df), color='blue', linestyle="--"))
-
-    fig, ax = mpf.plot(
-        df.tail(500), type='candle', style='yahoo',
-        title=f"{symbol} - {action}", addplot=addplots, returnfig=True
-    )
-    buf = io.BytesIO()
-    fig.savefig(buf, format='png', bbox_inches='tight')
-    buf.seek(0)
-    plt.close(fig)
-    return buf
-
-# ---------------- FETCH TOP SYMBOLS ----------------
-def fetch_top_symbols(limit=300):
+# ---------------- AUX: funding, oi, liq ----------------
+def get_funding_rate(symbol):
     try:
-        # Беремо всі USDT-пари ф'ючерсів
-        tickers = binance_client.futures_ticker()  # Для USDT-M ф'ючерсів
-        usdt_pairs = [t for t in tickers if t['symbol'].endswith("USDT")]
-        sorted_pairs = sorted(
-            usdt_pairs,
-            key=lambda x: abs(float(x.get("priceChangePercent", 0))),
-            reverse=True
-        )
-        top_symbols = [d["symbol"] for d in sorted_pairs[:limit]]
-        logger.info("Top %d symbols fetched: %s", limit, top_symbols[:10])
-        return top_symbols
-    except Exception as e:
-        logger.exception("Error fetching top symbols: %s", e)
+        fr = client.futures_funding_rate(symbol=symbol, limit=1)
+        return float(fr[0]["fundingRate"]) if fr else 0.0
+    except Exception:
+        return 0.0
+
+def get_open_interest(symbol):
+    try:
+        oi = client.futures_open_interest(symbol=symbol)
+        return float(oi.get("openInterest", 0))
+    except Exception:
+        return 0.0
+
+def get_recent_liquidations(symbol, limit=50):
+    try:
+        # Note: some python-binance wrappers don't have futures_liq_orders; use futures_account or public endpoints if missing.
+        # We'll try futures_liquidation_orders and gracefully fallback.
+        if hasattr(client, "futures_liquidation_orders"):
+            liqs = client.futures_liquidation_orders(symbol=symbol, limit=limit)
+            return liqs
+        return []
+    except Exception:
         return []
 
-# ---------------- MASTER SCAN ----------------
-def scan_all_symbols():
-    symbols = fetch_top_symbols(limit=300)
-    if not symbols:
-        logger.warning("No symbols fetched, falling back to ALL_USDT list")
-        symbols = ALL_USDT
-    logger.info("Starting scan for %d symbols", len(symbols))
-    def safe_analyze(sym):
+# ---------------- SIGNAL DETECTION (SMC) ----------------
+def detect_smc_signals(df: pd.DataFrame, funding: float, oi_now: float, oi_prev: float):
+    last = df.iloc[-1]
+    votes = []
+    conf = 0.45
+
+    # FVG / imbalance
+    if last.get("fvg", False):
+        votes.append("FVG/Imbalance"); conf += 0.07
+
+    # liquidity sweeps
+    if last.get("liquidity_sweep_long", False):
+        votes.append("Liquidity Sweep (Long)"); conf += 0.08
+    if last.get("liquidity_sweep_short", False):
+        votes.append("Liquidity Sweep (Short)"); conf += 0.08
+
+    # vol spike / whale candle
+    if last.get("vol_spike", False):
+        votes.append("Volume Spike"); conf += 0.06
+    if last.get("imbalance_up", False):
+        votes.append("Imbalance Up"); conf += 0.05
+    if last.get("imbalance_down", False):
+        votes.append("Imbalance Down"); conf += 0.05
+
+    # CHOCH
+    choch_val = last.get("choch", False)
+    if choch_val == "bullish":
+        votes.append("CHOCH Bullish"); conf += 0.08
+    elif choch_val == "bearish":
+        votes.append("CHOCH Bearish"); conf += 0.08
+
+    # accumulation
+    if last.get("accumulation_zone", False):
+        votes.append("Accumulation Zone"); conf += 0.04
+
+    # funding & OI context
+    if funding > 0.0006:
+        votes.append("Funding Long Bias (extreme)"); conf += 0.06
+    if funding < -0.0006:
+        votes.append("Funding Short Bias (extreme)"); conf += 0.06
+    if oi_prev and oi_prev > 0:
+        oi_change = (oi_now - oi_prev) / oi_prev
+        if oi_change > 0.12:
+            votes.append("OI Surge"); conf += 0.06
+        elif oi_change < -0.12:
+            votes.append("OI Drop"); conf -= 0.03
+
+    # determine action
+    action = "WATCH"
+    # strong combos -> actionable
+    if any("Liquidity Sweep (Long)" in v for v in votes) and "CHOCH Bullish" in votes:
+        action = "LONG"
+    elif any("Liquidity Sweep (Short)" in v for v in votes) and "CHOCH Bearish" in votes:
+        action = "SHORT"
+    else:
+        # fallback to directional biases
+        # more longs than shorts -> LONG bias
+        longs = sum(1 for v in votes if "Long" in v or "Bull" in v or "Up" in v)
+        shorts = sum(1 for v in votes if "Short" in v or "Bear" in v or "Down" in v)
+        if longs >= 2 and longs > shorts:
+            action = "LONG"
+        elif shorts >= 2 and shorts > longs:
+            action = "SHORT"
+
+    conf = max(0.0, min(1.0, conf))
+    return action, votes, conf
+
+# ---------------- QUALITY / SCORE ----------------
+def smc_quality_score(votes, conf):
+    # map signals to points
+    mapping = {
+        "FVG/Imbalance": 8, "Liquidity Sweep (Long)": 12, "Liquidity Sweep (Short)": 12,
+        "Volume Spike": 6, "Imbalance Up": 6, "Imbalance Down": 6,
+        "CHOCH Bullish": 10, "CHOCH Bearish": 10, "Accumulation Zone": 5,
+        "Funding Long Bias (extreme)": 5, "Funding Short Bias (extreme)": 5,
+        "OI Surge": 6, "OI Drop": -3
+    }
+    score = conf * 100
+    for v in votes:
+        score += mapping.get(v, 0)
+    # normalize 0-100
+    score = max(0, min(100, score))
+    return int(score)
+
+# ---------------- ENTRY / SL / TP suggestion ----------------
+def suggest_levels(df, action, last):
+    support = last["support"]
+    resistance = last["resistance"]
+    if pd.isna(support) or pd.isna(resistance):
+        return None, None, None, None
+    if action == "LONG":
+        entry = last["close"]
+        sl = support * 0.995 if support>0 else entry*0.995
+        tp1 = entry + (resistance - entry) * 0.33
+        tp2 = entry + (resistance - entry) * 0.66
+        tp3 = resistance
+    elif action == "SHORT":
+        entry = last["close"]
+        sl = resistance * 1.005 if resistance>0 else entry*1.005
+        tp1 = entry - (entry - support) * 0.33
+        tp2 = entry - (entry - support) * 0.66
+        tp3 = support
+    else:
+        return None, None, None, None
+    return entry, sl, tp1, tp2, tp3
+
+# ---------------- MAIN analyze_and_alert ----------------
+def analyze_and_alert(symbol):
+    try:
+        interval = "5m"
+        df = fetch_klines(symbol, interval=interval, limit=200)
+        if df is None or len(df) < 50:
+            return
+
+        # fetch context features
+        funding = get_funding_rate(symbol)
+        oi_now = get_open_interest(symbol)
+        # quick previous OI sample (5m ago): fetch older klines for OI history not available, so approximate by small sleepless fallback
+        # We'll attempt to fetch open interest historical via futures_open_interest_hist (may not exist) else reuse oi_now
+        oi_prev = oi_now
         try:
-            analyze_and_alert(sym)
-        except Exception as e:
-            logger.exception("Error analyzing symbol %s: %s", sym, e)
+            if hasattr(client, "futures_open_interest_hist"):
+                hist = client.futures_open_interest_hist(symbol=symbol, period="5m", limit=2)
+                if len(hist) >= 2:
+                    oi_prev = float(hist[-2].get("sumOpenInterest", oi_now))
+        except Exception:
+            pass
+
+        # pre-process features
+        df = apply_smc_features(df)
+
+        # detect signals
+        action, votes, conf = detect_smc_signals(df, funding, oi_now, oi_prev)
+        score = smc_quality_score(votes, conf)
+        last = df.iloc[-1]
+
+        # suggest levels
+        levels = suggest_levels(df, action, last)
+        entry, sl, tp1, tp2, tp3 = (levels + (None,))[:5] if levels else (None,)*5
+
+        logger.info("S:%s action=%s score=%s votes=%s conf=%.2f", symbol, action, score, votes, conf)
+
+        # filter to avoid spam: require score >= 55 and action != WATCH
+        if action != "WATCH" and score >= 55:
+            # format message
+            lines = [
+                f"⚡ *FUTURES SMC SIGNAL*",
+                f"Symbol: `{symbol}`",
+                f"Action: *{action}*",
+                f"Last price: `{last['close']:.6f}`",
+                f"Score: *{score}/100*  Confidence: *{conf:.2f}*",
+                f"Funding Rate: `{funding:.6f}`  OpenInterest: `{oi_now:.0f}`",
+                f"Patterns: {', '.join(votes) or '—'}",
+                ""
+            ]
+            if entry:
+                lines += [
+                    f"Entry: `{entry:.6f}`",
+                    f"Stop-Loss: `{sl:.6f}`",
+                    f"TP1: `{tp1:.6f}`  TP2: `{tp2:.6f}`  TP3: `{tp3:.6f}`",
+                ]
+            # advice text
+            lines.append("_Note: this is a signal idea, not trading advice. Check liquidity & timeframe alignment._")
+            msg = "\n".join(lines)
+            send_telegram(msg)
+            # save state
+            state.setdefault("signals", {})[symbol] = {
+                "time": str(datetime.now(timezone.utc)),
+                "action": action,
+                "score": score,
+                "conf": conf,
+                "votes": votes,
+                "price": float(last["close"])
+            }
+            save_state(state)
+
+    except Exception as e:
+        logger.exception("analyze_and_alert error %s: %s", symbol, e)
+
+# ---------------- SCAN MANAGER ----------------
+def get_symbols_to_scan():
+    if SYMBOLS_ENV:
+        return [s.strip().upper() for s in SYMBOLS_ENV.split(",") if s.strip()]
+    # otherwise pull top movers
+    syms = fetch_top_movers(limit=80)
+    if not syms:
+        # fallback baseline
+        return ["BTCUSDT","ETHUSDT","SOLUSDT"]
+    return syms
+
+def scan_all_symbols():
+    symbols = get_symbols_to_scan()
+    logger.info("Starting scan for %d symbols", len(symbols))
     with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as exe:
-        list(exe.map(safe_analyze, symbols))
+        list(exe.map(analyze_and_alert, symbols))
     state["last_scan"] = str(datetime.now(timezone.utc))
-    save_json_safe(STATE_FILE, state)
+    save_state(state)
     logger.info("Scan finished at %s", state["last_scan"])
 
-# ---------------- FLASK ----------------
-from flask import Flask, request, jsonify
+# ---------------- AUTO LOOP ----------------
+def run_loop():
+    while True:
+        try:
+            scan_all_symbols()
+        except Exception:
+            logger.exception("scan loop error")
+        time.sleep(SCAN_INTERVAL)
+
+# ---------------- FLASK (health + manual trigger) ----------------
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return jsonify({
-        "status": "ok",
-        "time": str(datetime.now(timezone.utc)),
-        "signals": len(state.get("signals", {}))
-    })
+    return jsonify({"ok": True, "last_scan": state.get("last_scan")})
 
-@app.route("/telegram_webhook/<token>", methods=["POST"])
-def telegram_webhook(token):
-    if token != TELEGRAM_TOKEN:
-        return jsonify({"ok": False, "error": "invalid token"}), 403
-    update = request.get_json(force=True) or {}
-    text = update.get("message", {}).get("text", "").lower().strip()
-    if text.startswith("/scan"):
-        send_telegram("⚡ Manual scan started.")
-        Thread(target=scan_all_symbols, daemon=True).start()
-    return jsonify({"ok": True})
-
-# ---------------- MAIN ----------------
-if __name__ == "__main__":
-    logger.info("Starting pre-top detector bot")
+@app.route("/trigger_scan")
+def trigger_scan():
     Thread(target=scan_all_symbols, daemon=True).start()
-    app.run(host="0.0.0.0", port=PORT)
+    return jsonify({"ok": True, "msg": "scan started"})
+
+# ---------------- START background scanner ----------------
+def start_background():
+    t = Thread(target=run_loop, daemon=True)
+    t.start()
+    logger.info("Background scanner started (interval %s sec)", SCAN_INTERVAL)
+
+# If run as main, start loop; if imported by gunicorn, we still start background thread
+start_background()
+
+if __name__ == "__main__":
+    # run flask for local debugging
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
