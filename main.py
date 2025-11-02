@@ -1,558 +1,465 @@
-#!/usr/bin/env python3
-"""
-monolith_demo.py
-
-Самодостатній демонстраційний моноліт:
-- Симулятор ринкових даних (async background producer, імітує WebSocket потік)
-- REST заглушка (fetch historical klines з локальної симуляції)
-- In-memory cache + TTL
-- Простий async rate-limiter (tokens per minute)
-- Сигнальний движок: EMA/RSI/MACD/ATR + candle patterns (pure functions)
-- Побудова графіків (mplfinance) в окремому потоці
-- FastAPI сервер з HTML дашбордом, API ендпоінтами та /metrics (Prometheus)
-- Візуальний дашборд: список сигналів, графіки, керування агресією
-
-ЦЕ БЕЗПЕЧНИЙ ДЕМО — НІЧОГО НЕ ПІДКЛЮЧАЄТЬСЯ ДО БІРЖІ І НЕ ВІДПРАВЛЯЄ ОРДЕРИ.
-"""
-
+# main.py
 import os
-import asyncio
+import time
 import json
 import logging
-import random
-import time
-from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+import re
+from datetime import datetime, timezone
+from threading import Thread
 from concurrent.futures import ThreadPoolExecutor
 
-import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import mplfinance as mpf
+import requests
 import ta
+import mplfinance as mpf
+import numpy as np
+import io
 
-from fastapi import FastAPI, BackgroundTasks, Request, Form
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
-from prometheus_client import make_asgi_app, Counter, Gauge
+from binance.client import Client
+from binance import ThreadedWebsocketManager
 
-# ---------------- logging ----------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("monolith-demo")
+# ---------------- LOGGING ----------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()]
+)
+logger = logging.getLogger("pretop-bot")
 
-# ---------------- config ----------------
-HOST = "0.0.0.0"
-PORT = int(os.getenv("PORT", "8000"))
-SYMBOLS = os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT").split(",")
-DATA_INTERVAL_MIN = int(os.getenv("DATA_INTERVAL_MIN", "15"))   # candle interval in minutes (for simulation)
-KLINES_HISTORY = int(os.getenv("KLINES_HISTORY", "500"))        # how many candles to keep per symbol
-PLOT_DPI = int(os.getenv("PLOT_DPI", "120"))
-AGGRESSION = float(os.getenv("AGGRESSION", "0.3"))              # 0..1 demo parameter
-RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "1200"))  # demo limiter (requests per minute)
+# ---------------- CONFIG ----------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")  # paste token or set env
+CHAT_ID = os.getenv("CHAT_ID", "")               # paste chat id or set env
+PORT = int(os.getenv("PORT", "5000"))
+PARALLEL_WORKERS = int(os.getenv("PARALLEL_WORKERS", "6"))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))  # seconds
+STATE_FILE = "state.json"
+CONF_THRESHOLD_MEDIUM = float(os.getenv("CONF_THRESHOLD_MEDIUM", "0.3"))
+TOP_SYMBOL_LIMIT = int(os.getenv("TOP_SYMBOL_LIMIT", "200"))  # how many top symbols to scan
 
-# ---------------- prometheus metrics ----------------
-SCAN_COUNTER = Counter("demo_scans_total", "Total demo scans")
-SIGNAL_COUNTER = Counter("demo_signals_total", "Total demo signals")
-LAST_SCAN_GAUGE = Gauge("demo_last_scan_unix", "Last demo scan timestamp")
+# ---------------- BINANCE CLIENT ----------------
+# Put your keys in env or leave empty for public reads that use REST for klines.
+binance_client = Client(api_key=os.getenv("BINANCE_API_KEY", ""), api_secret=os.getenv("BINANCE_API_SECRET", ""))
 
-# ---------------- threadpool for plotting ----------------
-_plot_executor = ThreadPoolExecutor(max_workers=2)
+# ---------------- STATE ----------------
+def load_json_safe(path, default):
+    try:
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                return json.load(f)
+    except Exception as e:
+        logger.exception("load_json_safe error %s: %s", path, e)
+    return default
 
-# ---------------- in-memory stores ----------------
-_klines_store: Dict[str, pd.DataFrame] = {}
-_store_lock = asyncio.Lock()
-_signals_store: Dict[str, Dict] = {}  # symbol -> latest signal dict
-_signals_history: List[Dict] = []
-_cache_ttl: Dict[str, float] = {}  # key -> expiry timestamp for cache entries
+def save_json_safe(path, data):
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2, default=str)
+        os.replace(tmp, path)
+    except Exception as e:
+        logger.exception("save_json_safe error %s: %s", path, e)
 
-# rate limiter (token-bucket style, simple)
-_rate_lock = asyncio.Lock()
-_rate_tokens = RATE_LIMIT_PER_MIN
-_rate_last_refill = time.time()
+state = load_json_safe(STATE_FILE, {"signals": {}, "last_scan": None})
 
-def _refill_tokens():
-    global _rate_tokens, _rate_last_refill
-    now = time.time()
-    elapsed = now - _rate_last_refill
-    if elapsed <= 0:
+# ---------------- TELEGRAM ----------------
+MARKDOWNV2_ESCAPE = r"_*[]()~`>#+-=|{}.!"
+
+def escape_md_v2(text: str) -> str:
+    return re.sub(f"([{re.escape(MARKDOWNV2_ESCAPE)}])", r"\\\1", str(text))
+
+def send_telegram(text: str, photo=None):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        logger.debug("Telegram credentials missing, skipping send.")
         return
-    # refill proportionally per minute
-    add = (elapsed / 60.0) * RATE_LIMIT_PER_MIN
-    if add >= 1:
-        _rate_tokens = min(RATE_LIMIT_PER_MIN, _rate_tokens + add)
-        _rate_last_refill = now
+    try:
+        if photo:
+            files = {'photo': ('signal.png', photo, 'image/png')}
+            data = {'chat_id': CHAT_ID, 'caption': escape_md_v2(text), 'parse_mode': 'MarkdownV2'}
+            resp = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto", data=data, files=files, timeout=10)
+            logger.debug("Telegram sendPhoto status: %s", resp.status_code)
+        else:
+            payload = {"chat_id": CHAT_ID, "text": escape_md_v2(text), "parse_mode": "MarkdownV2"}
+            resp = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=10)
+            logger.debug("Telegram sendMessage status: %s", resp.status_code)
+    except Exception as e:
+        logger.exception("send_telegram error: %s", e)
 
-async def consume_rate_token():
-    async with _rate_lock:
-        _refill_tokens()
-        if _rate_tokens >= 1:
-            _rate_tokens -= 1
-            return True
-        return False
+# ---------------- BINANCE WEBSOCKET (miniTicker) ----------------
+_tickers_cache = {}   # symbol -> {lastPrice, changePercent, volume, quoteVolume}
+_tickers_last_update = 0
+_twm = None
 
-# ---------------- simulated market data producer ----------------
-async def _simulate_symbol(symbol: str, interval_min: int = DATA_INTERVAL_MIN, history: int = KLINES_HISTORY):
-    """
-    Simulate OHLCV series for a symbol and store in _klines_store.
-    This runs indefinitely, appending new candles at interval.
-    """
-    # initial seed dataframe: generate a random walk price series
-    base_price = float(100.0 + random.random() * 5000.0)  # random base
-    # create a datetime index for the past `history` intervals
-    now = datetime.now(timezone.utc)
-    times = [now - timedelta(minutes=interval_min * (history - i)) for i in range(history)]
-    prices = [base_price]
-    for i in range(1, history):
-        drift = random.gauss(0, 0.002)
-        prices.append(max(0.0001, prices[-1] * (1 + drift)))
-    df = pd.DataFrame(index=pd.to_datetime(times))
-    df.index.name = "open_time"
-    df["open"] = prices
-    df["high"] = df["open"] * (1 + np.abs(np.random.normal(0, 0.002, size=history)))
-    df["low"] = df["open"] * (1 - np.abs(np.random.normal(0, 0.002, size=history)))
-    df["close"] = df["open"] * (1 + np.random.normal(0, 0.001, size=history))
-    df["volume"] = np.random.randint(1, 1000, size=history)
-    async with _store_lock:
-        _klines_store[symbol] = df.copy()
-    logger.info("Initialized simulated series for %s (rows=%d)", symbol, len(df))
+def start_ws_tickers():
+    """Запускаємо futures miniTicker websocket для кешування даних топ-символів"""
+    global _twm, _tickers_cache, _tickers_last_update
+    try:
+        _twm = ThreadedWebsocketManager()
+        _twm.start()
 
-    # live update loop
-    while True:
-        await asyncio.sleep(interval_min * 60)  # wait for the interval
+        def handle(msg):
+            # msg is dict for a single update or dict for a combined stream depending on lib version
+            try:
+                # miniTicker fields include: 's' (symbol), 'c' (close), 'P' (%), 'v' (volume), 'q' (quoteVolume)
+                if not isinstance(msg, dict):
+                    return
+                if "s" in msg and "c" in msg:
+                    sym = msg["s"]
+                    _tickers_cache[sym] = {
+                        "lastPrice": float(msg["c"]),
+                        "changePercent": float(msg.get("P", 0.0)),
+                        "volume": float(msg.get("v", 0.0)),
+                        "quoteVolume": float(msg.get("q", 0.0))
+                    }
+                    _tickers_last_update = time.time()
+            except Exception:
+                logger.exception("Error in WS handle")
+        # Start futures miniTicker socket
+        _twm.start_futures_miniticker_socket(callback=handle)
+        logger.info("Started futures miniTicker websocket")
+    except Exception as e:
+        logger.exception("start_ws_tickers error: %s", e)
+
+def fetch_top_symbols(limit=TOP_SYMBOL_LIMIT):
+    """Отримуємо топ символів з кешу websocket по абсолютній % зміні."""
+    global _tickers_cache
+    if not _tickers_cache:
+        logger.debug("Tickers cache empty, falling back to REST/all list")
+        # Fallback: try to use REST sparingly to fetch pairs (we do this only if WS not ready)
         try:
-            async with _store_lock:
-                df = _klines_store.get(symbol)
-                last_close = float(df["close"].iloc[-1])
-                # simulate new candle
-                drift = random.gauss(0, 0.003) * (1 + AGGRESSION)  # aggression nudges volatility
-                new_open = last_close
-                new_close = max(0.0001, new_open * (1 + drift))
-                high = max(new_open, new_close) * (1 + abs(random.gauss(0, 0.001)))
-                low = min(new_open, new_close) * (1 - abs(random.gauss(0, 0.001)))
-                vol = max(1, int(np.random.poisson(200 * (1 + AGGRESSION))))
-                new_time = df.index[-1] + pd.Timedelta(minutes=interval_min)
-                new_row = pd.DataFrame([{
-                    "open": new_open, "high": high, "low": low, "close": new_close, "volume": vol
-                }], index=[pd.to_datetime(new_time)])
-                new_row.index.name = "open_time"
-                df = pd.concat([df, new_row])
-                df = df.tail(history)
-                _klines_store[symbol] = df
-            # maybe emit a "tick" log occasionally
-            if random.random() < 0.05:
-                logger.debug("Simulated new candle for %s @ %s", symbol, new_time)
-        except Exception:
-            logger.exception("Simulation loop error for %s", symbol)
+            tickers = binance_client.futures_ticker()
+            usdt_pairs = [t['symbol'] for t in tickers if t['symbol'].endswith("USDT")]
+            return usdt_pairs[:limit] if limit else usdt_pairs
+        except Exception as e:
+            logger.exception("REST fallback fetch_top_symbols failed: %s", e)
+            return []
+    usdt_pairs = {s: d for s, d in _tickers_cache.items() if s.endswith("USDT")}
+    sorted_pairs = sorted(usdt_pairs.items(), key=lambda kv: abs(kv[1].get("changePercent", 0)), reverse=True)
+    symbols = [s for s, _ in sorted_pairs]
+    return symbols[:limit] if limit else symbols
 
-# ---------------- helper: fetch klines (simulated REST fallback) ----------------
-async def fetch_klines(symbol: str, limit: int = KLINES_HISTORY) -> Optional[pd.DataFrame]:
-    """
-    Simulated REST fetch. Uses in-memory store. Honors a simple cache TTL to emulate real-world caching.
-    """
-    key = f"klines:{symbol}:{limit}"
-    now = time.time()
-    # check cache TTL
-    expiry = _cache_ttl.get(key)
-    if expiry and expiry > now:
-        # return cached copy if exists
-        async with _store_lock:
-            df = _klines_store.get(symbol)
-            return df.tail(limit).copy() if df is not None else None
-    # consume rate token (simulate global rate limiting)
-    ok = await consume_rate_token()
-    if not ok:
-        # emulate rate limit response by returning None
-        logger.warning("Rate limit hit (simulated). Returning None for %s", symbol)
-        return None
-    # simulate network delay
-    await asyncio.sleep(0.05)
-    async with _store_lock:
-        df = _klines_store.get(symbol)
-        if df is None:
-            return None
-        # store cache ttl
-        _cache_ttl[key] = now + 5.0  # small TTL
-        return df.tail(limit).copy()
+# ---------------- FETCH KLINES (REST fallback if WS klines not present) ----------------
+BINANCE_REST_URL = "https://fapi.binance.com/fapi/v1/klines"
 
-# ---------------- feature engineering and signal detection ----------------
-def apply_all_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy().dropna()
-    if df.empty:
+def fetch_klines_rest(symbol, interval="15m", limit=500):
+    try:
+        resp = requests.get(BINANCE_REST_URL, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=10)
+        data = resp.json()
+        df = pd.DataFrame(data, columns=[
+            "open_time","open","high","low","close","volume",
+            "close_time","quote_asset_volume","trades",
+            "taker_buy_base","taker_buy_quote","ignore"
+        ])
+        for col in ["open","high","low","close","volume"]:
+            df[col] = df[col].astype(float)
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+        df.set_index("open_time", inplace=True)
         return df
+    except Exception as e:
+        logger.exception("REST fetch error for %s: %s", symbol, e)
+        return None
+
+# If you have a kline websocket manager (like your WebSocketKlineManager), you can plug it in.
+# For now we'll use only REST klines to keep code simple and robust.
+def fetch_klines(symbol, interval="15m", limit=200):
+    # Could be replaced by your WebSocketKlineManager.get_klines(symbol, limit)
+    return fetch_klines_rest(symbol, interval=interval, limit=limit)
+
+# ---------------- FEATURE HELPERS ----------------
+def apply_basic_candles(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["open"] = df["open"].astype(float)
+    df["high"] = df["high"].astype(float)
+    df["low"] = df["low"].astype(float)
+    df["close"] = df["close"].astype(float)
+    df["volume"] = df["volume"].astype(float)
     df["body"] = df["close"] - df["open"]
     df["range"] = df["high"] - df["low"]
     df["upper_shadow"] = df["high"] - df[["close", "open"]].max(axis=1)
     df["lower_shadow"] = df[["close", "open"]].min(axis=1) - df["low"]
     df["vol_ma20"] = df["volume"].rolling(20).mean()
-    df["vol_spike"] = df["volume"] > 1.5 * df["vol_ma20"]
-    try:
-        df["ema9"] = ta.trend.EMAIndicator(df["close"], window=9).ema_indicator()
-        df["ema21"] = ta.trend.EMAIndicator(df["close"], window=21).ema_indicator()
-        df["rsi14"] = ta.momentum.RSIIndicator(df["close"], window=14).rsi()
-        macd = ta.trend.MACD(df["close"])
-        df["macd"] = macd.macd()
-        df["macd_signal"] = macd.macd_signal()
-        df["atr14"] = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"], window=14).average_true_range()
-        bb = ta.volatility.BollingerBands(df["close"], window=20, window_dev=2)
-        df["bb_high"] = bb.bollinger_hband()
-        df["bb_low"] = bb.bollinger_lband()
-        # support/resistance using rolling min/max
-        df["support"] = df["low"].rolling(20).min()
-        df["resistance"] = df["high"].rolling(20).max()
-    except Exception:
-        logger.exception("TA calculation failed")
+    df["atr"] = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"], window=14).average_true_range()
     return df
 
-def detect_signal_v2(df: pd.DataFrame) -> Tuple[str, List[str], bool, pd.Series, float]:
+# ---------------- PUMP / DUMP REVERSAL DETECTOR (8 features + 2 extras) ----------------
+def detect_pump_reversals(df: pd.DataFrame):
     """
-    Pure function: returns (action, votes, pretop, last_row, confidence)
-    action in {"LONG","SHORT","WATCH"}
+    Return list of signals (dictionaries) detected on the latest candle.
+    Each signal: {'action': 'SHORT'/'LONG', 'reason': '...', 'score': float}
     """
-    df = apply_all_features(df)
-    if df.empty or len(df) < 20:
-        last = df.iloc[-1] if len(df) else pd.Series()
-        return "WATCH", [], False, last, 0.0
+    signals = []
+    if df is None or len(df) < 30:
+        return signals
+
+    df = apply_basic_candles(df)
     last = df.iloc[-1]
-    prev = df.iloc[-2]
-    votes = []
-    confidence = 0.45
+    entry = float(last["close"])
+    vol_ma = float(df["volume"].rolling(20).mean().iloc[-1])
+    recent_change_10 = (last["close"] - df["close"].iloc[-10]) / df["close"].iloc[-10]
+    recent_change_5 = (last["close"] - df["close"].iloc[-5]) / df["close"].iloc[-5]
 
-    # candle patterns
-    if last["lower_shadow"] > 2 * max(abs(last["body"]), 1e-9) and last["body"] > 0:
-        votes.append("hammer_bull"); confidence += 0.08
-    if last["upper_shadow"] > 2 * max(abs(last["body"]), 1e-9) and last["body"] < 0:
-        votes.append("shooting_star"); confidence += 0.08
+    # helper to append with small score
+    def add(action, reason, score=0.1):
+        signals.append({"action": action, "reason": reason, "score": score})
 
-    # engulfing
-    if last["body"] > 0 and prev["body"] < 0 and last["close"] > prev["open"] and last["open"] < prev["close"]:
-        votes.append("bullish_engulfing"); confidence += 0.06
-    if last["body"] < 0 and prev["body"] > 0 and last["close"] < prev["open"] and last["open"] > prev["close"]:
-        votes.append("bearish_engulfing"); confidence += 0.06
+    # Feature 1: Volume Spike Pump / Dump (big % move + huge volume)
+    if recent_change_10 > 0.18 and last["volume"] > 4 * vol_ma:
+        add("SHORT", "Volume Spike Pump", 0.25)
+    if recent_change_10 < -0.18 and last["volume"] > 4 * vol_ma:
+        add("LONG", "Volume Spike Dump", 0.25)
 
-    # doji
-    if abs(last["body"]) < 0.12 * max(last["range"], 1e-9):
-        votes.append("doji"); confidence += 0.03
+    # Feature 2: Exhaustion Wick (large upper wick on pump / lower on dump)
+    upper_wick = last["high"] - max(last["close"], last["open"])
+    lower_wick = min(last["close"], last["open"]) - last["low"]
+    body = abs(last["body"]) if last["body"] != 0 else 1e-9
+    if upper_wick > body * 2 and recent_change_5 > 0.10 and last["volume"] > 1.5 * vol_ma:
+        add("SHORT", "Exhaustion Upper Wick", 0.15)
+    if lower_wick > body * 2 and recent_change_5 < -0.10 and last["volume"] > 1.5 * vol_ma:
+        add("LONG", "Exhaustion Lower Wick", 0.15)
 
-    # 3 candles
-    if len(df) >= 3:
-        if all(df["close"].iloc[-i] > df["open"].iloc[-i] for i in range(1, 4)):
-            votes.append("3_green"); confidence += 0.03
-        if all(df["close"].iloc[-i] < df["open"].iloc[-i] for i in range(1, 4)):
-            votes.append("3_red"); confidence += 0.03
+    # Feature 3: Momentum Reversal (3 candles momentum drop)
+    mom = df["close"].diff()
+    if len(mom) >= 3:
+        if mom.iloc[-3] > 0 and mom.iloc[-2] > 0 and mom.iloc[-1] < 0 and recent_change_5 > 0.12:
+            add("SHORT", "Momentum Reversal After Pump", 0.12)
+        if mom.iloc[-3] < 0 and mom.iloc[-2] < 0 and mom.iloc[-1] > 0 and recent_change_5 < -0.12:
+            add("LONG", "Momentum Reversal After Dump", 0.12)
 
-    # volume
-    if last.get("vol_spike", False):
-        votes.append("volume_spike"); confidence += 0.04
-    if last["volume"] > 2 * df["vol_ma20"].iloc[-1]:
-        votes.append("climax_volume"); confidence += 0.04
+    # Feature 4: RSI Overextension
+    rsi = ta.momentum.RSIIndicator(df["close"], 14).rsi()
+    last_rsi = rsi.iloc[-1]
+    if last_rsi > 82:
+        add("SHORT", "RSI Overbought", 0.09)
+    if last_rsi < 18:
+        add("LONG", "RSI Oversold", 0.09)
 
-    # structure flips
-    if prev["close"] > prev.get("resistance", 0) and last["close"] < last.get("resistance", 0):
-        votes.append("fake_breakout_short"); confidence += 0.04
-    if prev["close"] < prev.get("support", 0) and last["close"] > last.get("support", 0):
-        votes.append("fake_breakout_long"); confidence += 0.04
-    if prev["close"] < prev.get("resistance", 0) and last["close"] > last.get("resistance", 0):
-        votes.append("resistance_flip_support"); confidence += 0.04
-    if prev["close"] > prev.get("support", 0) and last["close"] < last.get("support", 0):
-        votes.append("support_flip_resistance"); confidence += 0.04
+    # Feature 5: Volume Divergence (price up but volume down)
+    if len(df) >= 4:
+        if df["close"].iloc[-1] > df["close"].iloc[-2] > df["close"].iloc[-3] and df["volume"].iloc[-1] < df["volume"].iloc[-2]:
+            add("SHORT", "Price Up + Volume Down (Divergence)", 0.10)
+        if df["close"].iloc[-1] < df["close"].iloc[-2] < df["close"].iloc[-3] and df["volume"].iloc[-1] < df["volume"].iloc[-2]:
+            add("LONG", "Price Down + Volume Down (Divergence)", 0.10)
 
-    # retest / liquidity
-    if last.get("support") and abs(last["close"] - last["support"]) / max(last["support"], 1e-9) < 0.003 and last["body"] > 0:
-        votes.append("support_retest"); confidence += 0.03
-    if last.get("resistance") and abs(last["close"] - last["resistance"]) / max(last["resistance"], 1e-9) < 0.003 and last["body"] < 0:
-        votes.append("resistance_retest"); confidence += 0.03
-    if last["low"] < last.get("support", 0) and last["close"] > last.get("support", 0):
-        votes.append("liquidity_grab_long"); confidence += 0.03
-    if last["high"] > last.get("resistance", 0) and last["close"] < last.get("resistance", 0):
-        votes.append("liquidity_grab_short"); confidence += 0.03
+    # Feature 6: Volatility Spike (ATR explosion)
+    recent_vol = (df["high"] - df["low"]).iloc[-5:].mean()
+    prev_vol = (df["high"] - df["low"]).iloc[-20:-5].mean()
+    if prev_vol > 0 and recent_vol > prev_vol * 2 and last["volume"] > 2 * vol_ma:
+        if recent_change_5 > 0.12:
+            add("SHORT", "Volatility Spike on Pump", 0.12)
+        if recent_change_5 < -0.12:
+            add("LONG", "Volatility Spike on Dump", 0.12)
 
-    # trend via EMA
-    trend_val = df["ema21"].iloc[-1] if "ema21" in df.columns else df["close"].rolling(20).mean().iloc[-1]
-    if last["close"] > trend_val:
-        votes.append("above_trend"); confidence += 0.02
-    else:
-        votes.append("below_trend"); confidence += 0.02
+    # Feature 7: Liquidity Grab / Fake Breakout
+    rolling_high = df["high"].rolling(20).max().iloc[-2]
+    rolling_low = df["low"].rolling(20).min().iloc[-2]
+    if last["high"] > rolling_high and last["close"] < rolling_high:
+        add("SHORT", "Liquidity Grab Top (Fake Breakout)", 0.14)
+    if last["low"] < rolling_low and last["close"] > rolling_low:
+        add("LONG", "Liquidity Grab Bottom (Fake Breakout)", 0.14)
 
-    # RSI/MACD momentum
-    if "rsi14" in df.columns and last["rsi14"] < 30:
-        votes.append("rsi_oversold"); confidence += 0.03
-    if "rsi14" in df.columns and last["rsi14"] > 70:
-        votes.append("rsi_overbought"); confidence += 0.03
-    if "macd" in df.columns and "macd_signal" in df.columns:
-        if last["macd"] > last["macd_signal"] and df["macd"].iloc[-2] <= df["macd_signal"].iloc[-2]:
-            votes.append("macd_cross_up"); confidence += 0.03
-        if last["macd"] < last["macd_signal"] and df["macd"].iloc[-2] >= df["macd_signal"].iloc[-2]:
-            votes.append("macd_cross_down"); confidence += 0.03
+    # Feature 8: Climax Candle (huge volume + huge body beyond ATR)
+    atr = float(df["atr"].iloc[-1] if not np.isnan(df["atr"].iloc[-1]) else (df["high"]-df["low"]).iloc[-1])
+    if last["volume"] > 6 * vol_ma and abs(last["close"] - df["close"].iloc[-2]) > 3 * atr:
+        if recent_change_5 > 0.15:
+            add("SHORT", "Climax Pump Candle", 0.2)
+        if recent_change_5 < -0.15:
+            add("LONG", "Climax Dump Candle", 0.2)
 
-    # pretop detection
-    pretop = False
-    if len(df) >= 10 and (last["close"] - df["close"].iloc[-10]) / max(df["close"].iloc[-10], 1e-9) > 0.10:
-        pretop = True
-        votes.append("pretop"); confidence += 0.06
+    # Extra Feature 9: Smart Money Shift (big buy-side then large distribution)
+    # Detect a period where taker buy quote surged then reversed
+    # (requires taker data; fallback: check quoteVolume spike)
+    if "quote_asset_volume" in df.columns or "quoteVolume" in df.columns:
+        # fallback: use quoteVolume last candle if available
+        qvol = df.get("quote_asset_volume", df.get("quoteVolume", None))
+        if qvol is not None:
+            try:
+                qvol_last = float(qvol.iloc[-1])
+                qvol_ma = float(pd.Series(qvol).rolling(20).mean().iloc[-1])
+                if qvol_last > 4 * qvol_ma and recent_change_5 > 0.1:
+                    add("SHORT", "Smart Money Distribution (quoteVol spike)", 0.12)
+            except Exception:
+                pass
 
-    # Action (S/R proximity)
-    near_resistance = last.get("resistance") and last["close"] >= last["resistance"] * 0.985
-    near_support = last.get("support") and last["close"] <= last["support"] * 1.015
-    action = "WATCH"
-    if near_resistance:
-        action = "SHORT"
-    elif near_support:
-        action = "LONG"
+    # Extra Feature 10: Trap Candle (wick beyond level + close back)
+    # If candle pierces level (20-roll high/low) but closes back -> trap
+    if last["high"] > rolling_high and last["close"] < rolling_high and last["upper_shadow"] > last["range"] * 0.6:
+        add("SHORT", "Top Trap Candle", 0.12)
+    if last["low"] < rolling_low and last["close"] > rolling_low and last["lower_shadow"] > last["range"] * 0.6:
+        add("LONG", "Bottom Trap Candle", 0.12)
 
-    # aggression nudge
-    if AGGRESSION > 0:
-        if random.random() < 0.02 + 0.10 * AGGRESSION:
-            confidence += 0.08 * AGGRESSION
-            votes.append("random_nudge")
-        if action == "WATCH" and AGGRESSION > 0.6:
-            if last["close"] >= last.get("resistance", 0) * 0.97:
-                action = "SHORT"; votes.append("aggressive_near_res")
-            if last["close"] <= last.get("support", 1e18) * 1.03:
-                action = "LONG"; votes.append("aggressive_near_sup")
+    # Merge same-direction signals to produce a combined score
+    combined = {}
+    for s in signals:
+        combined.setdefault(s["action"], 0.0)
+        combined[s["action"]] += s["score"]
 
-    confidence = max(0.0, min(1.0, confidence))
-    return action, votes, pretop, last, confidence
+    # produce final signals list with threshold
+    output = []
+    for action, score in combined.items():
+        # signal threshold — require at least 0.18 combined weight to alert
+        if score >= 0.18:
+            # also include reasons (collect all reasons for that action)
+            reasons = [s["reason"] for s in signals if s["action"] == action]
+            output.append({"action": action, "score": round(min(1.0, score), 3), "reasons": reasons})
+    return output
 
-# ---------------- plotting helper ----------------
-def _plot_sync(df: pd.DataFrame, symbol: str, action: str, entry=None, sl=None, tp1=None, tp2=None, tp3=None) -> bytes:
-    df_tail = df.tail(200).copy()
-    N = len(df_tail)
-    if N == 0:
-        return b""
-    def line(v): return [v] * N if v is not None else None
+# ---------------- PLOT UTILITY ----------------
+def plot_signal_candles(df, symbol, action, tp1=None, tp2=None, tp3=None, sl=None, entry=None):
     addplots = []
-    if tp1 is not None: addplots.append(mpf.make_addplot(line(tp1), linestyle="--"))
-    if tp2 is not None: addplots.append(mpf.make_addplot(line(tp2), linestyle="--"))
-    if tp3 is not None: addplots.append(mpf.make_addplot(line(tp3), linestyle="--"))
-    if sl is not None: addplots.append(mpf.make_addplot(line(sl), linestyle="--"))
-    if entry is not None: addplots.append(mpf.make_addplot(line(entry), linestyle="--"))
+    if tp1 is not None: addplots.append(mpf.make_addplot([tp1]*len(df), color='green', linestyle="--"))
+    if tp2 is not None: addplots.append(mpf.make_addplot([tp2]*len(df), color='lime', linestyle="--"))
+    if tp3 is not None: addplots.append(mpf.make_addplot([tp3]*len(df), color='darkgreen', linestyle="--"))
+    if sl is not None: addplots.append(mpf.make_addplot([sl]*len(df), color='red', linestyle="--"))
+    if entry is not None: addplots.append(mpf.make_addplot([entry]*len(df), color='blue', linestyle="--"))
 
-    fig, ax = mpf.plot(df_tail, type="candle", style="yahoo", addplot=addplots, returnfig=True, title=f"{symbol} {action}")
-    import io
+    fig, ax = mpf.plot(df.tail(200), type='candle', style='yahoo', title=f"{symbol} - {action}", addplot=addplots, returnfig=True)
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", dpi=PLOT_DPI)
+    fig.savefig(buf, format='png', bbox_inches='tight')
     buf.seek(0)
     plt.close(fig)
-    return buf.read()
+    return buf
 
-async def plot_bytes(df: pd.DataFrame, symbol: str, action: str, entry=None, sl=None, tp1=None, tp2=None, tp3=None) -> bytes:
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(_plot_executor, _plot_sync, df, symbol, action, entry, sl, tp1, tp2, tp3)
-
-# ---------------- orchestration: analyze symbol and emit signal to in-memory store ----------------
-async def analyze_and_maybe_signal(symbol: str):
-    df = await fetch_klines(symbol, limit=KLINES_HISTORY)
-    if df is None or len(df) < 40:
-        return
-    action, votes, pretop, last, confidence = detect_signal_v2(df)
-    if action == "WATCH":
-        return
-    # compute example entry/sl/tps
-    entry = None; sl = None; tp1 = None; tp2 = None; tp3 = None
+# ---------------- ANALYZE & ALERT (pump/dump mode) ----------------
+def analyze_and_alert(symbol: str):
     try:
-        if action == "LONG":
-            entry = float(last.get("support") or last["close"]) * 1.001
-            sl = entry - max(1.5 * float(last.get("atr14", 0.0)), entry * 0.01)
-            tp1 = entry + (float(last.get("resistance", entry)) - entry) * 0.33
-            tp2 = entry + (float(last.get("resistance", entry)) - entry) * 0.66
-            tp3 = float(last.get("resistance") or entry * 1.06)
-        elif action == "SHORT":
-            entry = float(last.get("resistance") or last["close"]) * 0.999
-            sl = entry + max(1.5 * float(last.get("atr14", 0.0)), entry * 0.01)
-            tp1 = entry - (entry - float(last.get("support", entry))) * 0.33
-            tp2 = entry - (entry - float(last.get("support", entry))) * 0.66
-            tp3 = float(last.get("support") or entry * 0.94)
-    except Exception:
-        logger.exception("Entry/SL/TP calc failed for %s", symbol)
-        return
-
-    # rr simple
-    try:
-        if action == "LONG":
-            denom = entry - sl if (entry - sl) != 0 else 1e-9
-            rr1 = (tp1 - entry) / denom
-        else:
-            denom = sl - entry if (sl - entry) != 0 else 1e-9
-            rr1 = (entry - tp1) / denom
-    except Exception:
-        rr1 = 0.0
-
-    # gating: simple thresholds with aggression
-    rr_min = max(0.5, 2.0 - 1.5 * AGGRESSION)
-    allow = (confidence >= 0.3 and rr1 >= rr_min)
-    if not allow and AGGRESSION > 0.7 and random.random() < 0.02 * AGGRESSION:
-        allow = True
-        votes.append("aggressive_override")
-
-    if not allow:
-        return
-
-    # cooldown: one signal per symbol per SIGNAL_COOLDOWN_MIN
-    now = datetime.now(timezone.utc)
-    last_sig = _signals_store.get(symbol)
-    if last_sig:
-        last_time = datetime.fromisoformat(last_sig["time"])
-        if now - last_time < timedelta(minutes=SIGNAL_COOLDOWN_MIN):
-            logger.debug("Cooldown active for %s - skipping", symbol)
+        df = fetch_klines(symbol, interval="15m", limit=200)
+        if df is None or len(df) < 30:
             return
 
-    # prepare record
-    rec = {
-        "symbol": symbol,
-        "time": now.isoformat(),
-        "action": action,
-        "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
-        "confidence": round(float(confidence), 3),
-        "rr1": round(float(rr1), 3),
-        "votes": votes
-    }
-    _signals_store[symbol] = rec
-    _signals_history.insert(0, rec)
-    # cap history
-    if len(_signals_history) > 200:
-        _signals_history.pop()
-    SIGNAL_COUNTER.inc()
-    logger.info("Signal generated (demo) %s %s conf=%.2f rr1=%.2f", symbol, action, confidence, rr1)
+        signals = detect_pump_reversals(df)
+        if not signals:
+            return
 
-# ---------------- background periodic scanner ----------------
-async def periodic_scanner():
-    """
-    Periodically scan all symbols by calling analyze_and_maybe_signal.
-    """
+        # For each detected direction produce an alert
+        for s in signals:
+            action = s["action"]
+            score = s["score"]
+            reasons = s["reasons"]
+            last = df.iloc[-1]
+            entry = float(last["close"])
+
+            # Use far support/resistance (20-50 candles window) to set sl/tp around real levels
+            support = df["low"].rolling(50).min().iloc[-1]
+            resistance = df["high"].rolling(50).max().iloc[-1]
+
+            if action == "SHORT":
+                stop_loss = float(last["high"] * 1.01)
+                # TPs should be placed before important supports — use a ladder approaching long-term support
+                tp1 = entry * 0.985
+                tp2 = max(entry * 0.96, support * 1.01 if not np.isnan(support) else entry * 0.95)
+                tp3 = max(entry * 0.92, support * 1.005 if not np.isnan(support) else entry * 0.90)
+            else:  # LONG
+                stop_loss = float(last["low"] * 0.99)
+                tp1 = entry * 1.015
+                tp2 = min(entry * 1.04, resistance * 0.995 if not np.isnan(resistance) else entry * 1.06)
+                tp3 = min(entry * 1.08, resistance * 0.999 if not np.isnan(resistance) else entry * 1.12)
+
+            # Risk/Reward calculation (conservative)
+            rr1 = (tp1 - entry) / (entry - stop_loss) if action == "LONG" else (entry - tp1) / (stop_loss - entry)
+            rr2 = (tp2 - entry) / (entry - stop_loss) if action == "LONG" else (entry - tp2) / (stop_loss - entry)
+            rr3 = (tp3 - entry) / (entry - stop_loss) if action == "LONG" else (entry - tp3) / (stop_loss - entry)
+
+            # Quality filter: require some minimal combined score and RR1 > 0.8 (pump reversals are aggressive, allow lower RR)
+            if score < 0.2:
+                continue
+            if rr1 < 0.5:
+                # if first RR too low, push TP1 a bit closer to increase RR or skip
+                # here we skip to avoid spam
+                continue
+
+            # Compose message
+            msg = (
+                f"⚡ PUMP/DUMP REVERSAL ALERT\n"
+                f"Symbol: {symbol}\n"
+                f"Action: {action}\n"
+                f"Score: {score:.2f}\n"
+                f"Reasons: {', '.join(reasons)}\n"
+                f"Entry: {entry:.6f}\n"
+                f"Stop-Loss: {stop_loss:.6f}\n"
+                f"TP1: {tp1:.6f} (RR {rr1:.2f})\n"
+                f"TP2: {tp2:.6f} (RR {rr2:.2f})\n"
+                f"TP3: {tp3:.6f} (RR {rr3:.2f})\n"
+            )
+
+            logger.info("Signal %s %s score=%.2f rr1=%.2f reasons=%s", symbol, action, score, rr1, reasons)
+            photo_buf = plot_signal_candles(df, symbol, action, tp1=tp1, tp2=tp2, tp3=tp3, sl=stop_loss, entry=entry)
+            send_telegram(msg, photo=photo_buf)
+
+            # save state
+            state.setdefault("signals", {})[symbol] = {
+                "action": action, "entry": entry, "sl": stop_loss, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+                "rr1": rr1, "rr2": rr2, "rr3": rr3, "score": score, "reasons": reasons,
+                "time": str(df.index[-1]), "last_price": float(entry)
+            }
+            save_json_safe(STATE_FILE, state)
+    except Exception as e:
+        logger.exception("analyze_and_alert error for %s: %s", symbol, e)
+
+# ---------------- MASTER SCAN ----------------
+def scan_all_symbols():
+    symbols = fetch_top_symbols(limit=TOP_SYMBOL_LIMIT)
+    if not symbols:
+        logger.warning("No symbols fetched, falling back to empty list")
+        return
+    logger.info("Starting scan for %d symbols", len(symbols))
+    def safe_analyze(sym):
+        try:
+            analyze_and_alert(sym)
+        except Exception as e:
+            logger.exception("Error analyzing symbol %s: %s", sym, e)
+    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as exe:
+        list(exe.map(safe_analyze, symbols))
+    state["last_scan"] = str(datetime.now(timezone.utc))
+    save_json_safe(STATE_FILE, state)
+    logger.info("Scan finished at %s", state["last_scan"])
+
+# ---------------- BACKGROUND SCANNER ----------------
+def background_scanner():
     while True:
         try:
-            SCAN_COUNTER.inc()
-            LAST_SCAN_GAUGE.set_to_current_time()
-            logger.info("Starting periodic demo scan for %d symbols", len(SYMBOLS))
-            # parallelize up to a limited concurrency
-            sem = asyncio.Semaphore(6)
-            async def worker(sym):
-                async with sem:
-                    try:
-                        await analyze_and_maybe_signal(sym)
-                    except Exception:
-                        logger.exception("Error analyzing %s", sym)
-            tasks = [asyncio.create_task(worker(s)) for s in SYMBOLS]
-            await asyncio.gather(*tasks)
-        except Exception:
-            logger.exception("Periodic scanner error")
-        await asyncio.sleep(max(5, DATA_INTERVAL_MIN * 60 // 2))  # scan twice per interval
+            scan_all_symbols()
+        except Exception as e:
+            logger.exception("Background scan error: %s", e)
+        time.sleep(SCAN_INTERVAL)
 
-# ---------------- FastAPI app and dashboard ----------------
-app = FastAPI(title="Monolith Demo Pretop")
+# Start WS listener thread early
+Thread(target=start_ws_tickers, daemon=True).start()
+# Start background scanner thread
+Thread(target=background_scanner, daemon=True).start()
 
-# mount prometheus metrics at /metrics
-app.mount("/metrics", make_asgi_app())
+# ---------------- FLASK ----------------
+from flask import Flask, request, jsonify
+app = Flask(__name__)
 
-@app.on_event("startup")
-async def startup_event():
-    # start simulation producers
-    logger.info("Starting simulated producers for symbols: %s", SYMBOLS)
-    for s in SYMBOLS:
-        asyncio.create_task(_simulate_symbol(s, interval_min=DATA_INTERVAL_MIN, history=KLINES_HISTORY))
-    # start scanner
-    asyncio.create_task(periodic_scanner())
+@app.route("/")
+def home():
+    return jsonify({
+        "status": "ok",
+        "time": str(datetime.now(timezone.utc)),
+        "signals": len(state.get("signals", {}))
+    })
 
-@app.get("/", response_class=HTMLResponse)
-async def dashboard(request: Request):
-    """
-    Simple HTML dashboard showing recent signals and controls.
-    """
-    html = """
-    <html>
-      <head>
-        <title>Monolith Demo Pretop Dashboard</title>
-        <style>
-          body { font-family: Arial, sans-serif; margin: 20px; }
-          .sig { border: 1px solid #ddd; padding: 8px; margin-bottom: 8px; border-radius: 6px; }
-          .controls { margin-bottom: 16px; }
-          .grid { display:flex; flex-wrap: wrap; gap: 12px; }
-          .card { border:1px solid #eee; padding:8px; width: 320px; border-radius:6px; }
-        </style>
-      </head>
-      <body>
-        <h1>Monolith Demo Pretop Dashboard</h1>
-        <div class="controls">
-          <form method="post" action="/set_aggression">
-            Aggression (0.0 - 1.0): <input type="text" name="aggr" value="{aggr}" />
-            <button type="submit">Set</button>
-          </form>
-        </div>
-        <h2>Recent Signals</h2>
-        {signals_html}
-        <h2>Symbols</h2>
-        <div class="grid">
-          {cards_html}
-        </div>
-      </body>
-    </html>
-    """
-    # build signals html
-    sigs = _signals_history[:20]
-    signals_html = ""
-    for s in sigs:
-        signals_html += f'<div class="sig"><b>{s["symbol"]}</b> {s["action"]} conf={s["confidence"]} time={s["time"]}<br/>votes: {", ".join(s["votes"])}</div>'
-    # build cards with image thumbnails
-    cards_html = ""
-    for sym in SYMBOLS:
-        cards_html += f'<div class="card"><h3>{sym}</h3><img src="/plot/{sym}" width="300" /><p><a href="/api/signal/{sym}">Latest signal</a></p></div>'
-    return HTMLResponse(html.format(aggr=AGGRESSION, signals_html=signals_html, cards_html=cards_html))
+@app.route("/telegram_webhook/<token>", methods=["POST"])
+def telegram_webhook(token):
+    if token != TELEGRAM_TOKEN:
+        return jsonify({"ok": False, "error": "invalid token"}), 403
+    update = request.get_json(force=True) or {}
+    text = update.get("message", {}).get("text", "").lower().strip()
+    if text.startswith("/scan"):
+        send_telegram("⚡ Manual scan started.")
+        Thread(target=scan_all_symbols, daemon=True).start()
+    if text.startswith("/status"):
+        send_telegram(f"Status: last_scan={state.get('last_scan')}, signals={len(state.get('signals', {}))}")
+    return jsonify({"ok": True})
 
-@app.post("/set_aggression")
-async def set_aggression(aggr: str = Form(...)):
-    global AGGRESSION
-    try:
-        val = float(aggr)
-        if val < 0: val = 0.0
-        if val > 1: val = 1.0
-        AGGRESSION = val
-        return HTMLResponse(f"<html><body>Aggression set to {AGGRESSION}. <a href='/'>Back</a></body></html>")
-    except Exception:
-        return HTMLResponse("<html><body>Invalid value. <a href='/'>Back</a></body></html>")
-
-@app.get("/plot/{symbol}")
-async def plot_endpoint(symbol: str):
-    symbol = symbol.upper()
-    df = await fetch_klines(symbol, limit=KLINES_HISTORY)
-    if df is None:
-        return JSONResponse({"error": "no data"}, status_code=404)
-    # detect last action for annotation
-    last_sig = _signals_store.get(symbol)
-    entry = sl = tp1 = tp2 = tp3 = None
-    action = "WATCH"
-    if last_sig:
-        action = last_sig.get("action", "WATCH")
-        entry = last_sig.get("entry")
-        sl = last_sig.get("sl")
-        tp1 = last_sig.get("tp1")
-        tp2 = last_sig.get("tp2")
-        tp3 = last_sig.get("tp3")
-    img = await plot_bytes(df, symbol, action, entry=entry, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3)
-    return StreamingResponse(iter([img]), media_type="image/png")
-
-@app.get("/api/signals")
-async def api_signals():
-    # return last N signals
-    return JSONResponse(_signals_history[:50])
-
-@app.get("/api/signal/{symbol}")
-async def api_signal(symbol: str):
-    sig = _signals_store.get(symbol.upper())
-    if not sig:
-        return JSONResponse({"ok": False, "msg": "no signal"}, status_code=404)
-    return JSONResponse(sig)
-
-@app.get("/api/scan")
-async def api_scan(background: BackgroundTasks):
-    # trigger a manual scan in background
-    background.add_task(manual_scan)
-    return JSONResponse({"ok": True, "msg": "scan scheduled"})
-
-async def manual_scan():
-    await periodic_scanner()  # will run one full pass then sleep (but in our design periodic_scanner loops forever)
-    # NOTE: in this demo manual_scan simply calls the scanner once; to avoid infinite loops you could refactor periodic_scanner
-
-# ---------------- Run app ----------------
+# ---------------- MAIN ----------------
 if __name__ == "__main__":
-    import uvicorn
-    logger.info("Starting monolith demo app on http://127.0.0.1:%d", PORT)
-    uvicorn.run("monolith_demo:app", host="127.0.0.1", port=PORT, log_level="info")
+    logger.info("Starting pump/dump detector bot")
+    # quick test Telegram connectivity (will be skipped silently if no token)
+    try:
+        send_telegram("✅ Pump/Dump detector bot started.")
+    except Exception:
+        pass
+    # main web server
+    app.run(host="0.0.0.0", port=PORT)
