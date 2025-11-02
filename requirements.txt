@@ -35,4 +35,3 @@ websocket-client
 rel
 fpdf2==2.8.1
 pandas_ta
-aioredis
