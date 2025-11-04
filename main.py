@@ -672,19 +672,24 @@ def run_flask(host="0.0.0.0", port=5000, set_hook: Optional[str] = None):
     app.run(host=host, port=port)
 
 # ----------------------------
-# If executed directly, start app
+# Startup: if launched directly, start app
 # ----------------------------
 if __name__ == "__main__":
-    # optional: auto-register webhook if SELF_HOST is provided
-    SELF_HOST = os.getenv("SELF_HOST")  # full public URL, e.g. https://my-app.onrender.com
+    SELF_HOST = os.getenv("SELF_HOST")  # e.g. https://anom-nyc9.onrender.com
+    WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "change_this_to_secure_token")
+
+    # register webhook correctly
     if SELF_HOST:
         set_webhook(SELF_HOST)
-    # start background scanner (use ADMIN_CHAT_ID or TELEGRAM_CHAT_ID)
+    else:
+        logger.warning("SELF_HOST not set — Telegram webhook not registered!")
+
+    # optionally start background scanner if admin chat ID known
     admin_chat = os.getenv("ADMIN_CHAT_ID")
     if admin_chat:
         start_background(admin_chat)
     else:
-        logger.info("ADMIN_CHAT_ID not set; background will start when a user invokes /start (recommended to set ADMIN_CHAT_ID)")
+        logger.info("ADMIN_CHAT_ID not set — scanner will start after /start")
 
-    # start Flask server (blocking)
+    # run Flask web server
     run_flask(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
