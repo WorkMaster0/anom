@@ -42,7 +42,7 @@ if not TELEGRAM_TOKEN:
     raise RuntimeError("Set TELEGRAM_TOKEN environment variable")
 
 # webhook token: random secret fragment used in path to secure webhook endpoint
-WEBHOOK_TOKEN = os.getenv("WEBHOOK_URL", "change_this_to_secure_token")
+WEBHOOK_TOKEN = os.getenv("WEBHOOK_URL", "8489382938:AAHeFFZPODspuEFcSQyjw8lWzYpRRSv9n3g")
 
 # bot behavior
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", str(5 * 60)))  # 5 minutes
