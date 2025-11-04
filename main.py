@@ -1,465 +1,690 @@
-# main.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+signal_bot_webhook.py
+
+Monolithic Telegram Signal Bot (Webhook edition)
+- Flask web server for Telegram webhook
+- Background scanner every 5 minutes (signals only)
+- Self-ping to /health to avoid sleeping on some hosts
+- Uses Binance public REST for tickers & klines (read-only)
+- Commands: /smart_auto, /momentum, /reversal, /vol_spike, /auto_scan, /status
+- Single-file, minimal external deps:
+    pip install Flask pyTelegramBotAPI requests numpy pandas
+
+SECURITY/USAGE:
+- This bot generates *signals* only (no orders).
+- Set TELEGRAM_TOKEN and WEBHOOK_TOKEN (secret path fragment) via env.
+"""
+
 import os
 import time
 import json
+import math
 import logging
-import re
-from datetime import datetime, timezone
-from threading import Thread
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from datetime import datetime, timezone, timedelta
+from typing import List, Dict, Any, Optional
+from functools import wraps
 
-import pandas as pd
-import matplotlib.pyplot as plt
 import requests
-import ta
-import mplfinance as mpf
 import numpy as np
-import io
+import pandas as pd
+from flask import Flask, request, jsonify
 
-from binance.client import Client
-from binance import ThreadedWebsocketManager
+import telebot  # pyTelegramBotAPI
 
-# ---------------- LOGGING ----------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()]
-)
-logger = logging.getLogger("pretop-bot")
+# ----------------------------
+# Configuration (ENV)
+# ----------------------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("Set TELEGRAM_TOKEN environment variable")
 
-# ---------------- CONFIG ----------------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")  # paste token or set env
-CHAT_ID = os.getenv("CHAT_ID", "")               # paste chat id or set env
-PORT = int(os.getenv("PORT", "5000"))
-PARALLEL_WORKERS = int(os.getenv("PARALLEL_WORKERS", "6"))
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))  # seconds
-STATE_FILE = "state.json"
-CONF_THRESHOLD_MEDIUM = float(os.getenv("CONF_THRESHOLD_MEDIUM", "0.3"))
-TOP_SYMBOL_LIMIT = int(os.getenv("TOP_SYMBOL_LIMIT", "200"))  # how many top symbols to scan
+# webhook token: random secret fragment used in path to secure webhook endpoint
+WEBHOOK_TOKEN = os.getenv("WEBHOOK_URL", "change_this_to_secure_token")
 
-# ---------------- BINANCE CLIENT ----------------
-# Put your keys in env or leave empty for public reads that use REST for klines.
-binance_client = Client(api_key=os.getenv("BINANCE_API_KEY", ""), api_secret=os.getenv("BINANCE_API_SECRET", ""))
+# bot behavior
+SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", str(5 * 60)))  # 5 minutes
+SELF_PING_SECONDS = int(os.getenv("SELF_PING_SECONDS", str(4 * 60)))  # ping self to stay awake (4 min)
+SIGNAL_COOLDOWN_MIN = int(os.getenv("SIGNAL_COOLDOWN_MIN", "30"))  # cooldown per-symbol
+TOP_VOLUME_THRESHOLD = float(os.getenv("TOP_VOLUME_THRESHOLD", "5_000_000"))  # quoteVolume filter
+TOP_SYMBOL_LIMIT = int(os.getenv("TOP_SYMBOL_LIMIT", "30"))
+KLINES_INTERVAL = os.getenv("KLINES_INTERVAL", "1h")  # timeframe used for analysis
+KLINES_LIMIT = int(os.getenv("KLINES_LIMIT", "200"))
+CACHE_TTL = int(os.getenv("CACHE_TTL", "30"))  # seconds for klines cache
+RATE_LIMIT_WAIT = float(os.getenv("RATE_LIMIT_WAIT", "0.08"))  # small wait between REST calls
 
-# ---------------- STATE ----------------
-def load_json_safe(path, default):
+STATE_FILE = os.getenv("STATE_FILE", "signal_state.json")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+# ----------------------------
+# Logging
+# ----------------------------
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("signal-bot")
+
+# ----------------------------
+# Flask + TeleBot init
+# ----------------------------
+app = Flask(__name__)
+bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode=None)  # we'll send HTML with explicit parse_mode
+
+# webhook route path: /telegram_webhook/<WEBHOOK_TOKEN>
+WEBHOOK_ROUTE = f"/telegram_webhook/{WEBHOOK_TOKEN}"
+
+# ----------------------------
+# Simple in-memory cache & state
+# ----------------------------
+_klines_cache: Dict[str, Dict[str, Any]] = {}   # key -> {"ts": epoch, "df": pandas.DataFrame}
+_cache_lock = threading.Lock()
+
+_state_lock = threading.Lock()
+try:
+    with open(STATE_FILE, "r") as f:
+        STATE = json.load(f)
+except Exception:
+    STATE = {"signals": {}, "last_scan": None}  # signals: symbol -> record
+# record example: {"time": iso, "action":"LONG","entry":..., "confidence":0.7}
+
+def save_state():
     try:
-        if os.path.exists(path):
-            with open(path, "r") as f:
-                return json.load(f)
-    except Exception as e:
-        logger.exception("load_json_safe error %s: %s", path, e)
-    return default
+        with _state_lock:
+            with open(STATE_FILE, "w") as f:
+                json.dump(STATE, f, indent=2, default=str)
+    except Exception:
+        logger.exception("save_state failed")
 
-def save_json_safe(path, data):
+# ----------------------------
+# Helpers: Binance REST (public)
+# ----------------------------
+BINANCE_TICKER_24H = "https://api.binance.com/api/v3/ticker/24hr"
+BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
+
+def safe_get_json(url, params=None, timeout=10):
     try:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f, indent=2, default=str)
-        os.replace(tmp, path)
+        r = requests.get(url, params=params, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
     except Exception as e:
-        logger.exception("save_json_safe error %s: %s", path, e)
-
-state = load_json_safe(STATE_FILE, {"signals": {}, "last_scan": None})
-
-# ---------------- TELEGRAM ----------------
-MARKDOWNV2_ESCAPE = r"_*[]()~`>#+-=|{}.!"
-
-def escape_md_v2(text: str) -> str:
-    return re.sub(f"([{re.escape(MARKDOWNV2_ESCAPE)}])", r"\\\1", str(text))
-
-def send_telegram(text: str, photo=None):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        logger.debug("Telegram credentials missing, skipping send.")
-        return
-    try:
-        if photo:
-            files = {'photo': ('signal.png', photo, 'image/png')}
-            data = {'chat_id': CHAT_ID, 'caption': escape_md_v2(text), 'parse_mode': 'MarkdownV2'}
-            resp = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto", data=data, files=files, timeout=10)
-            logger.debug("Telegram sendPhoto status: %s", resp.status_code)
-        else:
-            payload = {"chat_id": CHAT_ID, "text": escape_md_v2(text), "parse_mode": "MarkdownV2"}
-            resp = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=10)
-            logger.debug("Telegram sendMessage status: %s", resp.status_code)
-    except Exception as e:
-        logger.exception("send_telegram error: %s", e)
-
-# ---------------- BINANCE WEBSOCKET (miniTicker) ----------------
-_tickers_cache = {}   # symbol -> {lastPrice, changePercent, volume, quoteVolume}
-_tickers_last_update = 0
-_twm = None
-
-def start_ws_tickers():
-    """Запускаємо futures miniTicker websocket для кешування даних топ-символів"""
-    global _twm, _tickers_cache, _tickers_last_update
-    try:
-        _twm = ThreadedWebsocketManager()
-        _twm.start()
-
-        def handle(msg):
-            # msg is dict for a single update or dict for a combined stream depending on lib version
-            try:
-                # miniTicker fields include: 's' (symbol), 'c' (close), 'P' (%), 'v' (volume), 'q' (quoteVolume)
-                if not isinstance(msg, dict):
-                    return
-                if "s" in msg and "c" in msg:
-                    sym = msg["s"]
-                    _tickers_cache[sym] = {
-                        "lastPrice": float(msg["c"]),
-                        "changePercent": float(msg.get("P", 0.0)),
-                        "volume": float(msg.get("v", 0.0)),
-                        "quoteVolume": float(msg.get("q", 0.0))
-                    }
-                    _tickers_last_update = time.time()
-            except Exception:
-                logger.exception("Error in WS handle")
-        # Start futures miniTicker socket
-        _twm.start_futures_miniticker_socket(callback=handle)
-        logger.info("Started futures miniTicker websocket")
-    except Exception as e:
-        logger.exception("start_ws_tickers error: %s", e)
-
-def fetch_top_symbols(limit=TOP_SYMBOL_LIMIT):
-    """Отримуємо топ символів з кешу websocket по абсолютній % зміні."""
-    global _tickers_cache
-    if not _tickers_cache:
-        logger.debug("Tickers cache empty, falling back to REST/all list")
-        # Fallback: try to use REST sparingly to fetch pairs (we do this only if WS not ready)
-        try:
-            tickers = binance_client.futures_ticker()
-            usdt_pairs = [t['symbol'] for t in tickers if t['symbol'].endswith("USDT")]
-            return usdt_pairs[:limit] if limit else usdt_pairs
-        except Exception as e:
-            logger.exception("REST fallback fetch_top_symbols failed: %s", e)
-            return []
-    usdt_pairs = {s: d for s, d in _tickers_cache.items() if s.endswith("USDT")}
-    sorted_pairs = sorted(usdt_pairs.items(), key=lambda kv: abs(kv[1].get("changePercent", 0)), reverse=True)
-    symbols = [s for s, _ in sorted_pairs]
-    return symbols[:limit] if limit else symbols
-
-# ---------------- FETCH KLINES (REST fallback if WS klines not present) ----------------
-BINANCE_REST_URL = "https://fapi.binance.com/fapi/v1/klines"
-
-def fetch_klines_rest(symbol, interval="15m", limit=500):
-    try:
-        resp = requests.get(BINANCE_REST_URL, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=10)
-        data = resp.json()
-        df = pd.DataFrame(data, columns=[
-            "open_time","open","high","low","close","volume",
-            "close_time","quote_asset_volume","trades",
-            "taker_buy_base","taker_buy_quote","ignore"
-        ])
-        for col in ["open","high","low","close","volume"]:
-            df[col] = df[col].astype(float)
-        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-        df.set_index("open_time", inplace=True)
-        return df
-    except Exception as e:
-        logger.exception("REST fetch error for %s: %s", symbol, e)
+        logger.debug("safe_get_json error: %s %s", e, url)
         return None
 
-# If you have a kline websocket manager (like your WebSocketKlineManager), you can plug it in.
-# For now we'll use only REST klines to keep code simple and robust.
-def fetch_klines(symbol, interval="15m", limit=200):
-    # Could be replaced by your WebSocketKlineManager.get_klines(symbol, limit)
-    return fetch_klines_rest(symbol, interval=interval, limit=limit)
+def fetch_tickers_24h():
+    """Return list of ticker dicts (or empty list)"""
+    data = safe_get_json(BINANCE_TICKER_24H)
+    return data or []
 
-# ---------------- FEATURE HELPERS ----------------
-def apply_basic_candles(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["open"] = df["open"].astype(float)
-    df["high"] = df["high"].astype(float)
-    df["low"] = df["low"].astype(float)
-    df["close"] = df["close"].astype(float)
-    df["volume"] = df["volume"].astype(float)
-    df["body"] = df["close"] - df["open"]
-    df["range"] = df["high"] - df["low"]
-    df["upper_shadow"] = df["high"] - df[["close", "open"]].max(axis=1)
-    df["lower_shadow"] = df[["close", "open"]].min(axis=1) - df["low"]
-    df["vol_ma20"] = df["volume"].rolling(20).mean()
-    df["atr"] = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"], window=14).average_true_range()
+def fetch_klines(symbol: str, interval: str = KLINES_INTERVAL, limit: int = KLINES_LIMIT):
+    """Fetch klines with in-memory cache (pandas DataFrame)."""
+    key = f"{symbol}_{interval}_{limit}"
+    now = time.time()
+    with _cache_lock:
+        entry = _klines_cache.get(key)
+        if entry and now - entry["ts"] < CACHE_TTL:
+            return entry["df"].copy()
+    # tiny sleep for rate control
+    time.sleep(RATE_LIMIT_WAIT)
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    data = safe_get_json(BINANCE_KLINES, params=params)
+    if not data:
+        return None
+    # columns: open_time, open, high, low, close, volume, close_time, quote_vol, trades, taker_base, taker_quote, ignore
+    df = pd.DataFrame(data, columns=[
+        "open_time","open","high","low","close","volume",
+        "close_time","quote_vol","trades","taker_base","taker_quote","ignore"
+    ])
+    for col in ["open","high","low","close","volume","quote_vol"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+    df.set_index("open_time", inplace=True)
+    with _cache_lock:
+        _klines_cache[key] = {"ts": now, "df": df}
     return df
 
-# ---------------- PUMP / DUMP REVERSAL DETECTOR (8 features + 2 extras) ----------------
-def detect_pump_reversals(df: pd.DataFrame):
+# ----------------------------
+# Feature engineering & S/R finder
+# ----------------------------
+def find_support_resistance(prices: np.ndarray, window: int = 20, delta: float = 0.005) -> List[float]:
     """
-    Return list of signals (dictionaries) detected on the latest candle.
-    Each signal: {'action': 'SHORT'/'LONG', 'reason': '...', 'score': float}
+    Simple SR finder: local minima/maxima on rolling window.
+    returns sorted levels (unique)
     """
-    signals = []
-    if df is None or len(df) < 30:
-        return signals
+    if len(prices) < window:
+        return []
+    levels = set()
+    for i in range(window, len(prices)-window):
+        s = prices[i-window:i+window+1]
+        val = prices[i]
+        if val == s.max() or val == s.min():
+            levels.add(float(val))
+    # compress nearby levels
+    levels = sorted(levels)
+    merged = []
+    for lvl in levels:
+        if not merged:
+            merged.append(lvl)
+            continue
+        if abs(lvl - merged[-1]) / merged[-1] <= delta:
+            # merge by avg
+            merged[-1] = (merged[-1] + lvl) / 2.0
+        else:
+            merged.append(lvl)
+    return merged
 
-    df = apply_basic_candles(df)
-    last = df.iloc[-1]
-    entry = float(last["close"])
-    vol_ma = float(df["volume"].rolling(20).mean().iloc[-1])
-    recent_change_10 = (last["close"] - df["close"].iloc[-10]) / df["close"].iloc[-10]
-    recent_change_5 = (last["close"] - df["close"].iloc[-5]) / df["close"].iloc[-5]
+def apply_features_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy().dropna()
+    if df.empty:
+        return df
+    df["close_f"] = df["close"].astype(float)
+    df["open_f"] = df["open"].astype(float)
+    df["high_f"] = df["high"].astype(float)
+    df["low_f"] = df["low"].astype(float)
+    df["vol_f"] = df["volume"].astype(float)
+    # candle
+    df["body"] = df["close_f"] - df["open_f"]
+    df["range"] = df["high_f"] - df["low_f"]
+    df["upper_shadow"] = df["high_f"] - df[["close_f", "open_f"]].max(axis=1)
+    df["lower_shadow"] = df[["close_f", "open_f"]].min(axis=1) - df["low_f"]
+    # sma/ema/rsi/macd
+    try:
+        df["ema9"] = df["close_f"].ewm(span=9, adjust=False).mean()
+        df["ema21"] = df["close_f"].ewm(span=21, adjust=False).mean()
+        # RSI
+        delta = df["close_f"].diff()
+        up = delta.clip(lower=0).ewm(span=14, adjust=False).mean()
+        down = -delta.clip(upper=0).ewm(span=14, adjust=False).mean()
+        rs = up / (down.replace(0, np.nan))
+        df["rsi14"] = 100 - 100 / (1 + rs)
+        # simple MACD
+        ema12 = df["close_f"].ewm(span=12, adjust=False).mean()
+        ema26 = df["close_f"].ewm(span=26, adjust=False).mean()
+        df["macd"] = ema12 - ema26
+        df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+        # ATR-ish: use simple average true range
+        high_low = df["high_f"] - df["low_f"]
+        high_close = (df["high_f"] - df["close_f"].shift()).abs()
+        low_close = (df["low_f"] - df["close_f"].shift()).abs()
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        df["atr14"] = tr.rolling(14).mean()
+    except Exception:
+        logger.exception("apply_features_df failure")
+    return df
 
-    # helper to append with small score
-    def add(action, reason, score=0.1):
-        signals.append({"action": action, "reason": reason, "score": score})
+# ----------------------------
+# Signal detection functions (pure-ish)
+# ----------------------------
+def detect_breakout(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    """
+    Detect breakout relative to SR levels: returns a signal dict or None.
+    Short if price breaks below support; Long if above resistance.
+    """
+    arr = df["close"].astype(float).values
+    levels = find_support_resistance(arr, window=20, delta=0.005)
+    if not levels:
+        return None
+    last_price = arr[-1]
+    # find nearest level under and above
+    lowers = [l for l in levels if l < last_price]
+    uppers = [l for l in levels if l > last_price]
+    nearest_res = min(uppers) if uppers else None
+    nearest_sup = max(lowers) if lowers else None
 
-    # Feature 1: Volume Spike Pump / Dump (big % move + huge volume)
-    if recent_change_10 > 0.18 and last["volume"] > 4 * vol_ma:
-        add("SHORT", "Volume Spike Pump", 0.25)
-    if recent_change_10 < -0.18 and last["volume"] > 4 * vol_ma:
-        add("LONG", "Volume Spike Dump", 0.25)
+    # breakout thresholds
+    if nearest_res and last_price >= nearest_res * 1.01:
+        # long breakout above resistance (price broke higher than a previous resistance -> trend)
+        return {"type": "LONG_BREAKOUT", "level": nearest_res, "price": float(last_price)}
+    if nearest_sup and last_price <= nearest_sup * 0.99:
+        return {"type": "SHORT_BREAKOUT", "level": nearest_sup, "price": float(last_price)}
+    return None
 
-    # Feature 2: Exhaustion Wick (large upper wick on pump / lower on dump)
-    upper_wick = last["high"] - max(last["close"], last["open"])
-    lower_wick = min(last["close"], last["open"]) - last["low"]
-    body = abs(last["body"]) if last["body"] != 0 else 1e-9
-    if upper_wick > body * 2 and recent_change_5 > 0.10 and last["volume"] > 1.5 * vol_ma:
-        add("SHORT", "Exhaustion Upper Wick", 0.15)
-    if lower_wick > body * 2 and recent_change_5 < -0.10 and last["volume"] > 1.5 * vol_ma:
-        add("LONG", "Exhaustion Lower Wick", 0.15)
+def detect_pretop(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    """
+    Detect pre-top (fast pump pattern) — heuristic:
+      - price increased >8% over last 3 candles (or 1 hour depending TF)
+      - last volume spike > 1.5x vol mean(20)
+    """
+    closes = df["close"].astype(float).values
+    vols = df["volume"].astype(float).values
+    if len(closes) < 5:
+        return None
+    impulse = (closes[-1] - closes[-4]) / max(closes[-4], 1e-9)
+    vol_mean20 = vols[-20:].mean() if len(vols) >= 20 else vols.mean()
+    vol_spike = vols[-1] > 1.5 * max(vol_mean20, 1e-9)
+    if impulse > 0.08 and vol_spike:
+        # Find nearest support below last price
+        levels = find_support_resistance(closes, window=20, delta=0.005)
+        nearest_support = max([l for l in levels if l < closes[-1]], default=None)
+        return {"type": "PRETOP", "impulse": float(impulse), "vol_spike": bool(vol_spike), "nearest_support": nearest_support, "price": float(closes[-1])}
+    return None
 
-    # Feature 3: Momentum Reversal (3 candles momentum drop)
-    mom = df["close"].diff()
-    if len(mom) >= 3:
-        if mom.iloc[-3] > 0 and mom.iloc[-2] > 0 and mom.iloc[-1] < 0 and recent_change_5 > 0.12:
-            add("SHORT", "Momentum Reversal After Pump", 0.12)
-        if mom.iloc[-3] < 0 and mom.iloc[-2] < 0 and mom.iloc[-1] > 0 and recent_change_5 < -0.12:
-            add("LONG", "Momentum Reversal After Dump", 0.12)
+def detect_momentum(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    """
+    Detects strong one-sided momentum (3 consecutive candles same direction)
+    """
+    closes = df["close"].astype(float)
+    opens = df["open"].astype(float)
+    if len(closes) < 4:
+        return None
+    last3 = [(closes.iloc[-i] - opens.iloc[-i]) for i in range(1,4)]
+    if all(x > 0 for x in last3):
+        return {"type": "MOMENTUM_UP", "strength": sum(last3)}
+    if all(x < 0 for x in last3):
+        return {"type": "MOMENTUM_DOWN", "strength": sum(abs(x) for x in last3)}
+    return None
 
-    # Feature 4: RSI Overextension
-    rsi = ta.momentum.RSIIndicator(df["close"], 14).rsi()
-    last_rsi = rsi.iloc[-1]
-    if last_rsi > 82:
-        add("SHORT", "RSI Overbought", 0.09)
-    if last_rsi < 18:
-        add("LONG", "RSI Oversold", 0.09)
+def detect_vol_spike(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    vols = df["volume"].astype(float).values
+    if len(vols) < 20:
+        return None
+    if vols[-1] > 2.0 * vols[-20:].mean():
+        return {"type": "VOL_SPIKE", "ratio": float(vols[-1] / (vols[-20:].mean() or 1))}
+    return None
 
-    # Feature 5: Volume Divergence (price up but volume down)
-    if len(df) >= 4:
-        if df["close"].iloc[-1] > df["close"].iloc[-2] > df["close"].iloc[-3] and df["volume"].iloc[-1] < df["volume"].iloc[-2]:
-            add("SHORT", "Price Up + Volume Down (Divergence)", 0.10)
-        if df["close"].iloc[-1] < df["close"].iloc[-2] < df["close"].iloc[-3] and df["volume"].iloc[-1] < df["volume"].iloc[-2]:
-            add("LONG", "Price Down + Volume Down (Divergence)", 0.10)
+# ----------------------------
+# Utility for formatting/sending signals (signals-only)
+# ----------------------------
+def safe_escape_html(text: str) -> str:
+    # basic escape for HTML mode in Telegram
+    return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
-    # Feature 6: Volatility Spike (ATR explosion)
-    recent_vol = (df["high"] - df["low"]).iloc[-5:].mean()
-    prev_vol = (df["high"] - df["low"]).iloc[-20:-5].mean()
-    if prev_vol > 0 and recent_vol > prev_vol * 2 and last["volume"] > 2 * vol_ma:
-        if recent_change_5 > 0.12:
-            add("SHORT", "Volatility Spike on Pump", 0.12)
-        if recent_change_5 < -0.12:
-            add("LONG", "Volatility Spike on Dump", 0.12)
+def build_signal_message(symbol: str, sig: Dict[str, Any]) -> str:
+    t = sig.get("type", "SIGNAL")
+    if t == "LONG_BREAKOUT":
+        msg = f"🚀 <b>LONG breakout</b> {symbol}\nPrice: {sig['price']:.6f}\nLevel: {sig['level']:.6f}"
+    elif t == "SHORT_BREAKOUT":
+        msg = f"⚡ <b>SHORT breakout</b> {symbol}\nPrice: {sig['price']:.6f}\nLevel: {sig['level']:.6f}"
+    elif t == "PRETOP":
+        msg = f"⚠️ <b>PRE-TOP (pump)</b> {symbol}\nPrice: {sig['price']:.6f}\nImpulse: {sig['impulse']*100:.2f}%\nNearest support: {sig.get('nearest_support')}"
+    elif t == "MOMENTUM_UP":
+        msg = f"🔥 <b>MOMENTUM UP</b> {symbol}\nStrength: {sig.get('strength'):.6f}"
+    elif t == "MOMENTUM_DOWN":
+        msg = f"🔥 <b>MOMENTUM DOWN</b> {symbol}\nStrength: {sig.get('strength'):.6f}"
+    elif t == "VOL_SPIKE":
+        msg = f"📣 <b>VOLUME SPIKE</b> {symbol}\nRatio: {sig.get('ratio'):.2f}x"
+    else:
+        msg = f"🔔 <b>SIGNAL</b> {symbol}\nDetails: {sig}"
+    return msg
 
-    # Feature 7: Liquidity Grab / Fake Breakout
-    rolling_high = df["high"].rolling(20).max().iloc[-2]
-    rolling_low = df["low"].rolling(20).min().iloc[-2]
-    if last["high"] > rolling_high and last["close"] < rolling_high:
-        add("SHORT", "Liquidity Grab Top (Fake Breakout)", 0.14)
-    if last["low"] < rolling_low and last["close"] > rolling_low:
-        add("LONG", "Liquidity Grab Bottom (Fake Breakout)", 0.14)
-
-    # Feature 8: Climax Candle (huge volume + huge body beyond ATR)
-    atr = float(df["atr"].iloc[-1] if not np.isnan(df["atr"].iloc[-1]) else (df["high"]-df["low"]).iloc[-1])
-    if last["volume"] > 6 * vol_ma and abs(last["close"] - df["close"].iloc[-2]) > 3 * atr:
-        if recent_change_5 > 0.15:
-            add("SHORT", "Climax Pump Candle", 0.2)
-        if recent_change_5 < -0.15:
-            add("LONG", "Climax Dump Candle", 0.2)
-
-    # Extra Feature 9: Smart Money Shift (big buy-side then large distribution)
-    # Detect a period where taker buy quote surged then reversed
-    # (requires taker data; fallback: check quoteVolume spike)
-    if "quote_asset_volume" in df.columns or "quoteVolume" in df.columns:
-        # fallback: use quoteVolume last candle if available
-        qvol = df.get("quote_asset_volume", df.get("quoteVolume", None))
-        if qvol is not None:
+def record_and_send_signal(chat_id: str, symbol: str, sig: Dict[str, Any]):
+    """
+    Records in STATE, avoids duplicates with cooldown, and sends Telegram message (HTML).
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with _state_lock:
+        last = STATE["signals"].get(symbol)
+        if last:
             try:
-                qvol_last = float(qvol.iloc[-1])
-                qvol_ma = float(pd.Series(qvol).rolling(20).mean().iloc[-1])
-                if qvol_last > 4 * qvol_ma and recent_change_5 > 0.1:
-                    add("SHORT", "Smart Money Distribution (quoteVol spike)", 0.12)
+                last_time = datetime.fromisoformat(last["time"])
+                if datetime.now(timezone.utc) - last_time < timedelta(minutes=SIGNAL_COOLDOWN_MIN):
+                    logger.debug("Duplicate suppressed by cooldown for %s", symbol)
+                    return False
             except Exception:
                 pass
-
-    # Extra Feature 10: Trap Candle (wick beyond level + close back)
-    # If candle pierces level (20-roll high/low) but closes back -> trap
-    if last["high"] > rolling_high and last["close"] < rolling_high and last["upper_shadow"] > last["range"] * 0.6:
-        add("SHORT", "Top Trap Candle", 0.12)
-    if last["low"] < rolling_low and last["close"] > rolling_low and last["lower_shadow"] > last["range"] * 0.6:
-        add("LONG", "Bottom Trap Candle", 0.12)
-
-    # Merge same-direction signals to produce a combined score
-    combined = {}
-    for s in signals:
-        combined.setdefault(s["action"], 0.0)
-        combined[s["action"]] += s["score"]
-
-    # produce final signals list with threshold
-    output = []
-    for action, score in combined.items():
-        # signal threshold — require at least 0.18 combined weight to alert
-        if score >= 0.18:
-            # also include reasons (collect all reasons for that action)
-            reasons = [s["reason"] for s in signals if s["action"] == action]
-            output.append({"action": action, "score": round(min(1.0, score), 3), "reasons": reasons})
-    return output
-
-# ---------------- PLOT UTILITY ----------------
-def plot_signal_candles(df, symbol, action, tp1=None, tp2=None, tp3=None, sl=None, entry=None):
-    addplots = []
-    if tp1 is not None: addplots.append(mpf.make_addplot([tp1]*len(df), color='green', linestyle="--"))
-    if tp2 is not None: addplots.append(mpf.make_addplot([tp2]*len(df), color='lime', linestyle="--"))
-    if tp3 is not None: addplots.append(mpf.make_addplot([tp3]*len(df), color='darkgreen', linestyle="--"))
-    if sl is not None: addplots.append(mpf.make_addplot([sl]*len(df), color='red', linestyle="--"))
-    if entry is not None: addplots.append(mpf.make_addplot([entry]*len(df), color='blue', linestyle="--"))
-
-    fig, ax = mpf.plot(df.tail(200), type='candle', style='yahoo', title=f"{symbol} - {action}", addplot=addplots, returnfig=True)
-    buf = io.BytesIO()
-    fig.savefig(buf, format='png', bbox_inches='tight')
-    buf.seek(0)
-    plt.close(fig)
-    return buf
-
-# ---------------- ANALYZE & ALERT (pump/dump mode) ----------------
-def analyze_and_alert(symbol: str):
+        # store
+        STATE["signals"][symbol] = {"time": now_iso, **sig}
+        STATE["last_scan"] = now_iso
+        save_state()
+    # send to telegram
+    msg = build_signal_message(symbol, sig)
     try:
-        df = fetch_klines(symbol, interval="15m", limit=200)
-        if df is None or len(df) < 30:
-            return
-
-        signals = detect_pump_reversals(df)
-        if not signals:
-            return
-
-        # For each detected direction produce an alert
-        for s in signals:
-            action = s["action"]
-            score = s["score"]
-            reasons = s["reasons"]
-            last = df.iloc[-1]
-            entry = float(last["close"])
-
-            # Use far support/resistance (20-50 candles window) to set sl/tp around real levels
-            support = df["low"].rolling(50).min().iloc[-1]
-            resistance = df["high"].rolling(50).max().iloc[-1]
-
-            if action == "SHORT":
-                stop_loss = float(last["high"] * 1.01)
-                # TPs should be placed before important supports — use a ladder approaching long-term support
-                tp1 = entry * 0.985
-                tp2 = max(entry * 0.96, support * 1.01 if not np.isnan(support) else entry * 0.95)
-                tp3 = max(entry * 0.92, support * 1.005 if not np.isnan(support) else entry * 0.90)
-            else:  # LONG
-                stop_loss = float(last["low"] * 0.99)
-                tp1 = entry * 1.015
-                tp2 = min(entry * 1.04, resistance * 0.995 if not np.isnan(resistance) else entry * 1.06)
-                tp3 = min(entry * 1.08, resistance * 0.999 if not np.isnan(resistance) else entry * 1.12)
-
-            # Risk/Reward calculation (conservative)
-            rr1 = (tp1 - entry) / (entry - stop_loss) if action == "LONG" else (entry - tp1) / (stop_loss - entry)
-            rr2 = (tp2 - entry) / (entry - stop_loss) if action == "LONG" else (entry - tp2) / (stop_loss - entry)
-            rr3 = (tp3 - entry) / (entry - stop_loss) if action == "LONG" else (entry - tp3) / (stop_loss - entry)
-
-            # Quality filter: require some minimal combined score and RR1 > 0.8 (pump reversals are aggressive, allow lower RR)
-            if score < 0.2:
-                continue
-            if rr1 < 0.5:
-                # if first RR too low, push TP1 a bit closer to increase RR or skip
-                # here we skip to avoid spam
-                continue
-
-            # Compose message
-            msg = (
-                f"⚡ PUMP/DUMP REVERSAL ALERT\n"
-                f"Symbol: {symbol}\n"
-                f"Action: {action}\n"
-                f"Score: {score:.2f}\n"
-                f"Reasons: {', '.join(reasons)}\n"
-                f"Entry: {entry:.6f}\n"
-                f"Stop-Loss: {stop_loss:.6f}\n"
-                f"TP1: {tp1:.6f} (RR {rr1:.2f})\n"
-                f"TP2: {tp2:.6f} (RR {rr2:.2f})\n"
-                f"TP3: {tp3:.6f} (RR {rr3:.2f})\n"
-            )
-
-            logger.info("Signal %s %s score=%.2f rr1=%.2f reasons=%s", symbol, action, score, rr1, reasons)
-            photo_buf = plot_signal_candles(df, symbol, action, tp1=tp1, tp2=tp2, tp3=tp3, sl=stop_loss, entry=entry)
-            send_telegram(msg, photo=photo_buf)
-
-            # save state
-            state.setdefault("signals", {})[symbol] = {
-                "action": action, "entry": entry, "sl": stop_loss, "tp1": tp1, "tp2": tp2, "tp3": tp3,
-                "rr1": rr1, "rr2": rr2, "rr3": rr3, "score": score, "reasons": reasons,
-                "time": str(df.index[-1]), "last_price": float(entry)
-            }
-            save_json_safe(STATE_FILE, state)
-    except Exception as e:
-        logger.exception("analyze_and_alert error for %s: %s", symbol, e)
-
-# ---------------- MASTER SCAN ----------------
-def scan_all_symbols():
-    symbols = fetch_top_symbols(limit=TOP_SYMBOL_LIMIT)
-    if not symbols:
-        logger.warning("No symbols fetched, falling back to empty list")
-        return
-    logger.info("Starting scan for %d symbols", len(symbols))
-    def safe_analyze(sym):
-        try:
-            analyze_and_alert(sym)
-        except Exception as e:
-            logger.exception("Error analyzing symbol %s: %s", sym, e)
-    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as exe:
-        list(exe.map(safe_analyze, symbols))
-    state["last_scan"] = str(datetime.now(timezone.utc))
-    save_json_safe(STATE_FILE, state)
-    logger.info("Scan finished at %s", state["last_scan"])
-
-# ---------------- BACKGROUND SCANNER ----------------
-def background_scanner():
-    while True:
-        try:
-            scan_all_symbols()
-        except Exception as e:
-            logger.exception("Background scan error: %s", e)
-        time.sleep(SCAN_INTERVAL)
-
-# Start WS listener thread early
-Thread(target=start_ws_tickers, daemon=True).start()
-# Start background scanner thread
-Thread(target=background_scanner, daemon=True).start()
-
-# ---------------- FLASK ----------------
-from flask import Flask, request, jsonify
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return jsonify({
-        "status": "ok",
-        "time": str(datetime.now(timezone.utc)),
-        "signals": len(state.get("signals", {}))
-    })
-
-@app.route("/telegram_webhook/<token>", methods=["POST"])
-def telegram_webhook(token):
-    if token != TELEGRAM_TOKEN:
-        return jsonify({"ok": False, "error": "invalid token"}), 403
-    update = request.get_json(force=True) or {}
-    text = update.get("message", {}).get("text", "").lower().strip()
-    if text.startswith("/scan"):
-        send_telegram("⚡ Manual scan started.")
-        Thread(target=scan_all_symbols, daemon=True).start()
-    if text.startswith("/status"):
-        send_telegram(f"Status: last_scan={state.get('last_scan')}, signals={len(state.get('signals', {}))}")
-    return jsonify({"ok": True})
-
-# ---------------- MAIN ----------------
-if __name__ == "__main__":
-    logger.info("Starting pump/dump detector bot")
-    # quick test Telegram connectivity (will be skipped silently if no token)
-    try:
-        send_telegram("✅ Pump/Dump detector bot started.")
+        bot.send_message(chat_id, safe_escape_html(msg), parse_mode="HTML")
     except Exception:
-        pass
-    # main web server
-    app.run(host="0.0.0.0", port=PORT)
+        # try plain text fallback
+        try:
+            bot.send_message(chat_id, msg)
+        except Exception:
+            logger.exception("Failed to send Telegram message for %s", symbol)
+    return True
+
+# ----------------------------
+# Core scanner (top-level): scan_top_symbols -> check various detectors -> emit signals
+# ----------------------------
+def scan_top_symbols_and_emit(chat_id: str):
+    """
+    This function is run periodically in background thread.
+    It fetches tickers, filters top USDT by quoteVolume, and analyzes top N symbols.
+    Emits signals to given chat_id (owner).
+    """
+    try:
+        tickers = fetch_tickers_24h()
+        if not tickers:
+            logger.warning("No tickers fetched")
+            return
+        # filter USDT and minimum volume
+        usdt = [t for t in tickers if t["symbol"].endswith("USDT")]
+        # convert safe
+        usdt = [t for t in usdt if float(t.get("quoteVolume", 0) or 0) > TOP_VOLUME_THRESHOLD]
+        # sort by absolute percent change
+        usdt_sorted = sorted(usdt, key=lambda x: abs(float(x.get("priceChangePercent", 0) or 0)), reverse=True)
+        top = usdt_sorted[:TOP_SYMBOL_LIMIT]
+        symbols = [d["symbol"] for d in top]
+        logger.info("Auto-scan analyzing %d symbols", len(symbols))
+
+        for symbol in symbols:
+            try:
+                df = fetch_klines(symbol, interval=KLINES_INTERVAL, limit=KLINES_LIMIT)
+                if df is None or df.empty:
+                    continue
+                df = apply_features_df(df)
+                # run detectors in order of priority
+                sig = detect_pretop(df) or detect_vol_spike(df) or detect_breakout(df) or detect_momentum(df)
+                if sig:
+                    # ensure we attach some metadata
+                    sig_meta = sig.copy()
+                    sig_meta.setdefault("detected_at", datetime.now(timezone.utc).isoformat())
+                    # prefer basis of our signals: always send as "signal" (not just info)
+                    record_and_send_signal(chat_id, symbol, sig_meta)
+                # short rate-control between symbols (avoid too many REST calls)
+                time.sleep(RATE_LIMIT_WAIT)
+            except Exception:
+                logger.exception("Error processing %s", symbol)
+    except Exception:
+        logger.exception("scan_top_symbols_and_emit failed")
+
+# ----------------------------
+# Background thread management
+# ----------------------------
+_bg_thread: Optional[threading.Thread] = None
+_bg_stop = threading.Event()
+
+def background_loop(chat_id: str):
+    """
+    Runs forever every SCAN_INTERVAL_SECONDS. Also self-pings /health to keep host awake.
+    """
+    logger.info("Background scanner started (interval=%ss)", SCAN_INTERVAL_SECONDS)
+    last_ping = 0.0
+    while not _bg_stop.is_set():
+        try:
+            start = time.time()
+            scan_top_symbols_and_emit(chat_id)
+            elapsed = time.time() - start
+            # self-ping to /health to keep dyno awake (only if SELF_HOST is set)
+            now = time.time()
+            if now - last_ping > SELF_PING_SECONDS:
+                last_ping = now
+                self_host = os.getenv("SELF_HOST")  # e.g. https://your-app.onrender.com
+                if self_host:
+                    try:
+                        requests.get(self_host.rstrip("/") + "/health", timeout=5)
+                        logger.debug("Self-ping to %s", self_host)
+                    except Exception:
+                        logger.debug("Self-ping failed")
+            # sleep remaining interval
+            sleep_for = SCAN_INTERVAL_SECONDS - elapsed
+            if sleep_for > 0:
+                _bg_stop.wait(sleep_for)
+        except Exception:
+            logger.exception("background_loop exception")
+            _bg_stop.wait(SCAN_INTERVAL_SECONDS)
+
+def start_background(chat_id: str):
+    global _bg_thread
+    if _bg_thread and _bg_thread.is_alive():
+        logger.info("Background scanner already running")
+        return
+    _bg_stop.clear()
+    _bg_thread = threading.Thread(target=background_loop, args=(chat_id,), daemon=True)
+    _bg_thread.start()
+
+def stop_background():
+    _bg_stop.set()
+    if _bg_thread:
+        _bg_thread.join(timeout=2)
+
+# ----------------------------
+# Telegram command handlers (via telebot style but we use webhook -> manual handling)
+# ----------------------------
+# For webhook we process updates from Flask route and pass to telebot
+# We'll implement some direct HTTP endpoints for manual trigger too.
+
+# Helper decorator to ensure chat is set and start background
+def require_chat_id(func):
+    @wraps(func)
+    def wrapper(chat_id: str, *args, **kwargs):
+        # start background if not running
+        start_background(chat_id)
+        return func(chat_id, *args, **kwargs)
+    return wrapper
+
+@require_chat_id
+def cmd_smart_auto(chat_id: str, args: Optional[str] = None):
+    """
+    One-shot smart_auto: analyze top symbols once and send immediate signals.
+    """
+    try:
+        tickers = fetch_tickers_24h()
+        usdt = [t for t in tickers if t["symbol"].endswith("USDT")]
+        usdt = [t for t in usdt if float(t.get("quoteVolume", 0) or 0) > TOP_VOLUME_THRESHOLD]
+        usdt_sorted = sorted(usdt, key=lambda x: abs(float(x.get("priceChangePercent", 0) or 0)), reverse=True)
+        top = usdt_sorted[:TOP_SYMBOL_LIMIT]
+        symbols = [d["symbol"] for d in top]
+        sent = 0
+        for symbol in symbols:
+            df = fetch_klines(symbol, interval=KLINES_INTERVAL, limit=KLINES_LIMIT)
+            if df is None or df.empty:
+                continue
+            df = apply_features_df(df)
+            sig = detect_pretop(df) or detect_vol_spike(df) or detect_breakout(df) or detect_momentum(df)
+            if sig:
+                sig_meta = sig.copy()
+                sig_meta.setdefault("detected_at", datetime.now(timezone.utc).isoformat())
+                if record_and_send_signal(chat_id, symbol, sig_meta):
+                    sent += 1
+            time.sleep(RATE_LIMIT_WAIT)
+        if sent == 0:
+            bot.send_message(chat_id, "ℹ️ Жодних сигналів не знайдено.")
+        else:
+            bot.send_message(chat_id, f"✅ Відправлено {sent} сигналів.")
+    except Exception as e:
+        logger.exception("cmd_smart_auto failed")
+        bot.send_message(chat_id, f"❌ Error: {e}")
+
+@require_chat_id
+def cmd_momentum(chat_id: str, args: Optional[str] = None):
+    tickers = fetch_tickers_24h()
+    usdt = [t for t in tickers if t["symbol"].endswith("USDT")]
+    usdt_sorted = sorted(usdt, key=lambda x: abs(float(x.get("priceChangePercent", 0) or 0)), reverse=True)
+    symbols = [d["symbol"] for d in usdt_sorted[:TOP_SYMBOL_LIMIT]]
+    sent = 0
+    for symbol in symbols:
+        df = fetch_klines(symbol, limit=KLINES_LIMIT)
+        if df is None or df.empty:
+            continue
+        df = apply_features_df(df)
+        sig = detect_momentum(df)
+        if sig:
+            sig_meta = sig.copy()
+            sig_meta.setdefault("detected_at", datetime.now(timezone.utc).isoformat())
+            if record_and_send_signal(chat_id, symbol, sig_meta):
+                sent += 1
+        time.sleep(RATE_LIMIT_WAIT)
+    bot.send_message(chat_id, f"✅ Momentum scan done. Sent: {sent}")
+
+@require_chat_id
+def cmd_reversal(chat_id: str, args: Optional[str] = None):
+    tickers = fetch_tickers_24h()
+    usdt = [t for t in tickers if t["symbol"].endswith("USDT")]
+    symbols = [d["symbol"] for d in sorted(usdt, key=lambda x: abs(float(x.get("priceChangePercent", 0) or 0)), reverse=True)[:TOP_SYMBOL_LIMIT]]
+    sent = 0
+    for symbol in symbols:
+        df = fetch_klines(symbol, limit=KLINES_LIMIT)
+        if df is None or df.empty:
+            continue
+        df = apply_features_df(df)
+        sig = detect_pretop(df)
+        if sig:
+            sig_meta = sig.copy()
+            sig_meta.setdefault("detected_at", datetime.now(timezone.utc).isoformat())
+            if record_and_send_signal(chat_id, symbol, sig_meta):
+                sent += 1
+        time.sleep(RATE_LIMIT_WAIT)
+    bot.send_message(chat_id, f"✅ Reversal (pretop) scan done. Sent: {sent}")
+
+@require_chat_id
+def cmd_vol_spike(chat_id: str, args: Optional[str] = None):
+    tickers = fetch_tickers_24h()
+    usdt = [t for t in tickers if t["symbol"].endswith("USDT")]
+    symbols = [d["symbol"] for d in sorted(usdt, key=lambda x: float(x.get("quoteVolume", 0) or 0), reverse=True)[:TOP_SYMBOL_LIMIT]]
+    sent = 0
+    for symbol in symbols:
+        df = fetch_klines(symbol, limit=KLINES_LIMIT)
+        if df is None or df.empty:
+            continue
+        df = apply_features_df(df)
+        sig = detect_vol_spike(df)
+        if sig:
+            sig_meta = sig.copy()
+            sig_meta.setdefault("detected_at", datetime.now(timezone.utc).isoformat())
+            if record_and_send_signal(chat_id, symbol, sig_meta):
+                sent += 1
+        time.sleep(RATE_LIMIT_WAIT)
+    bot.send_message(chat_id, f"✅ Vol spike scan done. Sent: {sent}")
+
+@require_chat_id
+def cmd_auto_scan(chat_id: str, args: Optional[str] = None):
+    # aggregate call: smart_auto + momentum + reversal + vol_spike
+    cmd_smart_auto(chat_id, args)
+    cmd_momentum(chat_id, args)
+    cmd_reversal(chat_id, args)
+    cmd_vol_spike(chat_id, args)
+    bot.send_message(chat_id, "✅ Auto scan done.")
+
+@require_chat_id
+def cmd_status(chat_id: str, args: Optional[str] = None):
+    with _state_lock:
+        last_scan = STATE.get("last_scan") or "never"
+        signals_count = len(STATE.get("signals", {}))
+        msg = f"🛰️ Status\nLast scan: {last_scan}\nSaved signals: {signals_count}\nBackground scanner: {'running' if _bg_thread and _bg_thread.is_alive() else 'stopped'}"
+    bot.send_message(chat_id, msg)
+
+# ----------------------------
+# Flask endpoints: webhook + health + manual
+# ----------------------------
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", "time": datetime.now(timezone.utc).isoformat()})
+
+# Telegram webhook POST endpoint
+@app.route(WEBHOOK_ROUTE, methods=["POST"])
+def telegram_webhook():
+    try:
+        json_str = request.get_data().decode("utf-8")
+        update = telebot.types.Update.de_json(json_str)
+        bot.process_new_updates([update])
+    except Exception:
+        logger.exception("Failed to process update")
+    return "", 200
+
+# manual trigger endpoints (useful for admin)
+@app.route("/admin/start", methods=["POST"])
+def admin_start():
+    # start background with chat_id set to env ADMIN_CHAT_ID if present
+    admin_id = os.getenv("ADMIN_CHAT_ID")
+    if not admin_id:
+        return jsonify({"ok": False, "error": "ADMIN_CHAT_ID not set"}), 400
+    start_background(admin_id)
+    return jsonify({"ok": True, "msg": "background started"})
+
+@app.route("/admin/stop", methods=["POST"])
+def admin_stop():
+    stop_background()
+    return jsonify({"ok": True, "msg": "background stopped"})
+
+# ----------------------------
+# TeleBot message handlers (register functions)
+# ----------------------------
+# We'll use bot.message_handler decorator to map commands to our functions.
+@bot.message_handler(commands=['smart_auto'])
+def _on_smart_auto(message):
+    chat_id = message.chat.id
+    threading.Thread(target=cmd_smart_auto, args=(chat_id, None), daemon=True).start()
+
+@bot.message_handler(commands=['momentum'])
+def _on_momentum(message):
+    chat_id = message.chat.id
+    threading.Thread(target=cmd_momentum, args=(chat_id, None), daemon=True).start()
+
+@bot.message_handler(commands=['reversal'])
+def _on_reversal(message):
+    chat_id = message.chat.id
+    threading.Thread(target=cmd_reversal, args=(chat_id, None), daemon=True).start()
+
+@bot.message_handler(commands=['vol_spike'])
+def _on_vol_spike(message):
+    chat_id = message.chat.id
+    threading.Thread(target=cmd_vol_spike, args=(chat_id, None), daemon=True).start()
+
+@bot.message_handler(commands=['auto_scan'])
+def _on_auto_scan(message):
+    chat_id = message.chat.id
+    threading.Thread(target=cmd_auto_scan, args=(chat_id, None), daemon=True).start()
+
+@bot.message_handler(commands=['status'])
+def _on_status(message):
+    chat_id = message.chat.id
+    threading.Thread(target=cmd_status, args=(chat_id, None), daemon=True).start()
+
+# simple start command to ensure background starts and gives info
+@bot.message_handler(commands=['start', 'help'])
+def _on_start(message):
+    chat_id = message.chat.id
+    # start bg
+    start_background(chat_id)
+    txt = (
+        "SignalBot Webhook edition\n\n"
+        "/smart_auto - scan for S/R breakouts & pre-tops (signals)\n"
+        "/momentum - momentum signals\n"
+        "/reversal - pre-top (pump) signals\n"
+        "/vol_spike - volume spike signals\n"
+        "/auto_scan - do all scans\n"
+        "/status - status of bot\n\n"
+        "Bot auto-scans every 5 minutes in background. It will send signals as they are found (avoids duplicates by cooldown)."
+    )
+    bot.send_message(chat_id, txt)
+
+# ----------------------------
+# Webhook registration helper (call once when deploying)
+# ----------------------------
+def set_webhook(url_base: str):
+    """
+    Sets Telegram webhook to url_base + WEBHOOK_ROUTE.
+    url_base should be like https://your-domain.com
+    """
+    webhook_url = url_base.rstrip("/") + WEBHOOK_ROUTE
+    r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook", params={"url": webhook_url})
+    if r.status_code == 200:
+        logger.info("Webhook set to %s", webhook_url)
+        return True
+    else:
+        logger.error("Failed to set webhook: %s %s", r.status_code, r.text)
+        return False
+
+# ----------------------------
+# Startup: if launched directly, optionally set webhook and start Flask
+# ----------------------------
+def run_flask(host="0.0.0.0", port=5000, set_hook: Optional[str] = None):
+    if set_hook:
+        ok = set_webhook(set_hook)
+        if not ok:
+            logger.warning("Webhook registration failed")
+    # run Flask app (production should use gunicorn/uvicorn)
+    app.run(host=host, port=port)
+
+# ----------------------------
+# If executed directly, start app
+# ----------------------------
+if __name__ == "__main__":
+    # optional: auto-register webhook if SELF_HOST is provided
+    SELF_HOST = os.getenv("SELF_HOST")  # full public URL, e.g. https://my-app.onrender.com
+    if SELF_HOST:
+        set_webhook(SELF_HOST)
+    # start background scanner (use ADMIN_CHAT_ID or TELEGRAM_CHAT_ID)
+    admin_chat = os.getenv("ADMIN_CHAT_ID")
+    if admin_chat:
+        start_background(admin_chat)
+    else:
+        logger.info("ADMIN_CHAT_ID not set; background will start when a user invokes /start (recommended to set ADMIN_CHAT_ID)")
+
+    # start Flask server (blocking)
+    run_flask(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
