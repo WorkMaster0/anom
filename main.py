@@ -106,7 +106,7 @@ ALL_USDT = [
 
 BINANCE_REST_URL = "https://fapi.binance.com/fapi/v1/klines"
 
-def fetch_klines_rest(symbol, interval="15m", limit=500):
+def fetch_klines_rest(symbol, interval="15m", limit=200):
     try:
         resp = requests.get(BINANCE_REST_URL, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=5)
         data = resp.json()
@@ -127,7 +127,7 @@ def fetch_klines_rest(symbol, interval="15m", limit=500):
 ws_manager = WebSocketKlineManager(symbols=ALL_USDT, interval="15m")
 Thread(target=ws_manager.start, daemon=True).start()
 
-def fetch_klines(symbol, limit=500):
+def fetch_klines(symbol, limit=200):
     df = ws_manager.get_klines(symbol, limit)
     if df is None or len(df) < 10:
         df = fetch_klines_rest(symbol, limit=limit)
@@ -306,10 +306,10 @@ def analyze_and_alert(symbol: str):
             f"Symbol: {symbol}\n"
             f"Action: {action}\n"
             f"Entry: {entry:.6f}\n"
-            f"Stop-Loss: {stop_loss:.6f}\n"
-            f"Take-Profit 1: {tp1:.6f} (RR {rr1:.2f})\n"
-            f"Take-Profit 2: {tp2:.6f} (RR {rr2:.2f})\n"
-            f"Take-Profit 3: {tp3:.6f} (RR {rr3:.2f})\n"
+            f"Limit: {stop_loss:.6f}\n"
+            f"Take 1: {tp1:.6f} (RR {rr1:.2f})\n"
+            f"Take 2: {tp2:.6f} (RR {rr2:.2f})\n"
+            f"Take 3: {tp3:.6f} (RR {rr3:.2f})\n"
             f"Confidence: {confidence:.2f}\n"
             f"Reasons: {', '.join(reasons)}\n"
             f"Patterns: {', '.join(votes)}\n"
