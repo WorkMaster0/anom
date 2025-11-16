@@ -1,563 +1,465 @@
-#!/usr/bin/env python3
-# app.py
-"""
-Telegram webhook scanner for three strategies:
-  1) Funding-rate harvesting (monitor funding rates)
-  2) Triangular arbitrage (single-exchange triangles)
-  3) Volatility/mean-reversion signals (cross-exchange spread spikes)
-
-SAFE mode: no trading, only sends Telegram signals.
-No API keys required (public data only). Uses ccxt for public tickers/orderbooks when possible.
-
-Usage:
-  - Set TELEGRAM_TOKEN and CHAT_ID as environment variables (or edit below).
-  - Run: python3 app.py
-  - Register Telegram webhook (optional) or use polling (see notes).
-    If using webhook, set WEBHOOK_URL env to your public HTTPS URL (https://...) and bot will call /webhook.
-  - In Telegram, send commands to the bot:
-      /start
-      /scan_funding start|stop
-      /scan_tri start|stop
-      /scan_vol start|stop
-      /status
-      /help
-"""
-
+# main.py
 import os
 import time
-import threading
-import logging
 import json
-from typing import Dict, Any, List, Optional, Tuple
-from datetime import datetime
+import logging
+import re
+from datetime import datetime, timezone
+from threading import Thread
+from concurrent.futures import ThreadPoolExecutor
 
+import pandas as pd
+import matplotlib.pyplot as plt
 import requests
-import ccxt
-from flask import Flask, request, jsonify
+import ta
+import mplfinance as mpf
+import numpy as np
+import io
 
-# ----------------------------- CONFIG ----------------------------------------
-# Fill these or set environment variables (recommended)
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()   # required for sending messages
-CHAT_ID = os.getenv("CHAT_ID", "").strip()                 # your chat id (or channel id)
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()         # optional; if set, app will attempt to set webhook
+from binance.client import Client
+from binance import ThreadedWebsocketManager
 
-# Exchanges (public access)
-EXCHANGE_A_ID = os.getenv("EXCHANGE_A", "kucoin")   # for funding & futures (kucoin preferred)
-EXCHANGE_B_ID = os.getenv("EXCHANGE_B", "lbank")    # spot reference exchange (lbank default)
+# ---------------- LOGGING ----------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()]
+)
+logger = logging.getLogger("pretop-bot")
 
-# Runtime params (tweak as needed)
-FUNDING_SCAN_INTERVAL = float(os.getenv("FUNDING_SCAN_INTERVAL", "60"))   # seconds
-TRI_SCAN_INTERVAL = float(os.getenv("TRI_SCAN_INTERVAL", "5"))            # seconds
-VOL_SCAN_INTERVAL = float(os.getenv("VOL_SCAN_INTERVAL", "2"))            # seconds
+# ---------------- CONFIG ----------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")  # paste token or set env
+CHAT_ID = os.getenv("CHAT_ID", "")               # paste chat id or set env
+PORT = int(os.getenv("PORT", "5000"))
+PARALLEL_WORKERS = int(os.getenv("PARALLEL_WORKERS", "6"))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))  # seconds
+STATE_FILE = "state.json"
+CONF_THRESHOLD_MEDIUM = float(os.getenv("CONF_THRESHOLD_MEDIUM", "0.3"))
+TOP_SYMBOL_LIMIT = int(os.getenv("TOP_SYMBOL_LIMIT", "200"))  # how many top symbols to scan
 
-FUNDING_THRESHOLD_PCT = float(os.getenv("FUNDING_THRESHOLD_PCT", "0.08"))  # percent (0.08% => 0.0008)
-TRI_ARB_THRESHOLD_PCT = float(os.getenv("TRI_ARB_THRESHOLD_PCT", "0.2"))   # percent profit threshold
-VOL_SPIKE_MULTIPLIER = float(os.getenv("VOL_SPIKE_MULTIPLIER", "4.0"))    # multiplier over rolling std
+# ---------------- BINANCE CLIENT ----------------
+# Put your keys in env or leave empty for public reads that use REST for klines.
+binance_client = Client(api_key=os.getenv("BINANCE_API_KEY", ""), api_secret=os.getenv("BINANCE_API_SECRET", ""))
 
-SYMBOLS = os.getenv("SYMBOLS", "BTC,ETH,SOL").split(",")
-SYMBOLS = [s.strip().upper() for s in SYMBOLS if s.strip()]
-
-LOG_LIMIT = 1000
-
-# ----------------------------- LOGGING ---------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("arb-signals")
-
-# in-memory logs (for simple status endpoint)
-_logs: List[str] = []
-_log_lock = threading.Lock()
-
-def app_log(msg: str):
-    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{ts}] {msg}"
-    logger.info(msg)
-    with _log_lock:
-        _logs.append(line)
-        if len(_logs) > LOG_LIMIT:
-            _logs.pop(0)
-
-def get_logs() -> List[str]:
-    with _log_lock:
-        return list(_logs)
-
-# ----------------------------- TELEGRAM HELPERS -------------------------------
-if not TELEGRAM_TOKEN:
-    app_log("WARNING: TELEGRAM_TOKEN not set. Bot cannot send messages until set.")
-
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-
-def tg_send(text: str):
-    """Send message to configured CHAT_ID. Silently fail if token or chat missing."""
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        app_log("tg_send skipped (missing TELEGRAM_TOKEN or CHAT_ID)")
-        return None
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
+# ---------------- STATE ----------------
+def load_json_safe(path, default):
     try:
-        r = requests.post(TELEGRAM_API + "/sendMessage", json=payload, timeout=8)
-        if r.status_code != 200:
-            app_log(f"tg_send failed: {r.status_code} {r.text}")
-            return None
-        return r.json()
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                return json.load(f)
     except Exception as e:
-        app_log(f"tg_send exception: {e}")
+        logger.exception("load_json_safe error %s: %s", path, e)
+    return default
+
+def save_json_safe(path, data):
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2, default=str)
+        os.replace(tmp, path)
+    except Exception as e:
+        logger.exception("save_json_safe error %s: %s", path, e)
+
+state = load_json_safe(STATE_FILE, {"signals": {}, "last_scan": None})
+
+# ---------------- TELEGRAM ----------------
+MARKDOWNV2_ESCAPE = r"_*[]()~`>#+-=|{}.!"
+
+def escape_md_v2(text: str) -> str:
+    return re.sub(f"([{re.escape(MARKDOWNV2_ESCAPE)}])", r"\\\1", str(text))
+
+def send_telegram(text: str, photo=None):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        logger.debug("Telegram credentials missing, skipping send.")
+        return
+    try:
+        if photo:
+            files = {'photo': ('signal.png', photo, 'image/png')}
+            data = {'chat_id': CHAT_ID, 'caption': escape_md_v2(text), 'parse_mode': 'MarkdownV2'}
+            resp = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto", data=data, files=files, timeout=10)
+            logger.debug("Telegram sendPhoto status: %s", resp.status_code)
+        else:
+            payload = {"chat_id": CHAT_ID, "text": escape_md_v2(text), "parse_mode": "MarkdownV2"}
+            resp = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=10)
+            logger.debug("Telegram sendMessage status: %s", resp.status_code)
+    except Exception as e:
+        logger.exception("send_telegram error: %s", e)
+
+# ---------------- BINANCE WEBSOCKET (miniTicker) ----------------
+_tickers_cache = {}   # symbol -> {lastPrice, changePercent, volume, quoteVolume}
+_tickers_last_update = 0
+_twm = None
+
+def start_ws_tickers():
+    """Запускаємо futures miniTicker websocket для кешування даних топ-символів"""
+    global _twm, _tickers_cache, _tickers_last_update
+    try:
+        _twm = ThreadedWebsocketManager()
+        _twm.start()
+
+        def handle(msg):
+            # msg is dict for a single update or dict for a combined stream depending on lib version
+            try:
+                # miniTicker fields include: 's' (symbol), 'c' (close), 'P' (%), 'v' (volume), 'q' (quoteVolume)
+                if not isinstance(msg, dict):
+                    return
+                if "s" in msg and "c" in msg:
+                    sym = msg["s"]
+                    _tickers_cache[sym] = {
+                        "lastPrice": float(msg["c"]),
+                        "changePercent": float(msg.get("P", 0.0)),
+                        "volume": float(msg.get("v", 0.0)),
+                        "quoteVolume": float(msg.get("q", 0.0))
+                    }
+                    _tickers_last_update = time.time()
+            except Exception:
+                logger.exception("Error in WS handle")
+        # Start futures miniTicker socket
+        _twm.start_futures_miniticker_socket(callback=handle)
+        logger.info("Started futures miniTicker websocket")
+    except Exception as e:
+        logger.exception("start_ws_tickers error: %s", e)
+
+def fetch_top_symbols(limit=TOP_SYMBOL_LIMIT):
+    """Отримуємо топ символів з кешу websocket по абсолютній % зміні."""
+    global _tickers_cache
+    if not _tickers_cache:
+        logger.debug("Tickers cache empty, falling back to REST/all list")
+        # Fallback: try to use REST sparingly to fetch pairs (we do this only if WS not ready)
+        try:
+            tickers = binance_client.futures_ticker()
+            usdt_pairs = [t['symbol'] for t in tickers if t['symbol'].endswith("USDT")]
+            return usdt_pairs[:limit] if limit else usdt_pairs
+        except Exception as e:
+            logger.exception("REST fallback fetch_top_symbols failed: %s", e)
+            return []
+    usdt_pairs = {s: d for s, d in _tickers_cache.items() if s.endswith("USDT")}
+    sorted_pairs = sorted(usdt_pairs.items(), key=lambda kv: abs(kv[1].get("changePercent", 0)), reverse=True)
+    symbols = [s for s, _ in sorted_pairs]
+    return symbols[:limit] if limit else symbols
+
+# ---------------- FETCH KLINES (REST fallback if WS klines not present) ----------------
+BINANCE_REST_URL = "https://fapi.binance.com/fapi/v1/klines"
+
+def fetch_klines_rest(symbol, interval="15m", limit=500):
+    try:
+        resp = requests.get(BINANCE_REST_URL, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=10)
+        data = resp.json()
+        df = pd.DataFrame(data, columns=[
+            "open_time","open","high","low","close","volume",
+            "close_time","quote_asset_volume","trades",
+            "taker_buy_base","taker_buy_quote","ignore"
+        ])
+        for col in ["open","high","low","close","volume"]:
+            df[col] = df[col].astype(float)
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+        df.set_index("open_time", inplace=True)
+        return df
+    except Exception as e:
+        logger.exception("REST fetch error for %s: %s", symbol, e)
         return None
 
-# ----------------------------- EXCHANGE CLIENTS -------------------------------
-# We'll create public ccxt clients for the two exchanges.
-_ccxt_clients_lock = threading.Lock()
-_ccxt_clients: Dict[str, Optional[ccxt.Exchange]] = {}
+# If you have a kline websocket manager (like your WebSocketKlineManager), you can plug it in.
+# For now we'll use only REST klines to keep code simple and robust.
+def fetch_klines(symbol, interval="15m", limit=200):
+    # Could be replaced by your WebSocketKlineManager.get_klines(symbol, limit)
+    return fetch_klines_rest(symbol, interval=interval, limit=limit)
 
-def get_ccxt_client(exid: str):
-    with _ccxt_clients_lock:
-        if exid in _ccxt_clients:
-            return _ccxt_clients[exid]
-        try:
-            client = getattr(ccxt, exid)({"enableRateLimit": True})
-            # some exchanges require loading markets to use certain methods
+# ---------------- FEATURE HELPERS ----------------
+def apply_basic_candles(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["open"] = df["open"].astype(float)
+    df["high"] = df["high"].astype(float)
+    df["low"] = df["low"].astype(float)
+    df["close"] = df["close"].astype(float)
+    df["volume"] = df["volume"].astype(float)
+    df["body"] = df["close"] - df["open"]
+    df["range"] = df["high"] - df["low"]
+    df["upper_shadow"] = df["high"] - df[["close", "open"]].max(axis=1)
+    df["lower_shadow"] = df[["close", "open"]].min(axis=1) - df["low"]
+    df["vol_ma20"] = df["volume"].rolling(20).mean()
+    df["atr"] = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"], window=14).average_true_range()
+    return df
+
+# ---------------- PUMP / DUMP REVERSAL DETECTOR (8 features + 2 extras) ----------------
+def detect_pump_reversals(df: pd.DataFrame):
+    """
+    Return list of signals (dictionaries) detected on the latest candle.
+    Each signal: {'action': 'SHORT'/'LONG', 'reason': '...', 'score': float}
+    """
+    signals = []
+    if df is None or len(df) < 30:
+        return signals
+
+    df = apply_basic_candles(df)
+    last = df.iloc[-1]
+    entry = float(last["close"])
+    vol_ma = float(df["volume"].rolling(20).mean().iloc[-1])
+    recent_change_10 = (last["close"] - df["close"].iloc[-10]) / df["close"].iloc[-10]
+    recent_change_5 = (last["close"] - df["close"].iloc[-5]) / df["close"].iloc[-5]
+
+    # helper to append with small score
+    def add(action, reason, score=0.1):
+        signals.append({"action": action, "reason": reason, "score": score})
+
+    # Feature 1: Volume Spike Pump / Dump (big % move + huge volume)
+    if recent_change_10 > 0.18 and last["volume"] > 4 * vol_ma:
+        add("SHORT", "Volume Spike Pump", 0.25)
+    if recent_change_10 < -0.18 and last["volume"] > 4 * vol_ma:
+        add("LONG", "Volume Spike Dump", 0.25)
+
+    # Feature 2: Exhaustion Wick (large upper wick on pump / lower on dump)
+    upper_wick = last["high"] - max(last["close"], last["open"])
+    lower_wick = min(last["close"], last["open"]) - last["low"]
+    body = abs(last["body"]) if last["body"] != 0 else 1e-9
+    if upper_wick > body * 2 and recent_change_5 > 0.10 and last["volume"] > 1.5 * vol_ma:
+        add("SHORT", "Exhaustion Upper Wick", 0.15)
+    if lower_wick > body * 2 and recent_change_5 < -0.10 and last["volume"] > 1.5 * vol_ma:
+        add("LONG", "Exhaustion Lower Wick", 0.15)
+
+    # Feature 3: Momentum Reversal (3 candles momentum drop)
+    mom = df["close"].diff()
+    if len(mom) >= 3:
+        if mom.iloc[-3] > 0 and mom.iloc[-2] > 0 and mom.iloc[-1] < 0 and recent_change_5 > 0.12:
+            add("SHORT", "Momentum Reversal After Pump", 0.12)
+        if mom.iloc[-3] < 0 and mom.iloc[-2] < 0 and mom.iloc[-1] > 0 and recent_change_5 < -0.12:
+            add("LONG", "Momentum Reversal After Dump", 0.12)
+
+    # Feature 4: RSI Overextension
+    rsi = ta.momentum.RSIIndicator(df["close"], 14).rsi()
+    last_rsi = rsi.iloc[-1]
+    if last_rsi > 82:
+        add("SHORT", "RSI Overbought", 0.09)
+    if last_rsi < 18:
+        add("LONG", "RSI Oversold", 0.09)
+
+    # Feature 5: Volume Divergence (price up but volume down)
+    if len(df) >= 4:
+        if df["close"].iloc[-1] > df["close"].iloc[-2] > df["close"].iloc[-3] and df["volume"].iloc[-1] < df["volume"].iloc[-2]:
+            add("SHORT", "Price Up + Volume Down (Divergence)", 0.10)
+        if df["close"].iloc[-1] < df["close"].iloc[-2] < df["close"].iloc[-3] and df["volume"].iloc[-1] < df["volume"].iloc[-2]:
+            add("LONG", "Price Down + Volume Down (Divergence)", 0.10)
+
+    # Feature 6: Volatility Spike (ATR explosion)
+    recent_vol = (df["high"] - df["low"]).iloc[-5:].mean()
+    prev_vol = (df["high"] - df["low"]).iloc[-20:-5].mean()
+    if prev_vol > 0 and recent_vol > prev_vol * 2 and last["volume"] > 2 * vol_ma:
+        if recent_change_5 > 0.12:
+            add("SHORT", "Volatility Spike on Pump", 0.12)
+        if recent_change_5 < -0.12:
+            add("LONG", "Volatility Spike on Dump", 0.12)
+
+    # Feature 7: Liquidity Grab / Fake Breakout
+    rolling_high = df["high"].rolling(20).max().iloc[-2]
+    rolling_low = df["low"].rolling(20).min().iloc[-2]
+    if last["high"] > rolling_high and last["close"] < rolling_high:
+        add("SHORT", "Liquidity Grab Top (Fake Breakout)", 0.14)
+    if last["low"] < rolling_low and last["close"] > rolling_low:
+        add("LONG", "Liquidity Grab Bottom (Fake Breakout)", 0.14)
+
+    # Feature 8: Climax Candle (huge volume + huge body beyond ATR)
+    atr = float(df["atr"].iloc[-1] if not np.isnan(df["atr"].iloc[-1]) else (df["high"]-df["low"]).iloc[-1])
+    if last["volume"] > 6 * vol_ma and abs(last["close"] - df["close"].iloc[-2]) > 3 * atr:
+        if recent_change_5 > 0.15:
+            add("SHORT", "Climax Pump Candle", 0.2)
+        if recent_change_5 < -0.15:
+            add("LONG", "Climax Dump Candle", 0.2)
+
+    # Extra Feature 9: Smart Money Shift (big buy-side then large distribution)
+    # Detect a period where taker buy quote surged then reversed
+    # (requires taker data; fallback: check quoteVolume spike)
+    if "quote_asset_volume" in df.columns or "quoteVolume" in df.columns:
+        # fallback: use quoteVolume last candle if available
+        qvol = df.get("quote_asset_volume", df.get("quoteVolume", None))
+        if qvol is not None:
             try:
-                client.load_markets()
+                qvol_last = float(qvol.iloc[-1])
+                qvol_ma = float(pd.Series(qvol).rolling(20).mean().iloc[-1])
+                if qvol_last > 4 * qvol_ma and recent_change_5 > 0.1:
+                    add("SHORT", "Smart Money Distribution (quoteVol spike)", 0.12)
             except Exception:
                 pass
-            _ccxt_clients[exid] = client
-            app_log(f"Initialized {exid} client")
-            return client
-        except Exception as e:
-            app_log(f"Failed to init client {exid}: {e}")
-            _ccxt_clients[exid] = None
-            return None
 
-# ----------------------------- SHARED STATE ----------------------------------
-scanners_state = {
-    "funding": {"running": False, "thread": None},
-    "tri": {"running": False, "thread": None},
-    "vol": {"running": False, "thread": None}
-}
+    # Extra Feature 10: Trap Candle (wick beyond level + close back)
+    # If candle pierces level (20-roll high/low) but closes back -> trap
+    if last["high"] > rolling_high and last["close"] < rolling_high and last["upper_shadow"] > last["range"] * 0.6:
+        add("SHORT", "Top Trap Candle", 0.12)
+    if last["low"] < rolling_low and last["close"] > rolling_low and last["lower_shadow"] > last["range"] * 0.6:
+        add("LONG", "Bottom Trap Candle", 0.12)
 
-# store small history for volatility strategy
-price_history: Dict[str, List[float]] = {}
-history_lock = threading.Lock()
+    # Merge same-direction signals to produce a combined score
+    combined = {}
+    for s in signals:
+        combined.setdefault(s["action"], 0.0)
+        combined[s["action"]] += s["score"]
 
-# utility: safe fetch ticker
-def safe_ticker(exid: str, pair: str) -> Optional[Dict[str, Any]]:
-    client = get_ccxt_client(exid)
-    if not client:
-        return None
+    # produce final signals list with threshold
+    output = []
+    for action, score in combined.items():
+        # signal threshold — require at least 0.18 combined weight to alert
+        if score >= 0.18:
+            # also include reasons (collect all reasons for that action)
+            reasons = [s["reason"] for s in signals if s["action"] == action]
+            output.append({"action": action, "score": round(min(1.0, score), 3), "reasons": reasons})
+    return output
+
+# ---------------- PLOT UTILITY ----------------
+def plot_signal_candles(df, symbol, action, tp1=None, tp2=None, tp3=None, sl=None, entry=None):
+    addplots = []
+    if tp1 is not None: addplots.append(mpf.make_addplot([tp1]*len(df), color='green', linestyle="--"))
+    if tp2 is not None: addplots.append(mpf.make_addplot([tp2]*len(df), color='lime', linestyle="--"))
+    if tp3 is not None: addplots.append(mpf.make_addplot([tp3]*len(df), color='darkgreen', linestyle="--"))
+    if sl is not None: addplots.append(mpf.make_addplot([sl]*len(df), color='red', linestyle="--"))
+    if entry is not None: addplots.append(mpf.make_addplot([entry]*len(df), color='blue', linestyle="--"))
+
+    fig, ax = mpf.plot(df.tail(200), type='candle', style='yahoo', title=f"{symbol} - {action}", addplot=addplots, returnfig=True)
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', bbox_inches='tight')
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+# ---------------- ANALYZE & ALERT (pump/dump mode) ----------------
+def analyze_and_alert(symbol: str):
     try:
-        tk = client.fetch_ticker(pair)
-        return tk
-    except Exception:
-        # don't spam logs; return None
-        return None
+        df = fetch_klines(symbol, interval="15m", limit=200)
+        if df is None or len(df) < 30:
+            return
 
-# ----------------------------- STRATEGIES ------------------------------------
-# 1) Funding-rate harvesting (signals only)
-def funding_scanner_loop():
-    """
-    Periodically fetch funding (if available) from EXCHANGE_A (e.g., kucoin futures)
-    and send signal when funding rate magnitude exceeds threshold.
-    Implementation: try ccxt.fetch_funding_rate() for each symbol, else try exchange-specific endpoints.
-    """
-    exid = EXCHANGE_A_ID
-    client = get_ccxt_client(exid)
-    app_log("Funding scanner started (exchange=%s)" % exid)
+        signals = detect_pump_reversals(df)
+        if not signals:
+            return
 
-    while scanners_state["funding"]["running"]:
-        for sym in SYMBOLS:
-            try:
-                # Try common ccxt method: fetchFundingRate (symbol) or fetch_funding_rate
-                funding = None
-                if client:
-                    try:
-                        # Some ccxt builds implement fetch_funding_rate or fetchFundingRate
-                        if hasattr(client, "fetch_funding_rate"):
-                            fr = client.fetch_funding_rate(symbol=f"{sym}/USDT")
-                            # structure varies: try common keys
-                            if isinstance(fr, dict):
-                                funding = fr.get("fundingRate") or fr.get("rate") or fr.get("funding_rate") or fr.get("funding")
-                        elif hasattr(client, "fetchFundingRate"):
-                            fr = client.fetchFundingRate(symbol=f"{sym}/USDT")
-                            if isinstance(fr, dict):
-                                funding = fr.get("fundingRate") or fr.get("rate")
-                    except Exception:
-                        funding = None
+        # For each detected direction produce an alert
+        for s in signals:
+            action = s["action"]
+            score = s["score"]
+            reasons = s["reasons"]
+            last = df.iloc[-1]
+            entry = float(last["close"])
 
-                # fallback: for kucoin futures, there's public endpoint but ccxt may not wrap; try REST
-                if funding is None and exid.lower().startswith("kucoin"):
-                    try:
-                        # get contract list and funding via public futures API
-                        # note: structure may change; best-effort
-                        resp = requests.get("https://api-futures.kucoin.com/api/v1/contracts/active", timeout=5)
-                        data = resp.json()
-                        if isinstance(data, dict) and "data" in data:
-                            for item in data["data"]:
-                                # item may have "symbol" like "XBTUSDTM" or "BTCUSDTM" etc. Try match
-                                # We'll match if item["symbol"].startswith(sym)
-                                if "symbol" in item and item["symbol"].upper().startswith(sym.upper()):
-                                    # try markPrice or fundingRate fields
-                                    funding = item.get("fundingRate") or item.get("fundingRateRate") or item.get("fundingRateRate")
-                                    if funding is not None:
-                                        funding = float(funding)
-                                        break
-                    except Exception:
-                        funding = None
+            # Use far support/resistance (20-50 candles window) to set sl/tp around real levels
+            support = df["low"].rolling(50).min().iloc[-1]
+            resistance = df["high"].rolling(50).max().iloc[-1]
 
-                # if still None: skip
-                if funding is None:
-                    app_log(f"[funding] {sym}: funding not available (skipped)")
-                    continue
+            if action == "SHORT":
+                stop_loss = float(last["high"] * 1.01)
+                # TPs should be placed before important supports — use a ladder approaching long-term support
+                tp1 = entry * 0.985
+                tp2 = max(entry * 0.96, support * 1.01 if not np.isnan(support) else entry * 0.95)
+                tp3 = max(entry * 0.92, support * 1.005 if not np.isnan(support) else entry * 0.90)
+            else:  # LONG
+                stop_loss = float(last["low"] * 0.99)
+                tp1 = entry * 1.015
+                tp2 = min(entry * 1.04, resistance * 0.995 if not np.isnan(resistance) else entry * 1.06)
+                tp3 = min(entry * 1.08, resistance * 0.999 if not np.isnan(resistance) else entry * 1.12)
 
-                # funding may be expressed as decimal per funding period (e.g., 0.0002 = 0.02%)
-                funding_pct = float(funding) * 100.0
-                app_log(f"[funding] {sym}: funding={funding} ({funding_pct:.4f}%)")
+            # Risk/Reward calculation (conservative)
+            rr1 = (tp1 - entry) / (entry - stop_loss) if action == "LONG" else (entry - tp1) / (stop_loss - entry)
+            rr2 = (tp2 - entry) / (entry - stop_loss) if action == "LONG" else (entry - tp2) / (stop_loss - entry)
+            rr3 = (tp3 - entry) / (entry - stop_loss) if action == "LONG" else (entry - tp3) / (stop_loss - entry)
 
-                thr = FUNDING_THRESHOLD_PCT
-                if abs(funding_pct) >= thr:
-                    # positive funding means long pays short; negative means short pays long.
-                    side = "longs pay shorts" if funding_pct > 0 else "shorts pay longs"
-                    text = (
-                        f"🔔 *FUNDING SIGNAL* — {sym}\n"
-                        f"Funding rate: *{funding_pct:.4f}%* ({side})\n"
-                        f"Exchange: {exid}\n"
-                        f"Note: this is a signal to consider delta-neutral funding harvest (monitor/hedge)."
-                    )
-                    tg_send(text)
-            except Exception as e:
-                app_log(f"funding loop error for {sym}: {e}")
-        time.sleep(FUNDING_SCAN_INTERVAL)
-    app_log("Funding scanner stopped")
-
-# 2) Triangular arbitrage scanner (single exchange)
-def triangle_scan_once(exid: str, threshold_pct: float) -> List[Dict[str, Any]]:
-    """
-    Attempt to find simple triangular arbitrage opportunities inside exchange `exid`.
-    Approach:
-      - Use exchange.fetch_tickers() to get available symbols and prices.
-      - Build quick map of quote/base pairs using USDT, BTC, ETH, etc.
-      - Check triangles A->B->C->A for arbitrage > threshold_pct.
-    This is a heuristic, best-effort scanner for signals only.
-    """
-    client = get_ccxt_client(exid)
-    if not client:
-        return []
-
-    try:
-        tickers = client.fetch_tickers()
-    except Exception as e:
-        app_log(f"tri: fetch_tickers failed for {exid}: {e}")
-        return []
-
-    # build price map: pair -> last
-    prices = {}
-    for pair, tk in tickers.items():
-        try:
-            last = tk.get("last") or tk.get("close")
-            if last:
-                prices[pair] = float(last)
-        except Exception:
-            continue
-
-    # Build list of unique currencies from pairs that include USDT or common bases
-    # We'll attempt triangles among SYMBOLS × common bridges (USDT,BTC,ETH)
-    bridges = ["USDT", "BTC", "ETH"]
-    results = []
-    # simplify: for each base in SYMBOLS, check triangles base-USDT-BTC-base etc.
-    for base in SYMBOLS:
-        base = base.upper()
-        # consider pairs: base/USDT, base/BTC, base/ETH and reverse
-        combos = []
-        for b in bridges:
-            if b == base:
+            # Quality filter: require some minimal combined score and RR1 > 0.8 (pump reversals are aggressive, allow lower RR)
+            if score < 0.2:
                 continue
-            pairs = [
-                f"{base}/{b}",
-                f"{b}/{base}"
-            ]
-            combos.extend(pairs)
-        # generate triangles: base -> X -> Y -> base, where X,Y from bridges
-        for x in bridges:
-            for y in bridges:
-                if x == y or x == base or y == base:
-                    continue
-                # try path: base/x, x/y, y/base
-                p1 = f"{base}/{x}"
-                p2 = f"{x}/{y}"
-                p3 = f"{y}/{base}"
-                # determine if we have quotes (we might have inverted pairs)
-                def get_price_for(pair):
-                    if pair in prices:
-                        return prices[pair], False  # direct
-                    # try inverse
-                    if "/" in pair:
-                        a,b = pair.split("/")
-                        inv = f"{b}/{a}"
-                        if inv in prices and prices[inv] != 0:
-                            return 1.0/prices[inv], True  # inverted
-                    return None, None
+            if rr1 < 0.5:
+                # if first RR too low, push TP1 a bit closer to increase RR or skip
+                # here we skip to avoid spam
+                continue
 
-                v1, inv1 = get_price_for(p1)
-                v2, inv2 = get_price_for(p2)
-                v3, inv3 = get_price_for(p3)
-                if v1 is None or v2 is None or v3 is None:
-                    continue
-                # simulate starting with 1 unit of base -> convert through triangles
-                try:
-                    after = 1.0
-                    after = after * v1  # base->x
-                    after = after * v2  # x->y
-                    after = after * v3  # y->base
-                    profit_pct = (after - 1.0) * 100.0
-                    if profit_pct >= threshold_pct:
-                        results.append({
-                            "exchange": exid,
-                            "base": base,
-                            "path": [p1, p2, p3],
-                            "profit_pct": profit_pct,
-                            "rates": [v1, v2, v3]
-                        })
-                except Exception:
-                    continue
-    return results
+            # Compose message
+            msg = (
+                f"⚡ PUMP/DUMP REVERSAL ALERT\n"
+                f"Symbol: {symbol}\n"
+                f"Action: {action}\n"
+                f"Score: {score:.2f}\n"
+                f"Reasons: {', '.join(reasons)}\n"
+                f"Entry: {entry:.6f}\n"
+                f"Stop-Loss: {stop_loss:.6f}\n"
+                f"TP1: {tp1:.6f} (RR {rr1:.2f})\n"
+                f"TP2: {tp2:.6f} (RR {rr2:.2f})\n"
+                f"TP3: {tp3:.6f} (RR {rr3:.2f})\n"
+            )
 
-def tri_scanner_loop():
-    exid = EXCHANGE_A_ID  # choose primary exchange for tri-arb (KuCoin typically)
-    app_log("Triangle scanner started (exchange=%s)" % exid)
-    while scanners_state["tri"]["running"]:
+            logger.info("Signal %s %s score=%.2f rr1=%.2f reasons=%s", symbol, action, score, rr1, reasons)
+            photo_buf = plot_signal_candles(df, symbol, action, tp1=tp1, tp2=tp2, tp3=tp3, sl=stop_loss, entry=entry)
+            send_telegram(msg, photo=photo_buf)
+
+            # save state
+            state.setdefault("signals", {})[symbol] = {
+                "action": action, "entry": entry, "sl": stop_loss, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+                "rr1": rr1, "rr2": rr2, "rr3": rr3, "score": score, "reasons": reasons,
+                "time": str(df.index[-1]), "last_price": float(entry)
+            }
+            save_json_safe(STATE_FILE, state)
+    except Exception as e:
+        logger.exception("analyze_and_alert error for %s: %s", symbol, e)
+
+# ---------------- MASTER SCAN ----------------
+def scan_all_symbols():
+    symbols = fetch_top_symbols(limit=TOP_SYMBOL_LIMIT)
+    if not symbols:
+        logger.warning("No symbols fetched, falling back to empty list")
+        return
+    logger.info("Starting scan for %d symbols", len(symbols))
+    def safe_analyze(sym):
         try:
-            res = triangle_scan_once(exid, TRI_ARB_THRESHOLD_PCT)
-            if res:
-                for r in res:
-                    text = (
-                        f"🔺 *TRIANGLE ARB SIGNAL* on {r['exchange']}\n"
-                        f"Base: {r['base']}\n"
-                        f"Path: {' -> '.join(r['path'])}\n"
-                        f"Estimated profit: *{r['profit_pct']:.3f}%*\n"
-                        f"_Note: fees/slippage not accounted. Signal only._"
-                    )
-                    tg_send(text)
-                    app_log(f"tri signal: {r['base']} profit={r['profit_pct']:.4f}%")
-            else:
-                app_log("tri scanner: no opportunities found")
+            analyze_and_alert(sym)
         except Exception as e:
-            app_log(f"tri scanner loop error: {e}")
-        time.sleep(TRI_SCAN_INTERVAL)
-    app_log("Triangle scanner stopped")
+            logger.exception("Error analyzing symbol %s: %s", sym, e)
+    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as exe:
+        list(exe.map(safe_analyze, symbols))
+    state["last_scan"] = str(datetime.now(timezone.utc))
+    save_json_safe(STATE_FILE, state)
+    logger.info("Scan finished at %s", state["last_scan"])
 
-# 3) Volatility / mean-reversion spike scanner (cross-exchange)
-def vol_scanner_loop():
-    app_log("Volatility scanner started (cross-exchange)")
-    ex1 = EXCHANGE_A_ID
-    ex2 = EXCHANGE_B_ID
-    while scanners_state["vol"]["running"]:
-        for s in SYMBOLS:
-            pair = f"{s}/USDT"
-            try:
-                tk1 = safe_ticker(ex1, pair)
-                tk2 = safe_ticker(ex2, pair)
-                if not tk1 or not tk2:
-                    continue
-                p1 = tk1.get("last") or tk1.get("close")
-                p2 = tk2.get("last") or tk2.get("close")
-                if not is_price_valid(p1) or not is_price_valid(p2):
-                    continue
-                p1 = float(p1); p2 = float(p2)
-                spread = p1 - p2
-                # update history
-                with history_lock:
-                    hist = price_history.setdefault(s, [])
-                    hist.append(spread)
-                    if len(hist) > 200:
-                        hist.pop(0)
-                    # compute rolling std and mean on last N
-                    window = min(len(hist), 60)
-                    if window < 10:
-                        continue
-                    recent = hist[-window:]
-                mean = sum(recent)/len(recent)
-                # sample returns std
-                # compute standard deviation of recent spreads
-                var = sum((x-mean)**2 for x in recent)/len(recent)
-                std = var**0.5
-                # detect spike
-                dev = abs(spread - mean)
-                if std > 0 and dev >= (VOL_SPIKE_MULTIPLIER * std):
-                    direction = "KUCOIN > LBank" if (p1 - p2) > 0 else "LBank > KuCoin"
-                    text = (
-                        f"⚡ *VOL SPIKE SIGNAL* {s}\n"
-                        f"{ex1} price: {p1:.6f}\n{ex2} price: {p2:.6f}\n"
-                        f"Spread: {spread:.6f} (mean={mean:.6f}, std={std:.6f})\n"
-                        f"Deviation: {dev:.6f} = {dev/std:.2f}σ\n"
-                        f"Direction: {direction}\n\n"
-                        f"Consider opening a hedged mean-reversion trade."
-                    )
-                    tg_send(text)
-                    app_log(f"vol signal {s}: dev={dev:.6f} std={std:.6f}")
-                else:
-                    app_log(f"vol check {s}: spread={spread:.6f} mean={mean:.6f} std={std:.6f}" if std>0 else f"vol check {s}: insufficient data")
-            except Exception as e:
-                app_log(f"vol loop error for {s}: {e}")
-        time.sleep(VOL_SCAN_INTERVAL)
-    app_log("Volatility scanner stopped")
+# ---------------- BACKGROUND SCANNER ----------------
+def background_scanner():
+    while True:
+        try:
+            scan_all_symbols()
+        except Exception as e:
+            logger.exception("Background scan error: %s", e)
+        time.sleep(SCAN_INTERVAL)
 
-# ----------------------------- START/STOP HELPERS ----------------------------
-def start_scanner(name: str) -> str:
-    if name not in scanners_state:
-        return f"Unknown scanner {name}"
-    if scanners_state[name]["running"]:
-        return f"{name} scanner already running"
-    scanners_state[name]["running"] = True
-    if name == "funding":
-        t = threading.Thread(target=funding_scanner_loop, daemon=True)
-    elif name == "tri":
-        t = threading.Thread(target=tri_scanner_loop, daemon=True)
-    elif name == "vol":
-        t = threading.Thread(target=vol_scanner_loop, daemon=True)
-    else:
-        return "invalid"
-    scanners_state[name]["thread"] = t
-    t.start()
-    return f"Started {name} scanner"
+# Start WS listener thread early
+Thread(target=start_ws_tickers, daemon=True).start()
+# Start background scanner thread
+Thread(target=background_scanner, daemon=True).start()
 
-def stop_scanner(name: str) -> str:
-    if name not in scanners_state:
-        return f"Unknown scanner {name}"
-    if not scanners_state[name]["running"]:
-        return f"{name} scanner not running"
-    scanners_state[name]["running"] = False
-    # thread will exit after loop checks running flag
-    return f"Stopping {name} scanner"
-
-def status_report() -> str:
-    parts = []
-    for k,v in scanners_state.items():
-        parts.append(f"{k}: {'running' if v['running'] else 'stopped'}")
-    parts.append("Symbols: " + ", ".join(SYMBOLS))
-    parts.append(f"Funding thr: {FUNDING_THRESHOLD_PCT}%")
-    parts.append(f"Tri thr: {TRI_ARB_THRESHOLD_PCT}%")
-    parts.append(f"Vol multiplier: x{VOL_SPIKE_MULTIPLIER}")
-    return "\n".join(parts)
-
-# ----------------------------- FLASK / TELEGRAM WEBHOOK -----------------------
+# ---------------- FLASK ----------------
+from flask import Flask, request, jsonify
 app = Flask(__name__)
 
-@app.route("/", methods=["GET"])
+@app.route("/")
 def home():
-    return jsonify({"ok": True, "status": "arb-signals running", "time": datetime.utcnow().isoformat()})
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    """
-    Telegram webhook handler.
-    Commands:
-      /start
-      /help
-      /scan_funding start|stop
-      /scan_tri start|stop
-      /scan_vol start|stop
-      /status
-    """
-    data = request.get_json(force=True)
-    if not data:
-        return jsonify({"ok": False}), 400
-    # parse message
-    msg = data.get("message") or data.get("edited_message")
-    if not msg:
-        return jsonify({"ok": True})
-    chat = msg.get("chat", {})
-    cid = chat.get("id")
-    text = (msg.get("text") or "").strip()
-    if not text:
-        return jsonify({"ok": True})
-    app_log(f"Webhook cmd from {cid}: {text[:200]}")
-    parts = text.split()
-    cmd = parts[0].lower()
-    reply = "Unknown command. /help"
-    try:
-        if cmd == "/start":
-            reply = ("Arb signals bot online.\nCommands:\n"
-                     "/scan_funding start|stop\n/scan_tri start|stop\n/scan_vol start|stop\n/status\n/help")
-        elif cmd == "/help":
-            reply = ("Scanner commands:\n"
-                     "/scan_funding start|stop — funding-rate harvesting signals\n"
-                     "/scan_tri start|stop — triangular arbitrage scanner\n"
-                     "/scan_vol start|stop — volatility spike scanner\n"
-                     "/status — show status")
-        elif cmd == "/scan_funding":
-            if len(parts) >= 2 and parts[1].lower() == "start":
-                reply = start_scanner("funding")
-            else:
-                reply = stop_scanner("funding")
-        elif cmd == "/scan_tri":
-            if len(parts) >= 2 and parts[1].lower() == "start":
-                reply = start_scanner("tri")
-            else:
-                reply = stop_scanner("tri")
-        elif cmd == "/scan_vol":
-            if len(parts) >= 2 and parts[1].lower() == "start":
-                reply = start_scanner("vol")
-            else:
-                reply = stop_scanner("vol")
-        elif cmd == "/status":
-            reply = status_report()
-        else:
-            reply = "Unknown command. /help"
-    except Exception as e:
-        app_log(f"Error handling cmd {text}: {e}")
-        reply = f"Error: {e}"
-    # send reply to the user who invoked command (so they know)
-    # If TELEGRAM_TOKEN is set, reply via sendMessage to that chat id.
-    if TELEGRAM_TOKEN:
-        try:
-            requests.post(TELEGRAM_API + "/sendMessage", json={"chat_id": cid, "text": reply}, timeout=5)
-        except Exception as e:
-            app_log(f"Failed to send reply: {e}")
-    else:
-        app_log("TELEGRAM_TOKEN not set; cannot reply via API.")
-    return jsonify({"ok": True})
-
-# Friendly endpoint to start/stop scanners via HTTP (optional)
-@app.route("/control/<scanner>/<action>", methods=["POST","GET"])
-def control(scanner: str, action: str):
-    scanner = scanner.lower()
-    action = action.lower()
-    if action == "start":
-        res = start_scanner(scanner)
-    else:
-        res = stop_scanner(scanner)
-    return jsonify({"result": res})
-
-@app.route("/status", methods=["GET"])
-def http_status():
     return jsonify({
-        "scanners": {k: ("running" if v["running"] else "stopped") for k,v in scanners_state.items()},
-        "symbols": SYMBOLS,
-        "logs": get_logs()[-50:]
+        "status": "ok",
+        "time": str(datetime.now(timezone.utc)),
+        "signals": len(state.get("signals", {}))
     })
 
-# ----------------------------- HELPER: set webhook -----------------------------
-def set_telegram_webhook():
-    if not WEBHOOK_URL:
-        app_log("WEBHOOK_URL not set; skipping webhook registration")
-        return
-    if not TELEGRAM_TOKEN:
-        app_log("TELEGRAM_TOKEN not set; cannot set webhook")
-        return
-    url = WEBHOOK_URL.rstrip("/") + "/webhook"
-    try:
-        r = requests.get(f"{TELEGRAM_API}/setWebhook?url={url}", timeout=8)
-        app_log(f"setWebhook result: {r.status_code} {r.text[:200]}")
-    except Exception as e:
-        app_log(f"setWebhook failed: {e}")
+@app.route("/telegram_webhook/<token>", methods=["POST"])
+def telegram_webhook(token):
+    if token != TELEGRAM_TOKEN:
+        return jsonify({"ok": False, "error": "invalid token"}), 403
+    update = request.get_json(force=True) or {}
+    text = update.get("message", {}).get("text", "").lower().strip()
+    if text.startswith("/scan"):
+        send_telegram("⚡ Manual scan started.")
+        Thread(target=scan_all_symbols, daemon=True).start()
+    if text.startswith("/status"):
+        send_telegram(f"Status: last_scan={state.get('last_scan')}, signals={len(state.get('signals', {}))}")
+    return jsonify({"ok": True})
 
-# ----------------------------- BOOT ------------------------------------------
+# ---------------- MAIN ----------------
 if __name__ == "__main__":
-    app_log("Starting arb-signals service")
-    # init clients early
-    get_ccxt_client(EXCHANGE_A_ID)
-    get_ccxt_client(EXCHANGE_B_ID)
-    # try to set webhook if WEBHOOK_URL provided
-    set_telegram_webhook()
-    # optionally send starting message to configured CHAT_ID
-    if TELEGRAM_TOKEN and CHAT_ID:
-        tg_send("🟢 Arb Signal Bot started (no trading — signals only). Use /help for commands.")
-    # run flask
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), threaded=True)
+    logger.info("Starting pump/dump detector bot")
+    # quick test Telegram connectivity (will be skipped silently if no token)
+    try:
+        send_telegram("✅ Pump/Dump detector bot started.")
+    except Exception:
+        pass
+    # main web server
+    app.run(host="0.0.0.0", port=PORT)
