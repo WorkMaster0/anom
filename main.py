@@ -1,4 +1,3 @@
-# main.py
 import os
 import time
 import json
@@ -17,7 +16,6 @@ import numpy as np
 import io
 
 from binance.client import Client
-from binance import ThreadedWebsocketManager
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(
@@ -28,18 +26,16 @@ logging.basicConfig(
 logger = logging.getLogger("pretop-bot")
 
 # ---------------- CONFIG ----------------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")  # paste token or set env
-CHAT_ID = os.getenv("CHAT_ID", "")               # paste chat id or set env
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+CHAT_ID = os.getenv("CHAT_ID", "")
 PORT = int(os.getenv("PORT", "5000"))
 PARALLEL_WORKERS = int(os.getenv("PARALLEL_WORKERS", "6"))
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))  # seconds
+EMA_SCAN_LIMIT = 500
 STATE_FILE = "state.json"
-CONF_THRESHOLD_MEDIUM = float(os.getenv("CONF_THRESHOLD_MEDIUM", "0.3"))
-TOP_SYMBOL_LIMIT = int(os.getenv("TOP_SYMBOL_LIMIT", "200"))  # how many top symbols to scan
+CONF_THRESHOLD_MEDIUM = 0.3
 
 # ---------------- BINANCE CLIENT ----------------
-# Put your keys in env or leave empty for public reads that use REST for klines.
-binance_client = Client(api_key=os.getenv("BINANCE_API_KEY", ""), api_secret=os.getenv("BINANCE_API_SECRET", ""))
+binance_client = Client(api_key="", api_secret="")
 
 # ---------------- STATE ----------------
 def load_json_safe(path, default):
@@ -71,80 +67,48 @@ def escape_md_v2(text: str) -> str:
 
 def send_telegram(text: str, photo=None):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        logger.debug("Telegram credentials missing, skipping send.")
         return
     try:
         if photo:
             files = {'photo': ('signal.png', photo, 'image/png')}
             data = {'chat_id': CHAT_ID, 'caption': escape_md_v2(text), 'parse_mode': 'MarkdownV2'}
-            resp = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto", data=data, files=files, timeout=10)
-            logger.debug("Telegram sendPhoto status: %s", resp.status_code)
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto", data=data, files=files, timeout=10)
         else:
             payload = {"chat_id": CHAT_ID, "text": escape_md_v2(text), "parse_mode": "MarkdownV2"}
-            resp = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=10)
-            logger.debug("Telegram sendMessage status: %s", resp.status_code)
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=10)
     except Exception as e:
         logger.exception("send_telegram error: %s", e)
 
-# ---------------- BINANCE WEBSOCKET (miniTicker) ----------------
-_tickers_cache = {}   # symbol -> {lastPrice, changePercent, volume, quoteVolume}
-_tickers_last_update = 0
-_twm = None
+# ---------------- WEBSOCKET / REST MANAGER ----------------
+from websocket_manager import WebSocketKlineManager
 
-def start_ws_tickers():
-    """Запускаємо futures miniTicker websocket для кешування даних топ-символів"""
-    global _twm, _tickers_cache, _tickers_last_update
-    try:
-        _twm = ThreadedWebsocketManager()
-        _twm.start()
+ALL_USDT = [
+    "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","ADAUSDT","DOGEUSDT",
+    "DOTUSDT","TRXUSDT","LTCUSDT","AVAXUSDT","SHIBUSDT","LINKUSDT","ATOMUSDT","XMRUSDT",
+    "ETCUSDT","XLMUSDT","APTUSDT","NEARUSDT","FILUSDT","ICPUSDT","GRTUSDT","AAVEUSDT",
+    "SANDUSDT","AXSUSDT","FTMUSDT","THETAUSDT","EGLDUSDT","MANAUSDT","FLOWUSDT","HBARUSDT",
+    "ALGOUSDT","ZECUSDT","EOSUSDT","KSMUSDT","CELOUSDT","SUSHIUSDT","CHZUSDT","KAVAUSDT",
+    "ZILUSDT","ANKRUSDT","RAYUSDT","GMTUSDT","UNIUSDT","APEUSDT","PEPEUSDT","OPUSDT",
+    "XTZUSDT","ALPHAUSDT","BALUSDT","COMPUSDT","CRVUSDT","SNXUSDT","RSRUSDT",
+    "LOKUSDT","GALUSDT","WLDUSDT","JASMYUSDT","ONEUSDT","ARBUSDT","ALICEUSDT","XECUSDT",
+    "FLMUSDT","CAKEUSDT","IMXUSDT","HOOKUSDT","MAGICUSDT","STGUSDT","FETUSDT",
+    "PEOPLEUSDT","ASTRUSDT","ENSUSDT","CTSIUSDT","GALAUSDT","RADUSDT","IOSTUSDT","QTUMUSDT",
+    "NPXSUSDT","DASHUSDT","ZRXUSDT","HNTUSDT","ENJUSDT","TFUELUSDT","TWTUSDT",
+    "NKNUSDT","GLMRUSDT","ZENUSDT","STORJUSDT","ICXUSDT","XVGUSDT","FLOKIUSDT","BONEUSDT",
+    "TRBUSDT","C98USDT","MASKUSDT","1000SHIBUSDT","1000PEPEUSDT","AMBUSDT","VEGUSDT","QNTUSDT",
+    "RNDRUSDT","CHRUSDT","API3USDT","MTLUSDT","ALPUSDT","LDOUSDT","AXLUSDT","FUNUSDT",
+    "OGUSDT","ORCUSDT","XAUTUSDT","ARUSDT","DYDXUSDT","RUNEUSDT","FLUXUSDT",
+    "AGLDUSDT","PERPUSDT","MLNUSDT","NMRUSDT","LRCUSDT","COTIUSDT","ACHUSDT",
+    "CKBUSDT","ACEUSDT","TRUUSDT","IPSUSDT","QIUSDT","GLMUSDT","ARNXUSDT",
+    "MIRUSDT","ROSEUSDT","OXTUSDT","SPELLUSDT","SUNUSDT","SYSUSDT","TAOUSDT",
+    "TLMUSDT","VLXUSDT","WAXPUSDT","XNOUSDT"
+]
 
-        def handle(msg):
-            # msg is dict for a single update or dict for a combined stream depending on lib version
-            try:
-                # miniTicker fields include: 's' (symbol), 'c' (close), 'P' (%), 'v' (volume), 'q' (quoteVolume)
-                if not isinstance(msg, dict):
-                    return
-                if "s" in msg and "c" in msg:
-                    sym = msg["s"]
-                    _tickers_cache[sym] = {
-                        "lastPrice": float(msg["c"]),
-                        "changePercent": float(msg.get("P", 0.0)),
-                        "volume": float(msg.get("v", 0.0)),
-                        "quoteVolume": float(msg.get("q", 0.0))
-                    }
-                    _tickers_last_update = time.time()
-            except Exception:
-                logger.exception("Error in WS handle")
-        # Start futures miniTicker socket
-        _twm.start_futures_miniticker_socket(callback=handle)
-        logger.info("Started futures miniTicker websocket")
-    except Exception as e:
-        logger.exception("start_ws_tickers error: %s", e)
-
-def fetch_top_symbols(limit=TOP_SYMBOL_LIMIT):
-    """Отримуємо топ символів з кешу websocket по абсолютній % зміні."""
-    global _tickers_cache
-    if not _tickers_cache:
-        logger.debug("Tickers cache empty, falling back to REST/all list")
-        # Fallback: try to use REST sparingly to fetch pairs (we do this only if WS not ready)
-        try:
-            tickers = binance_client.futures_ticker()
-            usdt_pairs = [t['symbol'] for t in tickers if t['symbol'].endswith("USDT")]
-            return usdt_pairs[:limit] if limit else usdt_pairs
-        except Exception as e:
-            logger.exception("REST fallback fetch_top_symbols failed: %s", e)
-            return []
-    usdt_pairs = {s: d for s, d in _tickers_cache.items() if s.endswith("USDT")}
-    sorted_pairs = sorted(usdt_pairs.items(), key=lambda kv: abs(kv[1].get("changePercent", 0)), reverse=True)
-    symbols = [s for s, _ in sorted_pairs]
-    return symbols[:limit] if limit else symbols
-
-# ---------------- FETCH KLINES (REST fallback if WS klines not present) ----------------
 BINANCE_REST_URL = "https://fapi.binance.com/fapi/v1/klines"
 
 def fetch_klines_rest(symbol, interval="15m", limit=500):
     try:
-        resp = requests.get(BINANCE_REST_URL, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=10)
+        resp = requests.get(BINANCE_REST_URL, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=5)
         data = resp.json()
         df = pd.DataFrame(data, columns=[
             "open_time","open","high","low","close","volume",
@@ -160,248 +124,250 @@ def fetch_klines_rest(symbol, interval="15m", limit=500):
         logger.exception("REST fetch error for %s: %s", symbol, e)
         return None
 
-# If you have a kline websocket manager (like your WebSocketKlineManager), you can plug it in.
-# For now we'll use only REST klines to keep code simple and robust.
-def fetch_klines(symbol, interval="15m", limit=200):
-    # Could be replaced by your WebSocketKlineManager.get_klines(symbol, limit)
-    return fetch_klines_rest(symbol, interval=interval, limit=limit)
+ws_manager = WebSocketKlineManager(symbols=ALL_USDT, interval="15m")
+Thread(target=ws_manager.start, daemon=True).start()
 
-# ---------------- FEATURE HELPERS ----------------
-def apply_basic_candles(df: pd.DataFrame) -> pd.DataFrame:
+def fetch_klines(symbol, limit=500):
+    df = ws_manager.get_klines(symbol, limit)
+    if df is None or len(df) < 10:
+        df = fetch_klines_rest(symbol, limit=limit)
+    return df
+
+# ---------------- PATTERN-BASED FEATURE ENGINEERING ----------------
+def apply_all_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["open"] = df["open"].astype(float)
-    df["high"] = df["high"].astype(float)
-    df["low"] = df["low"].astype(float)
-    df["close"] = df["close"].astype(float)
-    df["volume"] = df["volume"].astype(float)
+
+    # Support/Resistance (динамічні рівні за останні 20 свічок)
+    df["support"] = df["low"].rolling(20).min()
+    df["resistance"] = df["high"].rolling(20).max()
+
+    # Volume analysis
+    df["vol_ma20"] = df["volume"].rolling(20).mean()
+    df["vol_spike"] = df["volume"] > 1.5 * df["vol_ma20"]
+
+    # Candle structure
     df["body"] = df["close"] - df["open"]
     df["range"] = df["high"] - df["low"]
     df["upper_shadow"] = df["high"] - df[["close", "open"]].max(axis=1)
     df["lower_shadow"] = df[["close", "open"]].min(axis=1) - df["low"]
-    df["vol_ma20"] = df["volume"].rolling(20).mean()
-    df["atr"] = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"], window=14).average_true_range()
+
     return df
 
-# ---------------- PUMP / DUMP REVERSAL DETECTOR (8 features + 2 extras) ----------------
-def detect_pump_reversals(df: pd.DataFrame):
-    """
-    Return list of signals (dictionaries) detected on the latest candle.
-    Each signal: {'action': 'SHORT'/'LONG', 'reason': '...', 'score': float}
-    """
-    signals = []
-    if df is None or len(df) < 30:
-        return signals
-
-    df = apply_basic_candles(df)
+# ---------------- PATTERN-BASED SIGNAL DETECTION ----------------
+# ---------------- ADVANCED SIGNAL DETECTION (V2) ----------------
+def detect_signal_v2(df: pd.DataFrame):
     last = df.iloc[-1]
-    entry = float(last["close"])
-    vol_ma = float(df["volume"].rolling(20).mean().iloc[-1])
-    recent_change_10 = (last["close"] - df["close"].iloc[-10]) / df["close"].iloc[-10]
-    recent_change_5 = (last["close"] - df["close"].iloc[-5]) / df["close"].iloc[-5]
+    prev = df.iloc[-2]
+    votes = []
+    confidence = 0.5  # базова впевненість
 
-    # helper to append with small score
-    def add(action, reason, score=0.1):
-        signals.append({"action": action, "reason": reason, "score": score})
+    # --- 1. Price Action (свічкові патерни) ---
+    # Hammer / Shooting Star
+    if last["lower_shadow"] > 2 * abs(last["body"]) and last["body"] > 0:
+        votes.append("hammer_bull"); confidence += 0.1
+    if last["upper_shadow"] > 2 * abs(last["body"]) and last["body"] < 0:
+        votes.append("shooting_star"); confidence += 0.1
 
-    # Feature 1: Volume Spike Pump / Dump (big % move + huge volume)
-    if recent_change_10 > 0.18 and last["volume"] > 4 * vol_ma:
-        add("SHORT", "Volume Spike Pump", 0.25)
-    if recent_change_10 < -0.18 and last["volume"] > 4 * vol_ma:
-        add("LONG", "Volume Spike Dump", 0.25)
+    # Engulfing
+    if last["body"] > 0 and prev["body"] < 0 and last["close"] > prev["open"] and last["open"] < prev["close"]:
+        votes.append("bullish_engulfing"); confidence += 0.1
+    if last["body"] < 0 and prev["body"] > 0 and last["close"] < prev["open"] and last["open"] > prev["close"]:
+        votes.append("bearish_engulfing"); confidence += 0.1
 
-    # Feature 2: Exhaustion Wick (large upper wick on pump / lower on dump)
-    upper_wick = last["high"] - max(last["close"], last["open"])
-    lower_wick = min(last["close"], last["open"]) - last["low"]
-    body = abs(last["body"]) if last["body"] != 0 else 1e-9
-    if upper_wick > body * 2 and recent_change_5 > 0.10 and last["volume"] > 1.5 * vol_ma:
-        add("SHORT", "Exhaustion Upper Wick", 0.15)
-    if lower_wick > body * 2 and recent_change_5 < -0.10 and last["volume"] > 1.5 * vol_ma:
-        add("LONG", "Exhaustion Lower Wick", 0.15)
+    # Doji
+    if abs(last["body"]) < 0.1 * last["range"]:
+        votes.append("doji"); confidence += 0.05
 
-    # Feature 3: Momentum Reversal (3 candles momentum drop)
-    mom = df["close"].diff()
-    if len(mom) >= 3:
-        if mom.iloc[-3] > 0 and mom.iloc[-2] > 0 and mom.iloc[-1] < 0 and recent_change_5 > 0.12:
-            add("SHORT", "Momentum Reversal After Pump", 0.12)
-        if mom.iloc[-3] < 0 and mom.iloc[-2] < 0 and mom.iloc[-1] > 0 and recent_change_5 < -0.12:
-            add("LONG", "Momentum Reversal After Dump", 0.12)
+    # Tweezer Top/Bottom
+    if abs(last["high"] - prev["high"]) < 0.001 * last["high"] and last["close"] < last["open"]:
+        votes.append("tweezer_top"); confidence += 0.05
+    if abs(last["low"] - prev["low"]) < 0.001 * last["low"] and last["close"] > last["open"]:
+        votes.append("tweezer_bottom"); confidence += 0.05
 
-    # Feature 4: RSI Overextension
-    rsi = ta.momentum.RSIIndicator(df["close"], 14).rsi()
-    last_rsi = rsi.iloc[-1]
-    if last_rsi > 82:
-        add("SHORT", "RSI Overbought", 0.09)
-    if last_rsi < 18:
-        add("LONG", "RSI Oversold", 0.09)
+    # Inside / Outside bar
+    if last["high"] < prev["high"] and last["low"] > prev["low"]:
+        votes.append("inside_bar"); confidence += 0.05
+    if last["high"] > prev["high"] and last["low"] < prev["low"]:
+        votes.append("outside_bar"); confidence += 0.05
 
-    # Feature 5: Volume Divergence (price up but volume down)
-    if len(df) >= 4:
-        if df["close"].iloc[-1] > df["close"].iloc[-2] > df["close"].iloc[-3] and df["volume"].iloc[-1] < df["volume"].iloc[-2]:
-            add("SHORT", "Price Up + Volume Down (Divergence)", 0.10)
-        if df["close"].iloc[-1] < df["close"].iloc[-2] < df["close"].iloc[-3] and df["volume"].iloc[-1] < df["volume"].iloc[-2]:
-            add("LONG", "Price Down + Volume Down (Divergence)", 0.10)
+    # Momentum exhaustion (3+ свічки в один бік)
+    if all(df["close"].iloc[-i] > df["open"].iloc[-i] for i in range(1, 4)):
+        votes.append("3_green"); confidence += 0.05
+    if all(df["close"].iloc[-i] < df["open"].iloc[-i] for i in range(1, 4)):
+        votes.append("3_red"); confidence += 0.05
 
-    # Feature 6: Volatility Spike (ATR explosion)
-    recent_vol = (df["high"] - df["low"]).iloc[-5:].mean()
-    prev_vol = (df["high"] - df["low"]).iloc[-20:-5].mean()
-    if prev_vol > 0 and recent_vol > prev_vol * 2 and last["volume"] > 2 * vol_ma:
-        if recent_change_5 > 0.12:
-            add("SHORT", "Volatility Spike on Pump", 0.12)
-        if recent_change_5 < -0.12:
-            add("LONG", "Volatility Spike on Dump", 0.12)
+    # --- 2. Volume & Liquidity ---
+    if last["vol_spike"]:
+        votes.append("volume_spike"); confidence += 0.05
+    if last["volume"] > 2 * df["vol_ma20"].iloc[-1]:
+        votes.append("climax_volume"); confidence += 0.05
+    if last["volume"] < 0.5 * df["vol_ma20"].iloc[-1] and (
+        last["close"] > last["resistance"] or last["close"] < last["support"]):
+        votes.append("low_volume_breakout"); confidence -= 0.05
 
-    # Feature 7: Liquidity Grab / Fake Breakout
-    rolling_high = df["high"].rolling(20).max().iloc[-2]
-    rolling_low = df["low"].rolling(20).min().iloc[-2]
-    if last["high"] > rolling_high and last["close"] < rolling_high:
-        add("SHORT", "Liquidity Grab Top (Fake Breakout)", 0.14)
-    if last["low"] < rolling_low and last["close"] > rolling_low:
-        add("LONG", "Liquidity Grab Bottom (Fake Breakout)", 0.14)
+    # --- 3. Structure & Levels ---
+    if prev["close"] > prev["resistance"] and last["close"] < last["resistance"]:
+        votes.append("fake_breakout_short"); confidence += 0.05
+    if prev["close"] < prev["support"] and last["close"] > last["support"]:
+        votes.append("fake_breakout_long"); confidence += 0.05
+    if prev["close"] < prev["resistance"] and last["close"] > last["resistance"]:
+        votes.append("resistance_flip_support"); confidence += 0.05
+    if prev["close"] > prev["support"] and last["close"] < last["support"]:
+        votes.append("support_flip_resistance"); confidence += 0.05
 
-    # Feature 8: Climax Candle (huge volume + huge body beyond ATR)
-    atr = float(df["atr"].iloc[-1] if not np.isnan(df["atr"].iloc[-1]) else (df["high"]-df["low"]).iloc[-1])
-    if last["volume"] > 6 * vol_ma and abs(last["close"] - df["close"].iloc[-2]) > 3 * atr:
-        if recent_change_5 > 0.15:
-            add("SHORT", "Climax Pump Candle", 0.2)
-        if recent_change_5 < -0.15:
-            add("LONG", "Climax Dump Candle", 0.2)
+    # Retest
+    if abs(last["close"] - last["support"]) / last["support"] < 0.003 and last["body"] > 0:
+        votes.append("support_retest"); confidence += 0.05
+    if abs(last["close"] - last["resistance"]) / last["resistance"] < 0.003 and last["body"] < 0:
+        votes.append("resistance_retest"); confidence += 0.05
 
-    # Extra Feature 9: Smart Money Shift (big buy-side then large distribution)
-    # Detect a period where taker buy quote surged then reversed
-    # (requires taker data; fallback: check quoteVolume spike)
-    if "quote_asset_volume" in df.columns or "quoteVolume" in df.columns:
-        # fallback: use quoteVolume last candle if available
-        qvol = df.get("quote_asset_volume", df.get("quoteVolume", None))
-        if qvol is not None:
-            try:
-                qvol_last = float(qvol.iloc[-1])
-                qvol_ma = float(pd.Series(qvol).rolling(20).mean().iloc[-1])
-                if qvol_last > 4 * qvol_ma and recent_change_5 > 0.1:
-                    add("SHORT", "Smart Money Distribution (quoteVol spike)", 0.12)
-            except Exception:
-                pass
+    # Liquidity grab (свічка проколола рівень, але закрилась всередині)
+    if last["low"] < last["support"] and last["close"] > last["support"]:
+        votes.append("liquidity_grab_long"); confidence += 0.05
+    if last["high"] > last["resistance"] and last["close"] < last["resistance"]:
+        votes.append("liquidity_grab_short"); confidence += 0.05
 
-    # Extra Feature 10: Trap Candle (wick beyond level + close back)
-    # If candle pierces level (20-roll high/low) but closes back -> trap
-    if last["high"] > rolling_high and last["close"] < rolling_high and last["upper_shadow"] > last["range"] * 0.6:
-        add("SHORT", "Top Trap Candle", 0.12)
-    if last["low"] < rolling_low and last["close"] > rolling_low and last["lower_shadow"] > last["range"] * 0.6:
-        add("LONG", "Bottom Trap Candle", 0.12)
+    # --- 4. Trend & Context ---
+    df["trend"] = df["close"].rolling(20).mean()
+    if last["close"] > df["trend"].iloc[-1]:
+        votes.append("above_trend"); confidence += 0.05
+    else:
+        votes.append("below_trend"); confidence += 0.05
 
-    # Merge same-direction signals to produce a combined score
-    combined = {}
-    for s in signals:
-        combined.setdefault(s["action"], 0.0)
-        combined[s["action"]] += s["score"]
+    # --- Pre-top (як було) ---
+    pretop = False
+    if len(df) >= 10 and (last["close"] - df["close"].iloc[-10]) / df["close"].iloc[-10] > 0.10:
+        pretop = True
+        votes.append("pretop"); confidence += 0.1
 
-    # produce final signals list with threshold
-    output = []
-    for action, score in combined.items():
-        # signal threshold — require at least 0.18 combined weight to alert
-        if score >= 0.18:
-            # also include reasons (collect all reasons for that action)
-            reasons = [s["reason"] for s in signals if s["action"] == action]
-            output.append({"action": action, "score": round(min(1.0, score), 3), "reasons": reasons})
-    return output
+    # --- Action ---
+    action = "WATCH"
+    near_resistance = last["close"] >= last["resistance"] * 0.98
+    near_support = last["close"] <= last["support"] * 1.02
+    if near_resistance:
+        action = "SHORT"
+    elif near_support:
+        action = "LONG"
+
+    # Clamp confidence
+    confidence = max(0.0, min(1.0, confidence))
+    return action, votes, pretop, last, confidence
+
+
+# ---------------- MAIN ANALYZE FUNCTION ----------------
+def analyze_and_alert(symbol: str):
+    df = fetch_klines(symbol, limit=200)
+    if df is None or len(df) < 40:
+        return
+
+    df = apply_all_features(df)
+
+    action, votes, pretop, last, confidence = detect_signal_v2(df)
+
+    # Entry / SL / TP
+    entry = stop_loss = tp1 = tp2 = tp3 = None
+    if action == "LONG":
+        entry = last["support"] * 1.001
+        stop_loss = last["support"] * 0.99
+        tp1 = entry + (last["resistance"] - entry) * 0.33
+        tp2 = entry + (last["resistance"] - entry) * 0.66
+        tp3 = last["resistance"]
+    elif action == "SHORT":
+        entry = last["resistance"] * 0.999
+        stop_loss = last["resistance"] * 1.01
+        tp1 = entry - (entry - last["support"]) * 0.33
+        tp2 = entry - (entry - last["support"]) * 0.66
+        tp3 = last["support"]
+
+    if action == "WATCH":
+        return
+
+    # R/R
+    rr1 = (tp1 - entry)/(entry - stop_loss) if action=="LONG" else (entry - tp1)/(stop_loss - entry)
+    rr2 = (tp2 - entry)/(entry - stop_loss) if action=="LONG" else (entry - tp2)/(stop_loss - entry)
+    rr3 = (tp3 - entry)/(entry - stop_loss) if action=="LONG" else (entry - tp3)/(stop_loss - entry)
+
+    logger.info(
+        "Symbol=%s action=%s confidence=%.2f votes=%s pretop=%s RR1=%.2f RR2=%.2f RR3=%.2f",
+        symbol, action, confidence, votes, pretop, rr1, rr2, rr3
+    )
+
+    # --- Фільтр: мінімум RR >= 2 ---
+    if confidence >= CONF_THRESHOLD_MEDIUM and rr1 >= 2.0:
+        reasons = []
+        if "pretop" in votes: reasons.append("Pre-Top")
+        if "fake_breakout_long" in votes or "fake_breakout_short" in votes: reasons.append("Fake Breakout")
+        if "resistance_flip_support" in votes or "support_flip_resistance" in votes: reasons.append("S/R Flip")
+        if "volume_spike" in votes: reasons.append("Volume Spike")
+        if not reasons: reasons = ["Candle/Pattern Mix"]
+
+        msg = (
+            f"⚡ TRADE SIGNAL\n"
+            f"Symbol: {symbol}\n"
+            f"Action: {action}\n"
+            f"Entry: {entry:.6f}\n"
+            f"Stop-Loss: {stop_loss:.6f}\n"
+            f"Take-Profit 1: {tp1:.6f} (RR {rr1:.2f})\n"
+            f"Take-Profit 2: {tp2:.6f} (RR {rr2:.2f})\n"
+            f"Take-Profit 3: {tp3:.6f} (RR {rr3:.2f})\n"
+            f"Confidence: {confidence:.2f}\n"
+            f"Reasons: {', '.join(reasons)}\n"
+            f"Patterns: {', '.join(votes)}\n"
+        )
+
+        photo_buf = plot_signal_candles(df, symbol, action, tp1=tp1, tp2=tp2, tp3=tp3, sl=stop_loss, entry=entry)
+        send_telegram(msg, photo=photo_buf)
+
+        state.setdefault("signals", {})[symbol] = {
+            "action": action, "entry": entry, "sl": stop_loss, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+            "rr1": rr1, "rr2": rr2, "rr3": rr3, "confidence": confidence,
+            "time": str(last.name), "last_price": float(last["close"]), "votes": votes
+        }
+        save_json_safe(STATE_FILE, state)
 
 # ---------------- PLOT UTILITY ----------------
 def plot_signal_candles(df, symbol, action, tp1=None, tp2=None, tp3=None, sl=None, entry=None):
     addplots = []
-    if tp1 is not None: addplots.append(mpf.make_addplot([tp1]*len(df), color='green', linestyle="--"))
-    if tp2 is not None: addplots.append(mpf.make_addplot([tp2]*len(df), color='lime', linestyle="--"))
-    if tp3 is not None: addplots.append(mpf.make_addplot([tp3]*len(df), color='darkgreen', linestyle="--"))
-    if sl is not None: addplots.append(mpf.make_addplot([sl]*len(df), color='red', linestyle="--"))
-    if entry is not None: addplots.append(mpf.make_addplot([entry]*len(df), color='blue', linestyle="--"))
+    if tp1: addplots.append(mpf.make_addplot([tp1]*len(df), color='green', linestyle="--"))
+    if tp2: addplots.append(mpf.make_addplot([tp2]*len(df), color='lime', linestyle="--"))
+    if tp3: addplots.append(mpf.make_addplot([tp3]*len(df), color='darkgreen', linestyle="--"))
+    if sl: addplots.append(mpf.make_addplot([sl]*len(df), color='red', linestyle="--"))
+    if entry: addplots.append(mpf.make_addplot([entry]*len(df), color='blue', linestyle="--"))
 
-    fig, ax = mpf.plot(df.tail(200), type='candle', style='yahoo', title=f"{symbol} - {action}", addplot=addplots, returnfig=True)
+    fig, ax = mpf.plot(
+        df.tail(200), type='candle', style='yahoo',
+        title=f"{symbol} - {action}", addplot=addplots, returnfig=True
+    )
     buf = io.BytesIO()
     fig.savefig(buf, format='png', bbox_inches='tight')
     buf.seek(0)
     plt.close(fig)
     return buf
 
-# ---------------- ANALYZE & ALERT (pump/dump mode) ----------------
-def analyze_and_alert(symbol: str):
+# ---------------- FETCH TOP SYMBOLS ----------------
+def fetch_top_symbols(limit=300):
     try:
-        df = fetch_klines(symbol, interval="15m", limit=200)
-        if df is None or len(df) < 30:
-            return
-
-        signals = detect_pump_reversals(df)
-        if not signals:
-            return
-
-        # For each detected direction produce an alert
-        for s in signals:
-            action = s["action"]
-            score = s["score"]
-            reasons = s["reasons"]
-            last = df.iloc[-1]
-            entry = float(last["close"])
-
-            # Use far support/resistance (20-50 candles window) to set sl/tp around real levels
-            support = df["low"].rolling(50).min().iloc[-1]
-            resistance = df["high"].rolling(50).max().iloc[-1]
-
-            if action == "SHORT":
-                stop_loss = float(last["high"] * 1.01)
-                # TPs should be placed before important supports — use a ladder approaching long-term support
-                tp1 = entry * 0.985
-                tp2 = max(entry * 0.96, support * 1.01 if not np.isnan(support) else entry * 0.95)
-                tp3 = max(entry * 0.92, support * 1.005 if not np.isnan(support) else entry * 0.90)
-            else:  # LONG
-                stop_loss = float(last["low"] * 0.99)
-                tp1 = entry * 1.015
-                tp2 = min(entry * 1.04, resistance * 0.995 if not np.isnan(resistance) else entry * 1.06)
-                tp3 = min(entry * 1.08, resistance * 0.999 if not np.isnan(resistance) else entry * 1.12)
-
-            # Risk/Reward calculation (conservative)
-            rr1 = (tp1 - entry) / (entry - stop_loss) if action == "LONG" else (entry - tp1) / (stop_loss - entry)
-            rr2 = (tp2 - entry) / (entry - stop_loss) if action == "LONG" else (entry - tp2) / (stop_loss - entry)
-            rr3 = (tp3 - entry) / (entry - stop_loss) if action == "LONG" else (entry - tp3) / (stop_loss - entry)
-
-            # Quality filter: require some minimal combined score and RR1 > 0.8 (pump reversals are aggressive, allow lower RR)
-            if score < 0.2:
-                continue
-            if rr1 < 0.5:
-                # if first RR too low, push TP1 a bit closer to increase RR or skip
-                # here we skip to avoid spam
-                continue
-
-            # Compose message
-            msg = (
-                f"⚡ PUMP/DUMP REVERSAL ALERT\n"
-                f"Symbol: {symbol}\n"
-                f"Action: {action}\n"
-                f"Score: {score:.2f}\n"
-                f"Reasons: {', '.join(reasons)}\n"
-                f"Entry: {entry:.6f}\n"
-                f"Stop-Loss: {stop_loss:.6f}\n"
-                f"TP1: {tp1:.6f} (RR {rr1:.2f})\n"
-                f"TP2: {tp2:.6f} (RR {rr2:.2f})\n"
-                f"TP3: {tp3:.6f} (RR {rr3:.2f})\n"
-            )
-
-            logger.info("Signal %s %s score=%.2f rr1=%.2f reasons=%s", symbol, action, score, rr1, reasons)
-            photo_buf = plot_signal_candles(df, symbol, action, tp1=tp1, tp2=tp2, tp3=tp3, sl=stop_loss, entry=entry)
-            send_telegram(msg, photo=photo_buf)
-
-            # save state
-            state.setdefault("signals", {})[symbol] = {
-                "action": action, "entry": entry, "sl": stop_loss, "tp1": tp1, "tp2": tp2, "tp3": tp3,
-                "rr1": rr1, "rr2": rr2, "rr3": rr3, "score": score, "reasons": reasons,
-                "time": str(df.index[-1]), "last_price": float(entry)
-            }
-            save_json_safe(STATE_FILE, state)
+        # Беремо всі USDT-пари ф'ючерсів
+        tickers = binance_client.futures_ticker()  # Для USDT-M ф'ючерсів
+        usdt_pairs = [t for t in tickers if t['symbol'].endswith("USDT")]
+        sorted_pairs = sorted(
+            usdt_pairs,
+            key=lambda x: abs(float(x.get("priceChangePercent", 0))),
+            reverse=True
+        )
+        top_symbols = [d["symbol"] for d in sorted_pairs[:limit]]
+        logger.info("Top %d symbols fetched: %s", limit, top_symbols[:10])
+        return top_symbols
     except Exception as e:
-        logger.exception("analyze_and_alert error for %s: %s", symbol, e)
+        logger.exception("Error fetching top symbols: %s", e)
+        return []
 
 # ---------------- MASTER SCAN ----------------
 def scan_all_symbols():
-    symbols = fetch_top_symbols(limit=TOP_SYMBOL_LIMIT)
+    symbols = fetch_top_symbols(limit=300)
     if not symbols:
-        logger.warning("No symbols fetched, falling back to empty list")
-        return
+        logger.warning("No symbols fetched, falling back to ALL_USDT list")
+        symbols = ALL_USDT
     logger.info("Starting scan for %d symbols", len(symbols))
     def safe_analyze(sym):
         try:
@@ -413,20 +379,6 @@ def scan_all_symbols():
     state["last_scan"] = str(datetime.now(timezone.utc))
     save_json_safe(STATE_FILE, state)
     logger.info("Scan finished at %s", state["last_scan"])
-
-# ---------------- BACKGROUND SCANNER ----------------
-def background_scanner():
-    while True:
-        try:
-            scan_all_symbols()
-        except Exception as e:
-            logger.exception("Background scan error: %s", e)
-        time.sleep(SCAN_INTERVAL)
-
-# Start WS listener thread early
-Thread(target=start_ws_tickers, daemon=True).start()
-# Start background scanner thread
-Thread(target=background_scanner, daemon=True).start()
 
 # ---------------- FLASK ----------------
 from flask import Flask, request, jsonify
@@ -449,17 +401,10 @@ def telegram_webhook(token):
     if text.startswith("/scan"):
         send_telegram("⚡ Manual scan started.")
         Thread(target=scan_all_symbols, daemon=True).start()
-    if text.startswith("/status"):
-        send_telegram(f"Status: last_scan={state.get('last_scan')}, signals={len(state.get('signals', {}))}")
     return jsonify({"ok": True})
 
 # ---------------- MAIN ----------------
 if __name__ == "__main__":
-    logger.info("Starting pump/dump detector bot")
-    # quick test Telegram connectivity (will be skipped silently if no token)
-    try:
-        send_telegram("✅ Pump/Dump detector bot started.")
-    except Exception:
-        pass
-    # main web server
+    logger.info("Starting pre-top detector bot")
+    Thread(target=scan_all_symbols, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT)
